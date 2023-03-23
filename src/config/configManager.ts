@@ -54,4 +54,12 @@ export class ConfigManager {
       throw new Error("Profile not found");
     }
   }
+
+  async deleteProfile(): Promise<void> {
+    try {
+      await fs.promises.unlink(this.configFile);
+    } catch (error) {
+      throw new Error("Failed to delete profile.");
+    }
+  }
 }

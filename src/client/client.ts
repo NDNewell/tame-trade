@@ -5,6 +5,7 @@ import { TradingApi } from "../trading/tradingApi";
 import { ConfigManager } from "../config/configManager";
 import { formatOutput as fo } from "../utils/formatOutput";
 import { NotificationManager, NType } from "../utils/notificationManager";
+import inquirer from "inquirer";
 
 export class Client {
   private rl: readline.Interface;
@@ -30,11 +31,53 @@ export class Client {
       await this.createProfile();
     }
 
+    await this.showMenu();
+  }
+
+  private async showMenu() {
+    const menuChoices = [
+      { name: "Start Trading", value: "startTrading" },
+      { name: "Add Exchange", value: "addExchange" },
+      { name: "Remove Exchange", value: "removeExchange" },
+      { name: "Delete Profile", value: "deleteProfile" },
+    ];
+
+    const { action } = await inquirer.prompt([
+      {
+        type: "list",
+        name: "action",
+        message: "Choose an action:",
+        choices: menuChoices,
+      },
+    ]);
+
+    switch (action) {
+      case "startTrading":
+        await this.startSession();
+        this.availableMarkets = await this.tradingApi.getMarkets();
+        this.promptForCommand();
+        break;
+      case "addExchange":
+        // Implement the logic for adding an exchange
+        break;
+      case "removeExchange":
+        // Implement the logic for removing an exchange
+        break;
+      case "deleteProfile":
+        await this.configManager.deleteProfile();
+        console.log("Profile deleted.");
+        this.quit();
+        break;
+      default:
+        console.log("Invalid option.");
+        await this.showMenu();
+        break;
+    }
+  }
+
+  async startSession() {
     console.log("Starting new trading session...");
     console.log("Session initiated");
-
-    this.availableMarkets = await this.tradingApi.getMarkets();
-    this.promptForCommand();
   }
 
   private promptForCommand() {
