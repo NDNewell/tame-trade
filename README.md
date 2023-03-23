@@ -5,10 +5,10 @@ Tame is a Node.js and TypeScript trading app that communicates with Deribit's AP
 ## Installation
 
 Clone this repository.
-Run yarn install to install the required dependencies.
-Run yarn build to compile the TypeScript code.
+Run `yarn install` to install the required dependencies.
+Run `yarn build` to compile the TypeScript code.
 Usage
-Run yarn start to start the application. Follow the prompts to enter your API keys with trading, futures, and read permissions enabled. The API keys and configuration data will be stored locally in the tame-config-db.json file located in the root directory.
+Run `yarn start` to start the application. Follow the prompts to enter your API keys with trading, futures, and read permissions enabled. The API keys and configuration data will be stored locally in the `.tame/config.json` file located in your home directory.
 
 ### Fatfinger
 
