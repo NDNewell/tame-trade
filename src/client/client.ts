@@ -8,17 +8,13 @@ import inquirer from "inquirer";
 import clear from "console-clear";
 
 export class Client {
-  private rl: readline.Interface;
+  private rl?: readline.Interface;
   private currentInstrument: string;
   private tradingApi: TradingApi;
   private availableMarkets: string[];
   private configManager: ConfigManager;
 
   constructor() {
-    this.rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
     this.currentInstrument = "";
     this.tradingApi = new TradingApi();
     this.availableMarkets = [];
@@ -163,6 +159,12 @@ export class Client {
 
     console.log(`Using exchange: ${selectedExchange}`);
     this.availableMarkets = await this.tradingApi.getMarkets();
+
+    this.rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+
     this.promptForCommand();
   }
 
@@ -186,22 +188,18 @@ export class Client {
     return selectedExchange;
   }
 
-  private async promptForCommand() {
-    const command = await inquirer.prompt([
-      {
-        type: "input",
-        name: "command",
-        message: this.currentInstrument
-          ? `<${fo("Tame", "yellow", "italic")}><${fo(
-              this.currentInstrument,
-              "green",
-              "italic"
-            )}> `
-          : `<${fo("Tame", "yellow", "italic")}> `,
-      },
-    ]);
+  private promptForCommand() {
+    const promptMessage = this.currentInstrument
+      ? `<${fo("Tame", "yellow", "italic")}><${fo(
+          this.currentInstrument,
+          "green",
+          "italic"
+        )}> `
+      : `<${fo("Tame", "yellow", "italic")}> `;
 
-    this.handleCommand(command.command);
+    this.rl?.question(promptMessage, (command) => {
+      this.handleCommand(command);
+    });
   }
 
   private handleCommand(command: string) {
@@ -223,7 +221,7 @@ export class Client {
 
   private quit() {
     console.log("Exiting...");
-    this.rl.close();
+    this.rl?.close();
     process.exit(0); // Exit the application
   }
 
