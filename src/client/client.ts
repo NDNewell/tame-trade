@@ -133,30 +133,48 @@ export class Client {
     }
   }
 
-  async startSession() {
-    const chosenExchange = await this.chooseExchange();
-    console.log(`Using exchange: ${chosenExchange}`);
+  async startSession(): Promise<void> {
+    console.log("Starting trading session...");
+
+    const availableExchanges = await this.configManager.getExchanges();
+    let selectedExchange = "";
+
+    if (availableExchanges.length === 0) {
+      console.log("No exchanges available. Please add an exchange first.");
+      return;
+    } else if (availableExchanges.length === 1) {
+      selectedExchange = availableExchanges[0];
+    } else {
+      selectedExchange = await this.selectExchange();
+    }
+
+    if (!selectedExchange) {
+      return;
+    }
+
+    console.log(`Using exchange: ${selectedExchange}`);
     this.availableMarkets = await this.tradingApi.getMarkets();
     this.promptForCommand();
   }
 
-  private async chooseExchange() {
-    const exchanges = await this.configManager.getExchanges();
+  async selectExchange(): Promise<string> {
+    const availableExchanges = await this.configManager.getExchanges();
 
-    if (exchanges.length === 1) {
-      return exchanges[0];
-    } else {
-      const { chosenExchange } = await inquirer.prompt([
-        {
-          type: "list",
-          name: "chosenExchange",
-          message: "Which exchange would you like to use?",
-          choices: exchanges,
-        },
-      ]);
-
-      return chosenExchange;
+    if (availableExchanges.length === 0) {
+      console.log("No exchanges available. Please add an exchange first.");
+      return "";
     }
+
+    const { selectedExchange } = await inquirer.prompt([
+      {
+        type: "list",
+        name: "selectedExchange",
+        message: "Choose an exchange to trade on:",
+        choices: availableExchanges,
+      },
+    ]);
+
+    return selectedExchange;
   }
 
   private async promptForCommand() {
