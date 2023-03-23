@@ -36,17 +36,29 @@ With this alias configuration, typing b in the terminal will execute the limit b
 ### General Commands
 
 `instrument [symbol]`: Switch to another instrument (e.g., instrument btc-perp or instrument eth-perp).
+
 `buy [size] @ [price]`: Place a limit buy order (e.g., buy 0.001 @ 9000).
+
 `sell [size] @ [price]`: Place a limit sell order (e.g., sell 0.001 @ 9000).
+
 `stop [price]`: Place a stop loss order (e.g., stop 15000).
+
 `trigger buy [size] [price] or trigger sell [size] [price]`: Place a non-reduce-only stop order.
+
 `bump + [value] or bump - [value]`: Bump all orders by the specified value.
+
 `cancel all`: Cancel all resting orders, including stops.
+
 `cancel limits`: Cancel all resting orders, excluding stops.
+
 `cancel stops`: Cancel stop loss, take profit, and trailing stop orders.
+
 `cancel buys`: Cancel buy orders.
+
 `cancel sells`: Cancel sell orders.
+
 `logout`: Delete stored API credentials from the tame-config-db.json file.
+
 `q`: Quit the application.
 
 ## License
