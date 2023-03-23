@@ -66,6 +66,7 @@ export class Client {
       { name: "Add Exchange", value: "addExchange" },
       { name: "Remove Exchange", value: "removeExchange" },
       { name: "Delete Profile", value: "deleteProfile" },
+      { name: "Quit", value: "quit" },
     ];
 
     const { action } = await inquirer.prompt([
@@ -94,6 +95,9 @@ export class Client {
       case "deleteProfile":
         await this.configManager.deleteProfile();
         console.log("Profile deleted.");
+        this.quit();
+        break;
+      case "quit":
         this.quit();
         break;
       default:
