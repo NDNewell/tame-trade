@@ -11,11 +11,13 @@
   "license": "ISC",
   "dependencies": {
     "@types/node": "^16.11.12",
+    "console-clear": "^1.1.1",
     "inquirer": "^9.1.5",
     "ts-node": "^10.4.0",
     "typescript": "^4.5.4"
   },
   "devDependencies": {
+    "@types/console-clear": "^1.1.0",
     "@types/inquirer": "^9.0.3"
   }
 }

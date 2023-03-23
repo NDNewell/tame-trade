@@ -5,6 +5,7 @@ import { TradingApi } from "../trading/tradingApi";
 import { ConfigManager } from "../config/configManager";
 import { formatOutput as fo } from "../utils/formatOutput";
 import inquirer from "inquirer";
+import clear from "console-clear";
 
 export class Client {
   private rl: readline.Interface;
@@ -54,6 +55,8 @@ export class Client {
       },
     ]);
 
+    clear();
+
     if (action === "continue") {
       await this.addExchange();
     } else {
@@ -77,6 +80,8 @@ export class Client {
         choices: menuChoices,
       },
     ]);
+
+    clear();
 
     switch (action) {
       case "startTrading":
@@ -117,6 +122,8 @@ export class Client {
             ),
           },
         ]);
+
+        clear();
 
         const updatedExchanges = profile.exchanges.filter(
           (exchangeProfile) =>
@@ -241,6 +248,8 @@ export class Client {
       },
     ]);
 
+    clear();
+
     const { clientId } = await inquirer.prompt([
       {
         type: "input",
@@ -248,6 +257,8 @@ export class Client {
         message: "Enter your Client ID:",
       },
     ]);
+
+    clear();
 
     const { clientSecret } = await inquirer.prompt([
       {
@@ -257,41 +268,13 @@ export class Client {
       },
     ]);
 
+    clear();
+
     await this.configManager.addExchange(
       selectedExchange,
       clientId,
       clientSecret
     );
     console.log(`${selectedExchange} added successfully.`);
-  }
-
-  private async promptQuestion(
-    question: string,
-    clearAfterInput: boolean = false
-  ): Promise<string> {
-    const answer = await inquirer.prompt([
-      {
-        type: "input",
-        name: "answer",
-        message: question,
-      },
-    ]);
-
-    if (
-      answer.answer.toLowerCase() === "quit" ||
-      answer.answer.toLowerCase() === "q"
-    ) {
-      this.quit();
-    }
-
-    if (clearAfterInput) {
-      this.clearLine();
-    }
-
-    return answer.answer;
-  }
-
-  private clearLine() {
-    readline.clearScreenDown(process.stdout);
   }
 }
