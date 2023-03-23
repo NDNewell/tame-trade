@@ -143,12 +143,14 @@ export class Client {
   async startSession(): Promise<void> {
     console.log("Starting trading session...");
 
-    const availableExchanges = await this.configManager.getExchanges();
+    let availableExchanges = await this.configManager.getExchanges();
     let selectedExchange = "";
 
     if (availableExchanges.length === 0) {
       console.log("No exchanges available. Please add an exchange first.");
-      return;
+      await this.addExchange();
+      availableExchanges = await this.configManager.getExchanges();
+      selectedExchange = availableExchanges[0];
     } else if (availableExchanges.length === 1) {
       selectedExchange = availableExchanges[0];
     } else {
