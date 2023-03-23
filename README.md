@@ -1,6 +1,6 @@
 # Tame
 
-Tame is a Node.js and TypeScript trading app that communicates with Deribit's API. It provides a terminal-based client interface for users to input basic string commands, such as limit buy .01. The app also supports alias functionality, which allows users to create custom shortcuts for core commands.
+Tame is a Node.js and TypeScript trading app that communicates with Deribit's API. It provides a terminal-based client interface for users to input basic string commands, such as `limit buy .01`. The app also supports alias functionality, which allows users to create custom shortcuts for core commands.
 
 ## Installation
 
