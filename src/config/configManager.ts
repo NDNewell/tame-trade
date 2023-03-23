@@ -4,10 +4,14 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 
-export interface Profile {
+export interface ExchangeProfile {
   exchange: string;
   clientId: string;
   clientSecret: string;
+}
+
+export interface Profile {
+  exchanges: ExchangeProfile[];
 }
 
 export class ConfigManager {
@@ -32,18 +36,42 @@ export class ConfigManager {
     }
   }
 
-  async createProfile(
+  async getExchanges(): Promise<string[]> {
+    if (await this.hasProfile()) {
+      const profile = await this.getProfile();
+      return profile.exchanges.map(
+        (exchangeProfile) => exchangeProfile.exchange
+      );
+    } else {
+      return [];
+    }
+  }
+
+  async addExchange(
     exchange: string,
     clientId: string,
     clientSecret: string
   ): Promise<void> {
-    const profile: Profile = {
+    const exchangeProfile: ExchangeProfile = {
       exchange,
       clientId,
       clientSecret,
     };
 
-    await fs.promises.writeFile(this.configFile, JSON.stringify(profile));
+    let currentProfile: Profile;
+
+    if (await this.hasProfile()) {
+      currentProfile = await this.getProfile();
+    } else {
+      currentProfile = { exchanges: [] };
+    }
+
+    currentProfile.exchanges.push(exchangeProfile);
+
+    await fs.promises.writeFile(
+      this.configFile,
+      JSON.stringify(currentProfile)
+    );
   }
 
   async getProfile(): Promise<Profile> {
@@ -53,6 +81,10 @@ export class ConfigManager {
     } else {
       throw new Error("Profile not found");
     }
+  }
+
+  async updateProfile(profile: Profile): Promise<void> {
+    await fs.promises.writeFile(this.configFile, JSON.stringify(profile));
   }
 
   async deleteProfile(): Promise<void> {
