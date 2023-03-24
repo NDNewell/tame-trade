@@ -3,6 +3,8 @@
 import inquirer from "inquirer";
 import clear from "console-clear";
 
+import { ExchangeProfile } from "../config/configManager";
+
 export class UserInterface {
   async createProfile(): Promise<string> {
     const { action } = await inquirer.prompt([
@@ -20,5 +22,22 @@ export class UserInterface {
     clear();
 
     return action;
+  }
+
+  async removeExchange(profile: any): Promise<string> {
+    const { exchangeToRemove } = await inquirer.prompt([
+      {
+        type: "list",
+        name: "exchange",
+        message: "Choose an exchange to remove:",
+        choices: profile.exchanges.map((exchangeProfile: ExchangeProfile) => {
+          return exchangeProfile.exchange;
+        }),
+      },
+    ]);
+
+    clear();
+
+    return exchangeToRemove;
   }
 }

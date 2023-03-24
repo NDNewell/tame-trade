@@ -114,22 +114,11 @@ export class Client {
       const profile = await this.configManager.getProfile();
 
       if (profile.exchanges.length > 0) {
-        const exchangeToRemove = await inquirer.prompt([
-          {
-            type: "list",
-            name: "exchange",
-            message: "Choose an exchange to remove:",
-            choices: profile.exchanges.map(
-              (exchangeProfile) => exchangeProfile.exchange
-            ),
-          },
-        ]);
-
-        clear();
-
+        const exchangeToRemove = await this.userInterface.removeExchange(
+          profile
+        );
         const updatedExchanges = profile.exchanges.filter(
-          (exchangeProfile) =>
-            exchangeProfile.exchange !== exchangeToRemove.exchange
+          (exchangeProfile) => exchangeProfile.exchange !== exchangeToRemove
         );
 
         await this.configManager.updateProfile({
