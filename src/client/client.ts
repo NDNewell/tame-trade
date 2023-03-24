@@ -4,6 +4,7 @@ import * as readline from "readline";
 import { TradingApi } from "../trading/tradingApi";
 import { ConfigManager } from "../config/configManager";
 import { formatOutput as fo } from "../utils/formatOutput";
+import { AuthManager } from "../auth";
 import inquirer from "inquirer";
 import clear from "console-clear";
 import * as bcrypt from "bcrypt";
@@ -14,45 +15,20 @@ export class Client {
   private tradingApi: TradingApi;
   private availableMarkets: string[];
   private configManager: ConfigManager;
+  private authManager: AuthManager;
 
   constructor() {
     this.currentInstrument = "";
     this.tradingApi = new TradingApi();
     this.availableMarkets = [];
     this.configManager = new ConfigManager();
+    this.authManager = new AuthManager();
     console.log("Client initialized");
   }
 
   async start() {
     if (await this.configManager.hasProfile()) {
-      const storedPasswordHash = await this.configManager.getPasswordHash();
-      let attempts = 0;
-      let passwordCorrect = false;
-
-      while (attempts < 3) {
-        const { enteredPassword } = await inquirer.prompt([
-          {
-            type: "password",
-            name: "enteredPassword",
-            message: "Enter your password:",
-          },
-        ]);
-
-        passwordCorrect = await bcrypt.compare(
-          enteredPassword,
-          storedPasswordHash
-        );
-
-        if (passwordCorrect) {
-          break;
-        } else {
-          attempts++;
-          console.log(
-            `Incorrect password. You have ${3 - attempts} attempts remaining.`
-          );
-        }
-      }
-
+      const passwordCorrect = await this.authManager.verifyPassword();
       if (!passwordCorrect) {
         console.log("Too many incorrect password attempts. Exiting...");
         process.exit(1);
