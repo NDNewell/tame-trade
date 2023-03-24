@@ -6,6 +6,7 @@ import { ConfigManager } from "../config/configManager";
 import { formatOutput as fo } from "../utils/formatOutput";
 import inquirer from "inquirer";
 import clear from "console-clear";
+import * as bcrypt from "bcrypt";
 
 export class Client {
   private rl?: readline.Interface;
@@ -54,9 +55,43 @@ export class Client {
     clear();
 
     if (action === "continue") {
+      await this.configManager.initializeProfile();
+      await this.createPassword();
       await this.addExchange();
     } else {
       this.quit();
+    }
+  }
+
+  private async createPassword(): Promise<void> {
+    const { password } = await inquirer.prompt([
+      {
+        type: "password",
+        name: "password",
+        message: "Create a password to increase security:",
+      },
+    ]);
+
+    const { confirmPassword } = await inquirer.prompt([
+      {
+        type: "password",
+        name: "confirmPassword",
+        message: "Confirm your password:",
+      },
+    ]);
+
+    if (password !== confirmPassword) {
+      console.log("Passwords do not match. Please try again.");
+      await this.createPassword();
+    } else {
+      const saltRounds = 10;
+      const passwordHash = await bcrypt.hash(password, saltRounds);
+
+      const currentProfile = await this.configManager.getProfile();
+      currentProfile.passwordHash = passwordHash;
+
+      await this.configManager.updateProfile(currentProfile);
+      console.log("Password created successfully.");
     }
   }
 
@@ -130,7 +165,10 @@ export class Client {
             exchangeProfile.exchange !== exchangeToRemove.exchange
         );
 
-        await this.configManager.updateProfile({ exchanges: updatedExchanges });
+        await this.configManager.updateProfile({
+          exchanges: updatedExchanges,
+          passwordHash: profile.passwordHash,
+        });
         console.log("Exchange removed successfully.");
       } else {
         console.log("No exchanges available to remove.");

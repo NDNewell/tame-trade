@@ -12,6 +12,7 @@ export interface ExchangeProfile {
 
 export interface Profile {
   exchanges: ExchangeProfile[];
+  passwordHash: string;
 }
 
 export class ConfigManager {
@@ -25,6 +26,11 @@ export class ConfigManager {
     if (!fs.existsSync(this.configPath)) {
       fs.mkdirSync(this.configPath);
     }
+  }
+
+  async initializeProfile(): Promise<void> {
+    const emptyProfile: Profile = { exchanges: [], passwordHash: "" };
+    await fs.promises.writeFile(this.configFile, JSON.stringify(emptyProfile));
   }
 
   async hasProfile(): Promise<boolean> {
@@ -63,7 +69,7 @@ export class ConfigManager {
     if (await this.hasProfile()) {
       currentProfile = await this.getProfile();
     } else {
-      currentProfile = { exchanges: [] };
+      currentProfile = { exchanges: [], passwordHash: "" };
     }
 
     currentProfile.exchanges.push(exchangeProfile);
