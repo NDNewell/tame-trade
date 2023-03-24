@@ -4,9 +4,30 @@ import inquirer from "inquirer";
 import clear from "console-clear";
 
 import { ExchangeProfile } from "../config/configManager";
-import { getJSDocReadonlyTag } from "typescript";
 
 export class UserInterface {
+  async displayHomeScreen(): Promise<string> {
+    const menuChoices = [
+      { name: "Start Trading", value: "startTrading" },
+      { name: "Add Exchange", value: "addExchange" },
+      { name: "Remove Exchange", value: "removeExchange" },
+      { name: "Delete Profile", value: "deleteProfile" },
+      { name: "Quit", value: "quit" },
+    ];
+    const { action } = await inquirer.prompt([
+      {
+        type: "list",
+        name: "action",
+        message: "Choose an action:",
+        choices: menuChoices,
+      },
+    ]);
+
+    clear();
+
+    return action;
+  }
+
   async createProfile(): Promise<string> {
     const { action } = await inquirer.prompt([
       {

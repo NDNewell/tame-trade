@@ -63,24 +63,7 @@ export class Client {
   }
 
   private async showMenu() {
-    const menuChoices = [
-      { name: "Start Trading", value: "startTrading" },
-      { name: "Add Exchange", value: "addExchange" },
-      { name: "Remove Exchange", value: "removeExchange" },
-      { name: "Delete Profile", value: "deleteProfile" },
-      { name: "Quit", value: "quit" },
-    ];
-
-    const { action } = await inquirer.prompt([
-      {
-        type: "list",
-        name: "action",
-        message: "Choose an action:",
-        choices: menuChoices,
-      },
-    ]);
-
-    clear();
+    const action = await this.userInterface.displayHomeScreen();
 
     switch (action) {
       case "startTrading":
