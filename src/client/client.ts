@@ -4,7 +4,8 @@ import * as readline from "readline";
 import { TradingApi } from "../trading/tradingApi";
 import { ConfigManager } from "../config/configManager";
 import { formatOutput as fo } from "../utils/formatOutput";
-import { AuthManager } from "../auth/AuthManager";
+import { AuthManager } from "../auth/authManager";
+import { UserInterface } from "./userInterface";
 import inquirer from "inquirer";
 import clear from "console-clear";
 
@@ -15,6 +16,7 @@ export class Client {
   private availableMarkets: string[];
   private configManager: ConfigManager;
   private authManager: AuthManager;
+  private userInterface: UserInterface;
 
   constructor() {
     this.currentInstrument = "";
@@ -22,6 +24,7 @@ export class Client {
     this.availableMarkets = [];
     this.configManager = new ConfigManager();
     this.authManager = new AuthManager();
+    this.userInterface = new UserInterface();
     console.log("Client initialized");
   }
 
@@ -48,19 +51,7 @@ export class Client {
       )}`
     );
 
-    const { action } = await inquirer.prompt([
-      {
-        type: "list",
-        name: "action",
-        message: "Choose an action:",
-        choices: [
-          { name: "Continue", value: "continue" },
-          { name: "Quit", value: "quit" },
-        ],
-      },
-    ]);
-
-    clear();
+    const action = await this.userInterface.createProfile();
 
     if (action === "continue") {
       await this.configManager.initializeProfile();

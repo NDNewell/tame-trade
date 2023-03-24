@@ -1,3 +1,5 @@
+// src/index.ts
+
 import { Client } from "./client/client";
 
 async function main() {
