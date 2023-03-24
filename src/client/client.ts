@@ -40,20 +40,6 @@ export class Client {
     await this.showMenu();
   }
 
-  private async promptForPassword(): Promise<boolean> {
-    const { enteredPassword } = await inquirer.prompt([
-      {
-        type: "password",
-        name: "enteredPassword",
-        message: "Enter your password:",
-      },
-    ]);
-
-    const storedPasswordHash = await this.configManager.getPasswordHash();
-
-    return bcrypt.compare(enteredPassword, storedPasswordHash);
-  }
-
   private async createProfile() {
     console.log(`${fo("Welcome to Tame!", "yellow", "bold")}`);
     console.log(
@@ -79,42 +65,10 @@ export class Client {
 
     if (action === "continue") {
       await this.configManager.initializeProfile();
-      await this.createPassword();
+      await this.authManager.createPassword();
       await this.addExchange();
     } else {
       this.quit();
-    }
-  }
-
-  private async createPassword(): Promise<void> {
-    const { password } = await inquirer.prompt([
-      {
-        type: "password",
-        name: "password",
-        message: "Create a password to increase security:",
-      },
-    ]);
-
-    const { confirmPassword } = await inquirer.prompt([
-      {
-        type: "password",
-        name: "confirmPassword",
-        message: "Confirm your password:",
-      },
-    ]);
-
-    if (password !== confirmPassword) {
-      console.log("Passwords do not match. Please try again.");
-      await this.createPassword();
-    } else {
-      const saltRounds = 10;
-      const passwordHash = await bcrypt.hash(password, saltRounds);
-
-      const currentProfile = await this.configManager.getProfile();
-      currentProfile.passwordHash = passwordHash;
-
-      await this.configManager.updateProfile(currentProfile);
-      console.log("Password created successfully.");
     }
   }
 

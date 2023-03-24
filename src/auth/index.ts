@@ -42,4 +42,36 @@ export class AuthManager {
 
     return false;
   }
+
+  async createPassword(): Promise<void> {
+    const { password } = await inquirer.prompt([
+      {
+        type: "password",
+        name: "password",
+        message: "Create a password to increase security:",
+      },
+    ]);
+
+    const { confirmPassword } = await inquirer.prompt([
+      {
+        type: "password",
+        name: "confirmPassword",
+        message: "Confirm your password:",
+      },
+    ]);
+
+    if (password !== confirmPassword) {
+      console.log("Passwords do not match. Please try again.");
+      await this.createPassword();
+    } else {
+      const saltRounds = 10;
+      const passwordHash = await bcrypt.hash(password, saltRounds);
+
+      const currentProfile = await this.configManager.getProfile();
+      currentProfile.passwordHash = passwordHash;
+
+      await this.configManager.updateProfile(currentProfile);
+      console.log("Password created successfully.");
+    }
+  }
 }
