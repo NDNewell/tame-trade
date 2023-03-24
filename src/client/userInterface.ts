@@ -2,10 +2,24 @@
 
 import inquirer from "inquirer";
 import clear from "console-clear";
+import * as readline from "readline";
+import { TradingApi } from "../trading/tradingApi";
+import { formatOutput as fo } from "../utils/formatOutput";
 
 import { ExchangeProfile } from "../config/configManager";
 
 export class UserInterface {
+  private rl?: readline.Interface;
+  private currentInstrument: string;
+  private tradingApi: TradingApi;
+  private availableMarkets: string[];
+
+  constructor() {
+    this.tradingApi = new TradingApi();
+    this.currentInstrument = "";
+    this.availableMarkets = [];
+  }
+
   async displayHomeScreen(): Promise<string> {
     const menuChoices = [
       { name: "Start Trading", value: "startTrading" },
@@ -108,5 +122,52 @@ export class UserInterface {
     clear();
 
     return enteredCred;
+  }
+
+  async startTradingInterface(): Promise<void> {
+    this.availableMarkets = await this.tradingApi.getMarkets();
+    this.rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+
+    this.promptForCommand();
+  }
+
+  private promptForCommand() {
+    const promptMessage = this.currentInstrument
+      ? `<${fo("Tame", "yellow", "italic")}><${fo(
+          this.currentInstrument,
+          "green",
+          "italic"
+        )}> `
+      : `<${fo("Tame", "yellow", "italic")}> `;
+
+    this.rl?.question(promptMessage, (command) => {
+      this.handleCommand(command);
+    });
+  }
+
+  private handleCommand(command: string) {
+    if (command.startsWith("instrument ")) {
+      const instrument = command.split(" ")[1];
+      if (this.availableMarkets.includes(instrument)) {
+        this.currentInstrument = instrument;
+        console.log(`Switched to instrument: ${instrument}`);
+      } else {
+        console.log(`Invalid instrument: ${instrument}`);
+      }
+    } else if (command === "quit" || command === "q") {
+      this.quit();
+    } else {
+      console.log(`Command received: ${command}`);
+    }
+    this.promptForCommand();
+  }
+
+  quit() {
+    console.log("Exiting...");
+    this.rl?.close();
+    process.exit(0);
   }
 }

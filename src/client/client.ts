@@ -1,27 +1,19 @@
 // src/client/client.ts
 
 import * as readline from "readline";
-import { TradingApi } from "../trading/tradingApi";
+
 import { ConfigManager } from "../config/configManager";
 import { formatOutput as fo } from "../utils/formatOutput";
 import { AuthManager } from "../auth/authManager";
 import { UserInterface } from "./userInterface";
-import inquirer from "inquirer";
-import clear from "console-clear";
 
 export class Client {
   private rl?: readline.Interface;
-  private currentInstrument: string;
-  private tradingApi: TradingApi;
-  private availableMarkets: string[];
   private configManager: ConfigManager;
   private authManager: AuthManager;
   private userInterface: UserInterface;
 
   constructor() {
-    this.currentInstrument = "";
-    this.tradingApi = new TradingApi();
-    this.availableMarkets = [];
     this.configManager = new ConfigManager();
     this.authManager = new AuthManager();
     this.userInterface = new UserInterface();
@@ -58,7 +50,7 @@ export class Client {
       await this.authManager.createPassword();
       await this.addExchange();
     } else {
-      this.quit();
+      this.userInterface.quit();
     }
   }
 
@@ -80,10 +72,10 @@ export class Client {
       case "deleteProfile":
         await this.configManager.deleteProfile();
         console.log("Profile deleted.");
-        this.quit();
+        this.userInterface.quit();
         break;
       case "quit":
-        this.quit();
+        this.userInterface.quit();
         break;
       default:
         console.log("Invalid option.");
@@ -139,14 +131,8 @@ export class Client {
     }
 
     console.log(`Using exchange: ${selectedExchange}`);
-    this.availableMarkets = await this.tradingApi.getMarkets();
 
-    this.rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
-
-    this.promptForCommand();
+    this.userInterface.startTradingInterface();
   }
 
   async selectExchange(): Promise<string> {
@@ -158,43 +144,6 @@ export class Client {
     }
 
     return await this.userInterface.selectExchange(availableExchanges);
-  }
-
-  private promptForCommand() {
-    const promptMessage = this.currentInstrument
-      ? `<${fo("Tame", "yellow", "italic")}><${fo(
-          this.currentInstrument,
-          "green",
-          "italic"
-        )}> `
-      : `<${fo("Tame", "yellow", "italic")}> `;
-
-    this.rl?.question(promptMessage, (command) => {
-      this.handleCommand(command);
-    });
-  }
-
-  private handleCommand(command: string) {
-    if (command.startsWith("instrument ")) {
-      const instrument = command.split(" ")[1];
-      if (this.availableMarkets.includes(instrument)) {
-        this.currentInstrument = instrument;
-        console.log(`Switched to instrument: ${instrument}`);
-      } else {
-        console.log(`Invalid instrument: ${instrument}`);
-      }
-    } else if (command === "quit" || command === "q") {
-      this.quit();
-    } else {
-      console.log(`Command received: ${command}`);
-    }
-    this.promptForCommand();
-  }
-
-  private quit() {
-    console.log("Exiting...");
-    this.rl?.close();
-    process.exit(0); // Exit the application
   }
 
   async addExchange(): Promise<void> {
