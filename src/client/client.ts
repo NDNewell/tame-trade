@@ -24,11 +24,58 @@ export class Client {
   }
 
   async start() {
-    if (!(await this.configManager.hasProfile())) {
+    if (await this.configManager.hasProfile()) {
+      const storedPasswordHash = await this.configManager.getPasswordHash();
+      let attempts = 0;
+      let passwordCorrect = false;
+
+      while (attempts < 3) {
+        const { enteredPassword } = await inquirer.prompt([
+          {
+            type: "password",
+            name: "enteredPassword",
+            message: "Enter your password:",
+          },
+        ]);
+
+        passwordCorrect = await bcrypt.compare(
+          enteredPassword,
+          storedPasswordHash
+        );
+
+        if (passwordCorrect) {
+          break;
+        } else {
+          attempts++;
+          console.log(
+            `Incorrect password. You have ${3 - attempts} attempts remaining.`
+          );
+        }
+      }
+
+      if (!passwordCorrect) {
+        console.log("Too many incorrect password attempts. Exiting...");
+        process.exit(1);
+      }
+    } else {
       await this.createProfile();
     }
 
     await this.showMenu();
+  }
+
+  private async promptForPassword(): Promise<boolean> {
+    const { enteredPassword } = await inquirer.prompt([
+      {
+        type: "password",
+        name: "enteredPassword",
+        message: "Enter your password:",
+      },
+    ]);
+
+    const storedPasswordHash = await this.configManager.getPasswordHash();
+
+    return bcrypt.compare(enteredPassword, storedPasswordHash);
   }
 
   private async createProfile() {

@@ -42,6 +42,15 @@ export class ConfigManager {
     }
   }
 
+  async getPasswordHash(): Promise<string> {
+    if (await this.hasProfile()) {
+      const profile = await this.getProfile();
+      return profile.passwordHash;
+    } else {
+      throw new Error("Profile not found");
+    }
+  }
+
   async getExchanges(): Promise<string[]> {
     if (await this.hasProfile()) {
       const profile = await this.getProfile();
