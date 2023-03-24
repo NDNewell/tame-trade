@@ -228,66 +228,18 @@ export class Client {
       return;
     }
 
-    const { selectedExchange } = await inquirer.prompt([
-      {
-        type: "list",
-        name: "selectedExchange",
-        message: "Select an exchange:",
-        choices: availableExchanges,
-      },
-    ]);
+    const selectedExchange = await this.userInterface.selectExchange(
+      availableExchanges
+    );
 
-    clear();
-
-    let key, secret;
-
-    if (selectedExchange === "Kraken") {
-      const { apiKey } = await inquirer.prompt([
-        {
-          type: "input",
-          name: "apiKey",
-          message: "Enter your API Key:",
-        },
-      ]);
-
-      key = apiKey;
-
-      clear();
-
-      const { privateKey } = await inquirer.prompt([
-        {
-          type: "input",
-          name: "privateKey",
-          message: "Enter your Private Key:",
-        },
-      ]);
-
-      secret = privateKey;
-    } else {
-      const { clientIdInput } = await inquirer.prompt([
-        {
-          type: "input",
-          name: "clientIdInput",
-          message: "Enter your Client ID:",
-        },
-      ]);
-
-      key = clientIdInput;
-
-      clear();
-
-      const { clientSecretInput } = await inquirer.prompt([
-        {
-          type: "input",
-          name: "clientSecretInput",
-          message: "Enter your Client Secret:",
-        },
-      ]);
-
-      secret = clientSecretInput;
-    }
-
-    clear();
+    const key = await this.userInterface.addExchangeCredentials(
+      selectedExchange,
+      "key"
+    );
+    const secret = await this.userInterface.addExchangeCredentials(
+      selectedExchange,
+      "secret"
+    );
 
     await this.configManager.addExchange(selectedExchange, key, secret);
     console.log(`${selectedExchange} added successfully.`);
