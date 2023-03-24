@@ -4,10 +4,9 @@ import * as readline from "readline";
 import { TradingApi } from "../trading/tradingApi";
 import { ConfigManager } from "../config/configManager";
 import { formatOutput as fo } from "../utils/formatOutput";
-import { AuthManager } from "../auth";
+import { AuthManager } from "../auth/AuthManager";
 import inquirer from "inquirer";
 import clear from "console-clear";
-import * as bcrypt from "bcrypt";
 
 export class Client {
   private rl?: readline.Interface;
