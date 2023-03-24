@@ -6,8 +6,8 @@ import * as path from "path";
 
 export interface ExchangeProfile {
   exchange: string;
-  clientId: string;
-  clientSecret: string;
+  key: string;
+  secret: string;
 }
 
 export interface Profile {
@@ -49,13 +49,13 @@ export class ConfigManager {
 
   async addExchange(
     exchange: string,
-    clientId: string,
-    clientSecret: string
+    key: string,
+    secret: string
   ): Promise<void> {
     const exchangeProfile: ExchangeProfile = {
       exchange,
-      clientId,
-      clientSecret,
+      key,
+      secret,
     };
 
     let currentProfile: Profile;
