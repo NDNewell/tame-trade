@@ -89,18 +89,18 @@ export class Client {
   async startSession(): Promise<void> {
     console.log("Starting trading session...");
 
-    let availableExchanges = await this.configManager.getExchanges();
+    let availableExchanges = await this.exchangeManager.getAddedExchanges();
     let selectedExchange = "";
 
     if (availableExchanges.length === 0) {
       console.log("No exchanges available. Please add an exchange first.");
       await this.exchangeManager.addExchange();
-      availableExchanges = await this.configManager.getExchanges();
+      availableExchanges = await this.exchangeManager.getAddedExchanges();
       selectedExchange = availableExchanges[0];
     } else if (availableExchanges.length === 1) {
       selectedExchange = availableExchanges[0];
     } else {
-      selectedExchange = await this.selectExchange();
+      selectedExchange = await this.exchangeManager.selectExchange();
     }
 
     if (!selectedExchange) {
@@ -110,17 +110,6 @@ export class Client {
     console.log(`Using exchange: ${selectedExchange}`);
 
     this.userInterface.startTradingInterface();
-  }
-
-  async selectExchange(): Promise<string> {
-    const availableExchanges = await this.configManager.getExchanges();
-
-    if (availableExchanges.length === 0) {
-      console.log("No exchanges available. Please add an exchange first.");
-      return "";
-    }
-
-    return await this.userInterface.selectExchange(availableExchanges);
   }
 
   async addExchange(): Promise<void> {}

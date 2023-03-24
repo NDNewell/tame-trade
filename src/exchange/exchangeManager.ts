@@ -1,11 +1,7 @@
 // src/exchange/exchangeManager.ts
 
 import { UserInterface } from "../client/userInterface";
-import {
-  ConfigManager,
-  ExchangeProfile,
-  Profile,
-} from "../config/configManager";
+import { ConfigManager } from "../config/configManager";
 
 export class ExchangeManager {
   private configManager: ConfigManager;
@@ -20,7 +16,7 @@ export class ExchangeManager {
     console.log("Adding an exchange...");
 
     const supportedExchanges = ["Kraken", "Deribit", "Binance"];
-    const currentExchanges = await this.configManager.getExchanges();
+    const currentExchanges = await this.getAddedExchanges();
     const availableExchanges = supportedExchanges.filter(
       (exchange) => !currentExchanges.includes(exchange)
     );
@@ -73,7 +69,7 @@ export class ExchangeManager {
     }
   }
 
-  async getExchanges(): Promise<string[]> {
+  async getAddedExchanges(): Promise<string[]> {
     if (await this.configManager.hasProfile()) {
       const profile = await this.configManager.getProfile();
       return profile.exchanges.map(
@@ -82,5 +78,16 @@ export class ExchangeManager {
     } else {
       return [];
     }
+  }
+
+  async selectExchange(): Promise<string> {
+    const availableExchanges = await this.getAddedExchanges();
+
+    if (availableExchanges.length === 0) {
+      console.log("No exchanges available. Please add an exchange first.");
+      return "";
+    }
+
+    return await this.userInterface.selectExchange(availableExchanges);
   }
 }

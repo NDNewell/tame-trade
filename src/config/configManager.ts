@@ -51,17 +51,6 @@ export class ConfigManager {
     }
   }
 
-  async getExchanges(): Promise<string[]> {
-    if (await this.hasProfile()) {
-      const profile = await this.getProfile();
-      return profile.exchanges.map(
-        (exchangeProfile) => exchangeProfile.exchange
-      );
-    } else {
-      return [];
-    }
-  }
-
   async addExchange(
     exchange: string,
     key: string,
