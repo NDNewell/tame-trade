@@ -40,4 +40,19 @@ export class UserInterface {
 
     return exchangeToRemove;
   }
+
+  async selectExchange(availableExchanges: any): Promise<string> {
+    const { exchange } = await inquirer.prompt([
+      {
+        type: "list",
+        name: "exchange",
+        message: "Choose an exchange:",
+        choices: availableExchanges,
+      },
+    ]);
+
+    clear();
+
+    return exchange;
+  }
 }

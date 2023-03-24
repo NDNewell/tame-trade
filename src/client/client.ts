@@ -174,16 +174,7 @@ export class Client {
       return "";
     }
 
-    const { selectedExchange } = await inquirer.prompt([
-      {
-        type: "list",
-        name: "selectedExchange",
-        message: "Choose an exchange to trade on:",
-        choices: availableExchanges,
-      },
-    ]);
-
-    return selectedExchange;
+    return await this.userInterface.selectExchange(availableExchanges);
   }
 
   private promptForCommand() {
