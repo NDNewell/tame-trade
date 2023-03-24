@@ -47,11 +47,15 @@ export class ExchangeManager {
     console.log(`${selectedExchange} added successfully.`);
   }
 
-  async removeExchange(exchangeToRemove: string): Promise<void> {
+  async removeExchange(): Promise<void> {
     if (await this.configManager.hasProfile()) {
       const profile = await this.configManager.getProfile();
 
       if (profile.exchanges.length > 0) {
+        const exchangeToRemove = await this.userInterface.removeExchange(
+          profile
+        );
+
         const updatedExchanges = profile.exchanges.filter(
           (exchangeProfile) => exchangeProfile.exchange !== exchangeToRemove
         );
@@ -60,11 +64,12 @@ export class ExchangeManager {
           exchanges: updatedExchanges,
           passwordHash: profile.passwordHash,
         });
+        console.log("Exchange removed successfully.");
       } else {
-        throw new Error("No exchanges available to remove.");
+        console.log("No exchanges available to remove.");
       }
     } else {
-      throw new Error("No profile found. Please create a profile first.");
+      console.log("No profile found. Please create a profile first.");
     }
   }
 

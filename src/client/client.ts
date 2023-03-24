@@ -68,7 +68,7 @@ export class Client {
         await this.showMenu();
         break;
       case "removeExchange":
-        await this.removeExchange();
+        await this.exchangeManager.removeExchange();
         await this.showMenu();
         break;
       case "deleteProfile":
@@ -83,31 +83,6 @@ export class Client {
         console.log("Invalid option.");
         await this.showMenu();
         break;
-    }
-  }
-
-  private async removeExchange() {
-    if (await this.configManager.hasProfile()) {
-      const profile = await this.configManager.getProfile();
-
-      if (profile.exchanges.length > 0) {
-        const exchangeToRemove = await this.userInterface.removeExchange(
-          profile
-        );
-        const updatedExchanges = profile.exchanges.filter(
-          (exchangeProfile) => exchangeProfile.exchange !== exchangeToRemove
-        );
-
-        await this.configManager.updateProfile({
-          exchanges: updatedExchanges,
-          passwordHash: profile.passwordHash,
-        });
-        console.log("Exchange removed successfully.");
-      } else {
-        console.log("No exchanges available to remove.");
-      }
-    } else {
-      console.log("No profile found. Please create a profile first.");
     }
   }
 

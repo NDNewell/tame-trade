@@ -61,20 +61,20 @@ export class UserInterface {
   }
 
   async removeExchange(profile: any): Promise<string> {
-    const { exchangeToRemove } = await inquirer.prompt([
+    const { exchange } = await inquirer.prompt([
       {
         type: "list",
         name: "exchange",
         message: "Choose an exchange to remove:",
-        choices: profile.exchanges.map((exchangeProfile: ExchangeProfile) => {
-          return exchangeProfile.exchange;
-        }),
+        choices: profile.exchanges.map(
+          (exchangeProfile: ExchangeProfile) => exchangeProfile.exchange
+        ),
       },
     ]);
 
     clear();
 
-    return exchangeToRemove;
+    return exchange;
   }
 
   async selectExchange(availableExchanges: any): Promise<string> {
