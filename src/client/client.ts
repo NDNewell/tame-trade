@@ -6,15 +6,17 @@ import { ConfigManager } from "../config/configManager";
 import { formatOutput as fo } from "../utils/formatOutput";
 import { AuthManager } from "../auth/authManager";
 import { UserInterface } from "./userInterface";
+import { ExchangeManager } from "../exchange/exchangeManager";
 
 export class Client {
-  private rl?: readline.Interface;
   private configManager: ConfigManager;
   private authManager: AuthManager;
   private userInterface: UserInterface;
+  private exchangeManager: ExchangeManager;
 
   constructor() {
     this.configManager = new ConfigManager();
+    this.exchangeManager = new ExchangeManager();
     this.authManager = new AuthManager();
     this.userInterface = new UserInterface();
     console.log("Client initialized");
@@ -48,7 +50,7 @@ export class Client {
     if (action === "continue") {
       await this.configManager.initializeProfile();
       await this.authManager.createPassword();
-      await this.addExchange();
+      await this.exchangeManager.addExchange();
     } else {
       this.userInterface.quit();
     }
@@ -62,7 +64,7 @@ export class Client {
         await this.startSession();
         break;
       case "addExchange":
-        await this.addExchange();
+        await this.exchangeManager.addExchange();
         await this.showMenu();
         break;
       case "removeExchange":
@@ -117,7 +119,7 @@ export class Client {
 
     if (availableExchanges.length === 0) {
       console.log("No exchanges available. Please add an exchange first.");
-      await this.addExchange();
+      await this.exchangeManager.addExchange();
       availableExchanges = await this.configManager.getExchanges();
       selectedExchange = availableExchanges[0];
     } else if (availableExchanges.length === 1) {
@@ -146,34 +148,5 @@ export class Client {
     return await this.userInterface.selectExchange(availableExchanges);
   }
 
-  async addExchange(): Promise<void> {
-    console.log("Adding an exchange...");
-
-    const supportedExchanges = ["Kraken", "Deribit", "Binance"];
-    const currentExchanges = await this.configManager.getExchanges();
-    const availableExchanges = supportedExchanges.filter(
-      (exchange) => !currentExchanges.includes(exchange)
-    );
-
-    if (availableExchanges.length === 0) {
-      console.log("You have already added all supported exchanges.");
-      return;
-    }
-
-    const selectedExchange = await this.userInterface.selectExchange(
-      availableExchanges
-    );
-
-    const key = await this.userInterface.addExchangeCredentials(
-      selectedExchange,
-      "key"
-    );
-    const secret = await this.userInterface.addExchangeCredentials(
-      selectedExchange,
-      "secret"
-    );
-
-    await this.configManager.addExchange(selectedExchange, key, secret);
-    console.log(`${selectedExchange} added successfully.`);
-  }
+  async addExchange(): Promise<void> {}
 }
