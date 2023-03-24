@@ -1,9 +1,6 @@
 // src/client/client.ts
 
-import * as readline from "readline";
-
 import { ConfigManager } from "../config/configManager";
-import { formatOutput as fo } from "../utils/formatOutput";
 import { AuthManager } from "../auth/authManager";
 import { UserInterface } from "./userInterface";
 import { ExchangeManager } from "../exchange/exchangeManager";
@@ -37,13 +34,7 @@ export class Client {
   }
 
   private async createProfile() {
-    console.log(`${fo("Welcome to Tame!", "yellow", "bold")}`);
-    console.log(
-      `${fo(
-        "In trading, speed, execution, and emotional control are crucial to success. With Tame, you'll be able to access powerful trading commands and custom shortcuts that will allow you to execute trades faster and more efficiently.\n\nOur emotions can often get in the way of rational decision-making, which is why Tame has guardrails to help you stay on track and avoid impulsive trades. Tame will hopefully teach you how to recognize and regulate your emotions, so you can make sound trading decisions while also maximizing your gains.\n\nNow, go be a ruthless predator, and trade with speed, precision, and confidence!",
-        "yellow"
-      )}`
-    );
+    this.userInterface.displayWelcomeScreen();
 
     const action = await this.userInterface.createProfile();
 
