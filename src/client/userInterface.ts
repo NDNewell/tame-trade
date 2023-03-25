@@ -115,7 +115,7 @@ export class UserInterface {
         message = "Enter you Private Key";
       }
     } else if (exchange.toLowerCase() === "deribit") {
-      if (credential === "secret") {
+      if (credential === "key") {
         message = "Enter your Client ID:";
       } else if (credential === "secret") {
         message = "Enter your Client Secret:";

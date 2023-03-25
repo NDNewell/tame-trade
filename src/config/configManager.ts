@@ -3,6 +3,8 @@
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { AppError } from "../errors/appError";
+import { ErrorType } from "../errors/errorType";
 
 export interface ExchangeProfile {
   exchange: string;
@@ -47,7 +49,7 @@ export class ConfigManager {
       const profile = await this.getProfile();
       return profile.passwordHash;
     } else {
-      throw new Error("Profile not found");
+      throw new AppError(ErrorType.PROFILE_NOT_FOUND);
     }
   }
 
@@ -83,7 +85,7 @@ export class ConfigManager {
       const profileData = await fs.promises.readFile(this.configFile, "utf8");
       return JSON.parse(profileData) as Profile;
     } else {
-      throw new Error("Profile not found");
+      throw new AppError(ErrorType.PROFILE_NOT_FOUND);
     }
   }
 
@@ -95,7 +97,7 @@ export class ConfigManager {
     try {
       await fs.promises.unlink(this.configFile);
     } catch (error) {
-      throw new Error("Failed to delete profile.");
+      throw new AppError(ErrorType.DELETE_PROFILE_FAILED);
     }
   }
 }
