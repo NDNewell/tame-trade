@@ -11,17 +11,18 @@ export class Client {
   private authManager: AuthManager;
   private userInterface: UserInterface;
   private exchangeManager: ExchangeManager;
+  private exchangeClient: ExchangeClient;
 
   constructor() {
     this.configManager = new ConfigManager();
     this.exchangeManager = new ExchangeManager();
     this.authManager = new AuthManager();
     this.userInterface = new UserInterface();
+    this.exchangeClient = new ExchangeClient();
     console.log('Client initialized');
   }
 
   async start() {
-    ExchangeClient.testCcxt();
     if (await this.configManager.hasProfile()) {
       const passwordCorrect = await this.authManager.verifyPassword();
       if (!passwordCorrect) {
@@ -99,6 +100,8 @@ export class Client {
     if (!selectedExchange) {
       return;
     }
+
+    this.exchangeClient.setExchange(selectedExchange);
 
     console.log(`Using exchange: ${selectedExchange}`);
 

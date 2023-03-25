@@ -1,48 +1,50 @@
 // src/client/userInterface.ts
 
-import inquirer from "inquirer";
-import clear from "console-clear";
-import * as readline from "readline";
-import { TradingApi } from "../trading/tradingApi";
-import { formatOutput as fo } from "../utils/formatOutput";
-
-import { ExchangeProfile } from "../config/configManager";
+import inquirer from 'inquirer';
+import clear from 'console-clear';
+import * as readline from 'readline';
+import { TradingApi } from '../trading/tradingApi';
+import { formatOutput as fo } from '../utils/formatOutput';
+import { ExchangeProfile } from '../config/configManager';
+import { ExchangeCommand, CommandType } from '../commands/exchangeCommand';
 
 export class UserInterface {
   private rl?: readline.Interface;
   private currentInstrument: string;
   private tradingApi: TradingApi;
   private availableMarkets: string[];
+  private exchangeCommand: ExchangeCommand;
 
   constructor() {
     this.tradingApi = new TradingApi();
-    this.currentInstrument = "";
+    this.exchangeCommand = new ExchangeCommand();
+    this.currentInstrument = '';
     this.availableMarkets = [];
   }
 
   async displayWelcomeScreen(): Promise<void> {
-    console.log(`${fo("Welcome to Tame!", "yellow", "bold")}`);
+    console.log(`${fo('Welcome to Tame!', 'yellow', 'bold')}`);
     console.log(
       `${fo(
         "In trading, speed, execution, and emotional control are crucial to success. With Tame, you'll be able to access powerful trading commands and custom shortcuts that will allow you to execute trades faster and more efficiently.\n\nOur emotions can often get in the way of rational decision-making, which is why Tame has guardrails to help you stay on track and avoid impulsive trades. Tame will hopefully teach you how to recognize and regulate your emotions, so you can make sound trading decisions while also maximizing your gains.\n\nNow, go be a ruthless predator, and trade with speed, precision, and confidence!",
-        "yellow"
+        'yellow'
       )}`
     );
   }
 
   async displayHomeScreen(): Promise<string> {
     const menuChoices = [
-      { name: "Start Trading", value: "startTrading" },
-      { name: "Add Exchange", value: "addExchange" },
-      { name: "Remove Exchange", value: "removeExchange" },
-      { name: "Delete Profile", value: "deleteProfile" },
-      { name: "Quit", value: "quit" },
+      { name: 'Start Trading', value: 'startTrading' },
+      { name: 'Add Exchange', value: 'addExchange' },
+      { name: 'Remove Exchange', value: 'removeExchange' },
+      { name: 'Delete Profile', value: 'deleteProfile' },
+      { name: 'Quit', value: 'quit' },
     ];
     const { action } = await inquirer.prompt([
       {
-        type: "list",
-        name: "action",
-        message: "Choose an action:",
+        type: 'list',
+        name: 'action',
+        message: 'Choose an action:',
         choices: menuChoices,
       },
     ]);
@@ -55,12 +57,12 @@ export class UserInterface {
   async createProfile(): Promise<string> {
     const { action } = await inquirer.prompt([
       {
-        type: "list",
-        name: "action",
-        message: "Choose an action:",
+        type: 'list',
+        name: 'action',
+        message: 'Choose an action:',
         choices: [
-          { name: "Continue", value: "continue" },
-          { name: "Quit", value: "quit" },
+          { name: 'Continue', value: 'continue' },
+          { name: 'Quit', value: 'quit' },
         ],
       },
     ]);
@@ -73,9 +75,9 @@ export class UserInterface {
   async removeExchange(profile: any): Promise<string> {
     const { exchange } = await inquirer.prompt([
       {
-        type: "list",
-        name: "exchange",
-        message: "Choose an exchange to remove:",
+        type: 'list',
+        name: 'exchange',
+        message: 'Choose an exchange to remove:',
         choices: profile.exchanges.map(
           (exchangeProfile: ExchangeProfile) => exchangeProfile.exchange
         ),
@@ -90,9 +92,9 @@ export class UserInterface {
   async selectExchange(availableExchanges: any): Promise<string> {
     const { exchange } = await inquirer.prompt([
       {
-        type: "list",
-        name: "exchange",
-        message: "Choose an exchange:",
+        type: 'list',
+        name: 'exchange',
+        message: 'Choose an exchange:',
         choices: availableExchanges,
       },
     ]);
@@ -108,22 +110,22 @@ export class UserInterface {
   ): Promise<any> {
     let message;
 
-    if (exchange.toLowerCase() === "kraken") {
-      if (credential === "key") {
-        message = "Enter your API Key:";
-      } else if (credential === "secret") {
-        message = "Enter you Private Key";
+    if (exchange.toLowerCase() === 'kraken') {
+      if (credential === 'key') {
+        message = 'Enter your API Key:';
+      } else if (credential === 'secret') {
+        message = 'Enter your Private Key';
       }
-    } else if (exchange.toLowerCase() === "deribit") {
-      if (credential === "key") {
-        message = "Enter your Client ID:";
-      } else if (credential === "secret") {
-        message = "Enter your Client Secret:";
+    } else if (exchange.toLowerCase() === 'deribit') {
+      if (credential === 'key') {
+        message = 'Enter your Client ID:';
+      } else if (credential === 'secret') {
+        message = 'Enter your Client Secret:';
       }
     }
     const { enteredCred } = await inquirer.prompt([
       {
-        type: "input",
+        type: 'input',
         name: credential,
         message: message,
       },
@@ -146,37 +148,56 @@ export class UserInterface {
 
   private promptForCommand() {
     const promptMessage = this.currentInstrument
-      ? `<${fo("Tame", "yellow", "italic")}><${fo(
+      ? `<${fo('Tame', 'yellow', 'italic')}><${fo(
           this.currentInstrument,
-          "green",
-          "italic"
+          'green',
+          'italic'
         )}> `
-      : `<${fo("Tame", "yellow", "italic")}> `;
+      : `<${fo('Tame', 'yellow', 'italic')}> `;
 
     this.rl?.question(promptMessage, (command) => {
       this.handleCommand(command);
     });
   }
 
-  private handleCommand(command: string) {
-    if (command.startsWith("instrument ")) {
-      const instrument = command.split(" ")[1];
+  private async handleCommand(command: string) {
+    if (command.startsWith('instrument ')) {
+      const instrument = command.split(' ')[1];
       if (this.availableMarkets.includes(instrument)) {
         this.currentInstrument = instrument;
         console.log(`Switched to instrument: ${instrument}`);
       } else {
         console.log(`Invalid instrument: ${instrument}`);
       }
-    } else if (command === "quit" || command === "q") {
+    } else if (command === 'quit' || command === 'q') {
       this.quit();
     } else {
-      console.log(`Command received: ${command}`);
+      if (this.currentInstrument) {
+        try {
+          const commandParams = await CommandType.parseCommand(command);
+          if (commandParams !== null) {
+            const { type, quantity, price } = commandParams;
+            await this.exchangeCommand.execute(
+              type,
+              this.currentInstrument,
+              Number(quantity),
+              Number(price)
+            );
+          }
+        } catch (error: unknown) {
+          console.log((error as Error).message);
+        }
+      } else {
+        console.log(
+          'No instrument selected. Please select an instrument first.'
+        );
+      }
     }
     this.promptForCommand();
   }
 
   quit() {
-    console.log("Exiting...");
+    console.log('Exiting...');
     this.rl?.close();
     process.exit(0);
   }

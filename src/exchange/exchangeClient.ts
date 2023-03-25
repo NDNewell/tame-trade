@@ -1,76 +1,61 @@
 // src/exchange/exchangeClient.ts
 
-import ccxt from 'ccxt';
-// import { Exchange } from 'ccxt';
+import ccxt, { Exchange } from 'ccxt';
+import { ConfigManager } from '../config/configManager';
 
 export class ExchangeClient {
-  // private exchange: Exchange;
-  static testCcxt(): void {
-    console.log(ccxt.exchanges);
+  exchange: Exchange;
+  exchangeManager: ConfigManager;
+
+  constructor() {
+    this.exchange = new ccxt.kraken();
+    this.exchangeManager = new ConfigManager();
   }
 
-  // constructor(exchangeId: string, apiKey: string, secret: string) {
-  //   this.exchange = new ccxt[exchangeId]({
-  //     apiKey: apiKey,
-  //     secret: secret,
-  //     enableRateLimit: true,
-  //     options: {
-  //       defaultType: 'future',
-  //       adjustForTimeDifference: true,
-  //     },
-  //   });
-  // }
+  async setExchange(exchangeId: string) {
+    const { key, secret } = await this.exchangeManager.getExchangeCredentials(
+      exchangeId
+    );
 
-  // public async fetchOrderBook(symbol: string, limit?: number): Promise<any> {
-  //   const orderbook = await this.exchange.fetchOrderBook(symbol, limit);
-  //   return orderbook;
-  // }
+    this.exchange = new (ccxt as any)[exchangeId.toLowerCase()]({
+      apiKey: key,
+      secret: secret,
+      enableRateLimit: true,
+      options: {
+        defaultType: 'future',
+        adjustForTimeDifference: true,
+      },
+    });
+  }
 
-  // public async createOrder(
-  //   symbol: string,
-  //   side: string,
-  //   type: string,
-  //   amount: number,
-  //   price?: number,
-  //   params?: any
-  // ): Promise<any> {
-  //   const order = await this.exchange.createOrder(
-  //     symbol,
-  //     type,
-  //     side,
-  //     amount,
-  //     price,
-  //     params
-  //   );
-  //   return order;
-  // }
+  async createMarketBuyOrder(
+    instrument: string,
+    quantity: number
+  ): Promise<void> {
+    console.log(
+      `[ExchangeClient] Creating market buy order for ${instrument} with quantity: ${quantity}`
+    );
+    // Add the actual API call to place a market buy order here
+  }
 
-  // public async cancelOrder(
-  //   id: string,
-  //   symbol: string,
-  //   params?: any
-  // ): Promise<any> {
-  //   const result = await this.exchange.cancelOrder(id, symbol, params);
-  //   return result;
-  // }
+  async createMarketSellOrder(
+    instrument: string,
+    quantity: number
+  ): Promise<void> {
+    console.log(
+      `[ExchangeClient] Creating market sell order for ${instrument} with quantity: ${quantity}`
+    );
+    // Add the actual API call to place a market sell order here
+  }
 
-  // public async fetchBalance(): Promise<any> {
-  //   const balance = await this.exchange.fetchBalance();
-  //   return balance;
-  // }
-
-  // public async fetchOpenOrders(
-  //   symbol: string,
-  //   since?: number,
-  //   limit?: number,
-  //   params?: any
-  // ): Promise<any> {
-  //   const openOrders = await this.exchange.fetchOpenOrders(
-  //     symbol,
-  //     since,
-  //     limit,
-  //     params
-  //   );
-  //   return openOrders;
-  // }
+  async createStopOrder(
+    instrument: string,
+    stopPrice: number,
+    quantity: number
+  ): Promise<void> {
+    console.log(
+      `[ExchangeClient] Creating stop order for ${instrument} with stop price: ${stopPrice}, quantity: ${quantity}`
+    );
+    // Add the actual API call to place a stop order here
+  }
 }
