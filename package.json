@@ -12,6 +12,7 @@
   "dependencies": {
     "@types/node": "^16.11.12",
     "bcrypt": "^5.1.0",
+    "ccxt": "^3.0.33",
     "console-clear": "^1.1.1",
     "eslint": "^8.36.0",
     "eslint-config-prettier": "^8.8.0",

@@ -4,6 +4,7 @@ import { ConfigManager } from '../config/configManager';
 import { AuthManager } from '../auth/authManager';
 import { UserInterface } from './userInterface';
 import { ExchangeManager } from '../exchange/exchangeManager';
+import { ExchangeClient } from '../exchange/exchangeClient';
 
 export class Client {
   private configManager: ConfigManager;
@@ -20,6 +21,7 @@ export class Client {
   }
 
   async start() {
+    ExchangeClient.testCcxt();
     if (await this.configManager.hasProfile()) {
       const passwordCorrect = await this.authManager.verifyPassword();
       if (!passwordCorrect) {
