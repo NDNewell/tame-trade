@@ -1,9 +1,9 @@
 // src/client/client.ts
 
-import { ConfigManager } from "../config/configManager";
-import { AuthManager } from "../auth/authManager";
-import { UserInterface } from "./userInterface";
-import { ExchangeManager } from "../exchange/exchangeManager";
+import { ConfigManager } from '../config/configManager';
+import { AuthManager } from '../auth/authManager';
+import { UserInterface } from './userInterface';
+import { ExchangeManager } from '../exchange/exchangeManager';
 
 export class Client {
   private configManager: ConfigManager;
@@ -16,14 +16,14 @@ export class Client {
     this.exchangeManager = new ExchangeManager();
     this.authManager = new AuthManager();
     this.userInterface = new UserInterface();
-    console.log("Client initialized");
+    console.log('Client initialized');
   }
 
   async start() {
     if (await this.configManager.hasProfile()) {
       const passwordCorrect = await this.authManager.verifyPassword();
       if (!passwordCorrect) {
-        console.log("Too many incorrect password attempts. Exiting...");
+        console.log('Too many incorrect password attempts. Exiting...');
         process.exit(1);
       }
     } else {
@@ -38,7 +38,7 @@ export class Client {
 
     const action = await this.userInterface.createProfile();
 
-    if (action === "continue") {
+    if (action === 'continue') {
       await this.configManager.initializeProfile();
       await this.authManager.createPassword();
       await this.exchangeManager.addExchange();
@@ -51,40 +51,40 @@ export class Client {
     const action = await this.userInterface.displayHomeScreen();
 
     switch (action) {
-      case "startTrading":
+      case 'startTrading':
         await this.startSession();
         break;
-      case "addExchange":
+      case 'addExchange':
         await this.exchangeManager.addExchange();
         await this.showMenu();
         break;
-      case "removeExchange":
+      case 'removeExchange':
         await this.exchangeManager.removeExchange();
         await this.showMenu();
         break;
-      case "deleteProfile":
+      case 'deleteProfile':
         await this.configManager.deleteProfile();
-        console.log("Profile deleted.");
+        console.log('Profile deleted.');
         this.userInterface.quit();
         break;
-      case "quit":
+      case 'quit':
         this.userInterface.quit();
         break;
       default:
-        console.log("Invalid option.");
+        console.log('Invalid option.');
         await this.showMenu();
         break;
     }
   }
 
   async startSession(): Promise<void> {
-    console.log("Starting trading session...");
+    console.log('Starting trading session...');
 
     let availableExchanges = await this.exchangeManager.getAddedExchanges();
-    let selectedExchange = "";
+    let selectedExchange = '';
 
     if (availableExchanges.length === 0) {
-      console.log("No exchanges available. Please add an exchange first.");
+      console.log('No exchanges available. Please add an exchange first.');
       await this.exchangeManager.addExchange();
       availableExchanges = await this.exchangeManager.getAddedExchanges();
       selectedExchange = availableExchanges[0];
