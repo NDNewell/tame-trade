@@ -51,7 +51,15 @@ export class ExchangeClient {
 
     try {
       const order = await (this.exchange as any)[method](instrument, ...args);
-      console.log(`[ExchangeClient] Order placed successfully:`, order);
+      const filledAmount = parseFloat(order.filled);
+      const trimmedFilledAmount = filledAmount.toFixed(
+        Math.max(
+          2,
+          filledAmount.toString().split('.')[1].replace(/0+$/, '').length
+        )
+      );
+      const trimmedPrice = parseFloat(order.price).toFixed(2);
+      console.log(`Filled ${trimmedFilledAmount} @${trimmedPrice}`);
     } catch (error) {
       console.error(`[ExchangeClient] Failed to place order:`, error);
     }
