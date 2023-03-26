@@ -177,12 +177,28 @@ export class UserInterface {
           const commandParams = await CommandType.parseCommand(command);
           if (commandParams !== null) {
             const { type, quantity, price } = commandParams;
-            await this.exchangeCommand.execute(
-              type,
-              this.currentInstrument,
-              Number(quantity),
-              Number(price)
-            );
+
+            if (
+              type === CommandType.MARKET_BUY ||
+              type === CommandType.MARKET_SELL
+            ) {
+              await this.exchangeCommand.execute(
+                type,
+                this.currentInstrument,
+                Number(quantity)
+              );
+            } else if (
+              type === CommandType.STOP ||
+              type === CommandType.LIMIT_BUY ||
+              type === CommandType.LIMIT_SELL
+            ) {
+              await this.exchangeCommand.execute(
+                type,
+                this.currentInstrument,
+                Number(quantity),
+                Number(price)
+              );
+            }
           }
         } catch (error: unknown) {
           console.log((error as Error).message);

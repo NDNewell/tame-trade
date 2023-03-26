@@ -5,8 +5,10 @@ import { AppError } from '../errors/appError';
 import { ErrorType } from '../errors/errorType';
 
 export enum CommandType {
-  BUY,
-  SELL,
+  MARKET_BUY,
+  MARKET_SELL,
+  LIMIT_BUY,
+  LIMIT_SELL,
   STOP,
   NULL,
 }
@@ -31,39 +33,38 @@ export class ExchangeCommand implements Command {
     commandType: CommandType,
     currentInstrument: string,
     quantity: number,
-    price: number
+    price?: number
   ): Promise<void> {
     switch (commandType) {
-      case CommandType.BUY:
+      case CommandType.MARKET_BUY:
         console.log(
-          `Buy command executed for instrument: ${currentInstrument} with quantity: ${quantity} and price: ${price}`
+          `Market buy command executed for instrument: ${currentInstrument} with quantity: ${quantity}`
         );
-        // Execute the buy command with the exchangeClient
-        // await this.exchangeClient.createMarketBuyOrder(
-        //   currentInstrument,
-        //   quantity
-        // );
+        // Execute the market buy command with the exchangeClient
         break;
-      case CommandType.SELL:
+      case CommandType.MARKET_SELL:
         console.log(
-          `Sell command executed for instrument: ${currentInstrument} with quantity: ${quantity} and price: ${price}`
+          `Market sell command executed for instrument: ${currentInstrument} with quantity: ${quantity}`
         );
-        // Execute the sell command with the exchangeClient
-        // await this.exchangeClient.createMarketSellOrder(
-        //   currentInstrument,
-        //   quantity
-        // );
+        // Execute the market sell command with the exchangeClient
+        break;
+      case CommandType.LIMIT_BUY:
+        console.log(
+          `Limit buy command executed for instrument: ${currentInstrument} with quantity: ${quantity} and price: ${price}`
+        );
+        // Execute the limit buy command with the exchangeClient
+        break;
+      case CommandType.LIMIT_SELL:
+        console.log(
+          `Limit sell command executed for instrument: ${currentInstrument} with quantity: ${quantity} and price: ${price}`
+        );
+        // Execute the limit sell command with the exchangeClient
         break;
       case CommandType.STOP:
         console.log(
-          `Stop command executed for instrument: ${currentInstrument} with quantity: ${quantity} and price: ${price}`
+          `Market stop command executed for instrument: ${currentInstrument} with quantity: ${quantity} and price: ${price}`
         );
-        // Execute the stop command with the exchangeClient
-        // await this.exchangeClient.createStopOrder(
-        //   currentInstrument,
-        //   quantity,
-        //   price
-        // );
+        // Execute the market stop command with the exchangeClient
         break;
       default:
         console.log('Invalid command. Please enter a valid command.');
@@ -80,30 +81,75 @@ export namespace CommandType {
     let quantity: number | undefined = undefined;
     let price: number | undefined = undefined;
 
-    const [typeString, quantityString, priceString] = command.split(/\s+/);
+    const args = command.split(/\s+/);
+    const typeString = args[0];
 
     if (typeString === 'buy') {
-      type = CommandType.BUY;
+      type = CommandType.MARKET_BUY;
     } else if (typeString === 'sell') {
-      type = CommandType.SELL;
+      type = CommandType.MARKET_SELL;
     } else if (typeString === 'stop') {
       type = CommandType.STOP;
+    } else if (typeString === 'limit' && args.length === 4) {
+      const sideString = args[1];
+      if (sideString === 'buy') {
+        type = CommandType.LIMIT_BUY;
+      } else if (sideString === 'sell') {
+        type = CommandType.LIMIT_SELL;
+      } else {
+        throw new AppError(ErrorType.INVALID_COMMAND);
+      }
+    }
+
+    if (type !== CommandType.NULL) {
+      // Apply your validation function here
+      validateCommand(command, type);
+
+      const quantityString = args.length === 4 ? args[2] : args[1];
+      const priceString = args.length === 4 ? args[3] : args[2];
+
+      if (!isNaN(Number(quantityString))) {
+        quantity = Number(quantityString);
+      } else {
+        throw new AppError(ErrorType.INVALID_QUANTITY);
+      }
+
+      if (
+        type === CommandType.STOP ||
+        type === CommandType.LIMIT_BUY ||
+        type === CommandType.LIMIT_SELL
+      ) {
+        if (!isNaN(Number(priceString))) {
+          price = Number(priceString);
+        } else {
+          throw new AppError(ErrorType.INVALID_PRICE);
+        }
+      }
+
+      return { type, quantity, price };
     } else {
       throw new AppError(ErrorType.INVALID_COMMAND);
     }
+  }
 
-    if (!isNaN(Number(quantityString))) {
-      quantity = Number(quantityString);
-    } else {
-      throw new AppError(ErrorType.INVALID_QUANTITY);
+  export function validateCommand(command: string, type: CommandType): void {
+    const args = command.trim().split(/\s+/);
+
+    if (type === CommandType.MARKET_BUY || type === CommandType.MARKET_SELL) {
+      if (args.length !== 2) {
+        throw new AppError(ErrorType.INVALID_MARKET_ORDER);
+      }
+    } else if (
+      type === CommandType.LIMIT_BUY ||
+      type === CommandType.LIMIT_SELL
+    ) {
+      if (args.length !== 4) {
+        throw new AppError(ErrorType.INVALID_LIMIT_ORDER);
+      }
+    } else if (type === CommandType.STOP) {
+      if (args.length !== 3) {
+        throw new AppError(ErrorType.INVALID_STOP_ORDER);
+      }
     }
-
-    if (!isNaN(Number(priceString))) {
-      price = Number(priceString);
-    } else {
-      throw new AppError(ErrorType.INVALID_PRICE);
-    }
-
-    return { type, quantity, price };
   }
 }
