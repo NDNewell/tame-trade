@@ -48,13 +48,35 @@ export class ExchangeClient {
     // Add the actual API call to place a market sell order here
   }
 
-  async createStopOrder(
+  async createLimitBuyOrder(
     instrument: string,
-    stopPrice: number,
-    quantity: number
+    quantity: number,
+    price: number
   ): Promise<void> {
     console.log(
-      `[ExchangeClient] Creating stop order for ${instrument} with stop price: ${stopPrice}, quantity: ${quantity}`
+      `[ExchangeClient] Creating limit buy order for ${instrument} with quantity: ${quantity} and price: ${price}`
+    );
+    // Add the actual API call to place a limit buy order here
+  }
+
+  async createLimitSellOrder(
+    instrument: string,
+    quantity: number,
+    price: number
+  ): Promise<void> {
+    console.log(
+      `[ExchangeClient] Creating limit sell order for ${instrument} with quantity: ${quantity} and price: ${price}`
+    );
+    // Add the actual API call to place a limit sell order here
+  }
+
+  async createStopOrder(
+    instrument: string,
+    quantity: number,
+    price: number
+  ): Promise<void> {
+    console.log(
+      `[ExchangeClient] Creating stop order for ${instrument} with quantity: ${quantity} and price: ${price}`
     );
     // Add the actual API call to place a stop order here
   }

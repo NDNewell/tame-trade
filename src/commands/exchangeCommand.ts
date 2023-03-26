@@ -37,34 +37,43 @@ export class ExchangeCommand implements Command {
   ): Promise<void> {
     switch (commandType) {
       case CommandType.MARKET_BUY:
-        console.log(
-          `Market buy command executed for instrument: ${currentInstrument} with quantity: ${quantity}`
+        await this.exchangeClient.createMarketBuyOrder(
+          currentInstrument,
+          quantity
         );
-        // Execute the market buy command with the exchangeClient
         break;
       case CommandType.MARKET_SELL:
-        console.log(
-          `Market sell command executed for instrument: ${currentInstrument} with quantity: ${quantity}`
+        await this.exchangeClient.createMarketSellOrder(
+          currentInstrument,
+          quantity
         );
-        // Execute the market sell command with the exchangeClient
         break;
       case CommandType.LIMIT_BUY:
-        console.log(
-          `Limit buy command executed for instrument: ${currentInstrument} with quantity: ${quantity} and price: ${price}`
-        );
-        // Execute the limit buy command with the exchangeClient
+        if (price) {
+          await this.exchangeClient.createLimitBuyOrder(
+            currentInstrument,
+            quantity,
+            price
+          );
+        }
         break;
       case CommandType.LIMIT_SELL:
-        console.log(
-          `Limit sell command executed for instrument: ${currentInstrument} with quantity: ${quantity} and price: ${price}`
-        );
-        // Execute the limit sell command with the exchangeClient
+        if (price) {
+          await this.exchangeClient.createLimitSellOrder(
+            currentInstrument,
+            quantity,
+            price
+          );
+        }
         break;
       case CommandType.STOP:
-        console.log(
-          `Market stop command executed for instrument: ${currentInstrument} with quantity: ${quantity} and price: ${price}`
-        );
-        // Execute the market stop command with the exchangeClient
+        if (price) {
+          await this.exchangeClient.createStopOrder(
+            currentInstrument,
+            quantity,
+            price
+          );
+        }
         break;
       default:
         console.log('Invalid command. Please enter a valid command.');
