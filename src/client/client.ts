@@ -18,11 +18,11 @@ export class Client {
     this.exchangeManager = new ExchangeManager();
     this.authManager = new AuthManager();
     this.userInterface = new UserInterface();
-    this.exchangeClient = new ExchangeClient();
-    console.log('Client initialized');
+    this.exchangeClient = ExchangeClient.getInstance();
   }
 
   async start() {
+    console.log('Client initialized');
     if (await this.configManager.hasProfile()) {
       const passwordCorrect = await this.authManager.verifyPassword();
       if (!passwordCorrect) {
@@ -101,7 +101,7 @@ export class Client {
       return;
     }
 
-    this.exchangeClient.setExchange(selectedExchange);
+    await this.exchangeClient.init(selectedExchange);
 
     console.log(`Using exchange: ${selectedExchange}`);
 

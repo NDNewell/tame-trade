@@ -26,7 +26,7 @@ export class ExchangeCommand implements Command {
   private exchangeClient: ExchangeClient;
 
   constructor() {
-    this.exchangeClient = new ExchangeClient();
+    this.exchangeClient = ExchangeClient.getInstance();
   }
 
   async execute(

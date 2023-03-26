@@ -106,7 +106,8 @@ export class ConfigManager {
     if (await this.hasProfile()) {
       const profile = await this.getProfile();
       const savedExchange = profile.exchanges.find(
-        (exchangeProfile) => exchangeProfile.exchange === exchange
+        (exchangeProfile) =>
+          exchangeProfile.exchange.toLowerCase() === exchange.toLowerCase()
       );
 
       if (savedExchange) {

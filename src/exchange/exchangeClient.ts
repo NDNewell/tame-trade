@@ -1,18 +1,27 @@
-// src/exchange/exchangeClient.ts
-
 import ccxt, { Exchange } from 'ccxt';
 import { ConfigManager } from '../config/configManager';
 
 export class ExchangeClient {
-  exchange: Exchange;
+  private static instance: ExchangeClient | null = null;
+  exchange: Exchange | null = null;
   exchangeManager: ConfigManager;
 
-  constructor() {
-    this.exchange = new ccxt.kraken();
+  private constructor() {
     this.exchangeManager = new ConfigManager();
   }
 
-  async setExchange(exchangeId: string) {
+  static getInstance(): ExchangeClient {
+    if (!this.instance) {
+      this.instance = new ExchangeClient();
+    }
+    return this.instance;
+  }
+
+  async init(exchangeId: string): Promise<void> {
+    await this.setExchange(exchangeId);
+  }
+
+  async setExchange(exchangeId: string): Promise<void> {
     const { key, secret } = await this.exchangeManager.getExchangeCredentials(
       exchangeId
     );
@@ -28,24 +37,38 @@ export class ExchangeClient {
     });
   }
 
+  async executeOrder(
+    method: string,
+    instrument: string,
+    ...args: any[]
+  ): Promise<void> {
+    if (this.exchange === null) {
+      console.error(
+        `[ExchangeClient] Exchange not initialized. Please call 'init' or 'setExchange' before placing an order.`
+      );
+      return;
+    }
+
+    try {
+      const order = await (this.exchange as any)[method](instrument, ...args);
+      console.log(`[ExchangeClient] Order placed successfully:`, order);
+    } catch (error) {
+      console.error(`[ExchangeClient] Failed to place order:`, error);
+    }
+  }
+
   async createMarketBuyOrder(
     instrument: string,
     quantity: number
   ): Promise<void> {
-    console.log(
-      `[ExchangeClient] Creating market buy order for ${instrument} with quantity: ${quantity}`
-    );
-    // Add the actual API call to place a market buy order here
+    await this.executeOrder('createMarketBuyOrder', instrument, quantity);
   }
 
   async createMarketSellOrder(
     instrument: string,
     quantity: number
   ): Promise<void> {
-    console.log(
-      `[ExchangeClient] Creating market sell order for ${instrument} with quantity: ${quantity}`
-    );
-    // Add the actual API call to place a market sell order here
+    await this.executeOrder('createMarketSellOrder', instrument, quantity);
   }
 
   async createLimitBuyOrder(
@@ -53,10 +76,7 @@ export class ExchangeClient {
     quantity: number,
     price: number
   ): Promise<void> {
-    console.log(
-      `[ExchangeClient] Creating limit buy order for ${instrument} with quantity: ${quantity} and price: ${price}`
-    );
-    // Add the actual API call to place a limit buy order here
+    await this.executeOrder('createLimitBuyOrder', instrument, quantity, price);
   }
 
   async createLimitSellOrder(
@@ -64,20 +84,19 @@ export class ExchangeClient {
     quantity: number,
     price: number
   ): Promise<void> {
-    console.log(
-      `[ExchangeClient] Creating limit sell order for ${instrument} with quantity: ${quantity} and price: ${price}`
+    await this.executeOrder(
+      'createLimitSellOrder',
+      instrument,
+      quantity,
+      price
     );
-    // Add the actual API call to place a limit sell order here
   }
 
   async createStopOrder(
     instrument: string,
-    quantity: number,
-    price: number
+    stopPrice: number,
+    quantity: number
   ): Promise<void> {
-    console.log(
-      `[ExchangeClient] Creating stop order for ${instrument} with quantity: ${quantity} and price: ${price}`
-    );
-    // Add the actual API call to place a stop order here
+    await this.executeOrder('createStopOrder', instrument, stopPrice, quantity);
   }
 }

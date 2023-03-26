@@ -123,7 +123,7 @@ export class UserInterface {
         message = 'Enter your Client Secret:';
       }
     }
-    const { enteredCred } = await inquirer.prompt([
+    const { [credential]: enteredCred } = await inquirer.prompt([
       {
         type: 'input',
         name: credential,
