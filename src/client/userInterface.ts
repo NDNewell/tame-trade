@@ -147,13 +147,21 @@ export class UserInterface {
   }
 
   private promptForCommand() {
+    const exchangeClient = this.exchangeCommand.getExchangeClient();
+    const exchangeName = exchangeClient.getSelectedExchange();
+    const tameDisplay = `<${fo('Tame', 'yellow', 'italic')}>`;
+    const instrumentDisplay = `<${fo(
+      `${this.currentInstrument}`,
+      'green',
+      'italic'
+    )}>`;
+    const exchangeDisplay = exchangeName
+      ? `<${fo(exchangeName, 'orange', 'italic')}>`
+      : '';
+
     const promptMessage = this.currentInstrument
-      ? `<${fo('Tame', 'yellow', 'italic')}><${fo(
-          this.currentInstrument,
-          'green',
-          'italic'
-        )}> `
-      : `<${fo('Tame', 'yellow', 'italic')}> `;
+      ? `${tameDisplay}${exchangeDisplay}${instrumentDisplay} `
+      : `${tameDisplay}${exchangeDisplay} `;
 
     this.rl?.question(promptMessage, (command) => {
       this.handleCommand(command);

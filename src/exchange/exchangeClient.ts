@@ -37,6 +37,10 @@ export class ExchangeClient {
     });
   }
 
+  getSelectedExchange(): string | null {
+    return this.exchange ? this.exchange.name : null;
+  }
+
   async executeOrder(
     method: string,
     instrument: string,

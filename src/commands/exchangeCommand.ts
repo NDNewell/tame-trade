@@ -80,6 +80,10 @@ export class ExchangeCommand implements Command {
         break;
     }
   }
+
+  getExchangeClient(): ExchangeClient {
+    return this.exchangeClient;
+  }
 }
 
 export namespace CommandType {
