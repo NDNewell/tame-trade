@@ -4,6 +4,7 @@ import { ConfigManager } from '../config/configManager';
 export class ExchangeClient {
   private static instance: ExchangeClient | null = null;
   private availableMarkets: Record<string, Market> | null = null;
+  private supportedExchanges: string[] | null = null;
   exchange: Exchange | null = null;
   exchangeManager: ConfigManager;
 
@@ -18,9 +19,20 @@ export class ExchangeClient {
     return this.instance;
   }
 
-  async init(exchangeId: string): Promise<void> {
-    await this.setExchange(exchangeId);
+  async init(exchangeId?: string): Promise<void> {
+    if (exchangeId) {
+      await this.setExchange(exchangeId);
+    }
+    await this.loadExchanges();
     await this.loadMarkets();
+  }
+
+  isInitialized(): boolean {
+    return this.supportedExchanges !== null;
+  }
+
+  async loadExchanges(): Promise<void> {
+    this.supportedExchanges = ccxt.exchanges;
   }
 
   async loadMarkets(): Promise<void> {
@@ -59,9 +71,11 @@ export class ExchangeClient {
     if (this.availableMarkets !== null) {
       Object.values(this.availableMarkets).forEach((market) => {
         if (market.type) {
-          availableTypes.add(
-            `${market.type.charAt(0).toUpperCase()}${market.type.slice(1)}s`
-          );
+          const formattedMarketType =
+            market.type !== 'spot'
+              ? `${market.type.charAt(0).toUpperCase()}${market.type.slice(1)}s`
+              : `${market.type.charAt(0).toUpperCase()}${market.type.slice(1)}`;
+          availableTypes.add(formattedMarketType);
         }
       });
 
@@ -72,6 +86,10 @@ export class ExchangeClient {
       );
       return [];
     }
+  }
+
+  getSupportedExchanges(): string[] {
+    return this.supportedExchanges || [];
   }
 
   getExchangeInstance(): Exchange | null {

@@ -4,32 +4,46 @@ import { UserInterface } from '../client/userInterface';
 import { ConfigManager } from '../config/configManager';
 import { AppError } from '../errors/appError';
 import { ErrorType } from '../errors/errorType';
+import { ExchangeClient } from './exchangeClient';
 
 export class ExchangeManager {
   private configManager: ConfigManager;
   private userInterface: UserInterface;
+  private exchangeClient: ExchangeClient;
 
   constructor() {
     this.configManager = new ConfigManager();
     this.userInterface = new UserInterface();
+    this.exchangeClient = ExchangeClient.getInstance();
+  }
+
+  private async initializeExchangeClient(): Promise<void> {
+    try {
+      await this.exchangeClient.init();
+    } catch (error) {
+      console.error('Failed to initialize ExchangeClient:', error);
+    }
+  }
+
+  async getExchangeClient(): Promise<ExchangeClient> {
+    if (!this.exchangeClient.isInitialized()) {
+      await this.initializeExchangeClient();
+    }
+    return this.exchangeClient;
   }
 
   async addExchange(): Promise<void> {
     console.log('Adding an exchange...');
 
-    const supportedExchanges = ['Kraken', 'Deribit', 'Binance'];
-    const currentExchanges = await this.getAddedExchanges();
-    const availableExchanges = supportedExchanges.filter(
-      (exchange) => !currentExchanges.includes(exchange)
-    );
-
-    if (availableExchanges.length === 0) {
+    const exchangeClient = await this.getExchangeClient();
+    const supportedExchanges = exchangeClient.getSupportedExchanges();
+    if (supportedExchanges.length === 0) {
       console.log('You have already added all supported exchanges.');
       return;
     }
 
     const selectedExchange = await this.userInterface.selectExchange(
-      availableExchanges
+      supportedExchanges
     );
 
     const key = await this.userInterface.addExchangeCredentials(
@@ -82,15 +96,20 @@ export class ExchangeManager {
     }
   }
 
-  async selectExchange(): Promise<string> {
-    const availableExchanges = await this.getAddedExchanges();
+  async selectSavedExchange(): Promise<string> {
+    const addedExchanges = await this.getAddedExchanges();
+    return await this.userInterface.selectExchange(addedExchanges);
+  }
 
-    if (availableExchanges.length === 0) {
+  async selectExchange(): Promise<string> {
+    const supportedExchanges = this.exchangeClient.getSupportedExchanges();
+
+    if (supportedExchanges.length === 0) {
       console.log('No exchanges available. Please add an exchange first.');
       return '';
     }
 
-    return await this.userInterface.selectExchange(availableExchanges);
+    return await this.userInterface.selectExchange(supportedExchanges);
   }
 
   async getExchangeCredentials(

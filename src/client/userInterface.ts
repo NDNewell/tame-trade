@@ -3,24 +3,17 @@
 import inquirer from 'inquirer';
 import clear from 'console-clear';
 import * as readline from 'readline';
-import { TradingApi } from '../trading/tradingApi';
 import { formatOutput as fo } from '../utils/formatOutput';
 import { ExchangeProfile } from '../config/configManager';
-import {
-  ExchangeCommand,
-  CommandType,
-  InstrumentType,
-} from '../commands/exchangeCommand';
+import { ExchangeCommand, CommandType } from '../commands/exchangeCommand';
 
 export class UserInterface {
   private rl?: readline.Interface;
   private currentInstrument: string;
-  private tradingApi: TradingApi;
   private availableMarkets: string[];
   private exchangeCommand: ExchangeCommand;
 
   constructor() {
-    this.tradingApi = new TradingApi();
     this.exchangeCommand = new ExchangeCommand();
     this.currentInstrument = '';
     this.availableMarkets = [];
@@ -93,13 +86,13 @@ export class UserInterface {
     return exchange;
   }
 
-  async selectExchange(availableExchanges: any): Promise<string> {
+  async selectExchange(supportedExchanges: any): Promise<string> {
     const { exchange } = await inquirer.prompt([
       {
         type: 'list',
         name: 'exchange',
         message: 'Choose an exchange:',
-        choices: availableExchanges,
+        choices: supportedExchanges,
       },
     ]);
 
