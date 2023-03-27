@@ -23,6 +23,7 @@ export class Client {
 
   async start() {
     console.log('Client initialized');
+    this.exchangeClient.init();
     if (await this.configManager.hasProfile()) {
       const passwordCorrect = await this.authManager.verifyPassword();
       if (!passwordCorrect) {
@@ -100,7 +101,7 @@ export class Client {
       return;
     }
 
-    await this.exchangeClient.init(selectedExchange);
+    await this.exchangeClient.setExchange(selectedExchange);
 
     this.userInterface.startTradingInterface();
   }

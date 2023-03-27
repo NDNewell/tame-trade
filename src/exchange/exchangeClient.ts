@@ -51,6 +51,7 @@ export class ExchangeClient {
   }
 
   async setExchange(exchangeId: string): Promise<void> {
+    console.log(`[ExchangeClient] Setting exchange to ${exchangeId}...`);
     const { key, secret } = await this.exchangeManager.getExchangeCredentials(
       exchangeId
     );
@@ -64,6 +65,9 @@ export class ExchangeClient {
         adjustForTimeDifference: true,
       },
     });
+
+    await this.loadMarkets();
+    await this.loadExchanges();
   }
 
   async getMarketTypes(): Promise<string[]> {
