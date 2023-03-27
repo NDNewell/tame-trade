@@ -141,7 +141,8 @@ export class UserInterface {
   }
 
   async startTradingInterface(): Promise<void> {
-    this.availableMarkets = await this.tradingApi.getMarkets();
+    this.availableMarkets =
+      (await this.exchangeCommand.getExchangeClient().getMarketSymbols()) || [];
     this.rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
@@ -236,13 +237,18 @@ export class UserInterface {
 
   private async selectInstrumentType(): Promise<void> {
     this.pauseReadline();
+
+    const availableTypes = await this.exchangeCommand
+      .getExchangeClient()
+      .getMarketTypes();
+
     const { instrumentType } = await inquirer.prompt([
       {
         type: 'list',
         name: 'instrumentType',
-        message: 'Choose an instrument type:',
+        message: 'Select instrument type:',
         choices: [
-          ...Object.values(InstrumentType),
+          ...Array.from(availableTypes),
           { name: 'Back', value: 'back' },
         ],
       },

@@ -1,8 +1,9 @@
-import ccxt, { Exchange } from 'ccxt';
+import ccxt, { Exchange, Market } from 'ccxt';
 import { ConfigManager } from '../config/configManager';
 
 export class ExchangeClient {
   private static instance: ExchangeClient | null = null;
+  private availableMarkets: Record<string, Market> | null = null;
   exchange: Exchange | null = null;
   exchangeManager: ConfigManager;
 
@@ -19,6 +20,22 @@ export class ExchangeClient {
 
   async init(exchangeId: string): Promise<void> {
     await this.setExchange(exchangeId);
+    await this.loadMarkets();
+  }
+
+  async loadMarkets(): Promise<void> {
+    if (this.exchange === null) {
+      console.error(
+        `[ExchangeClient] Exchange not initialized. Please call 'init' or 'setExchange' before fetching instruments.`
+      );
+      return;
+    }
+
+    try {
+      this.availableMarkets = await this.exchange.loadMarkets();
+    } catch (error) {
+      console.error(`[ExchangeClient] Failed to fetch instruments:`, error);
+    }
   }
 
   async setExchange(exchangeId: string): Promise<void> {
@@ -37,12 +54,50 @@ export class ExchangeClient {
     });
   }
 
+  async getMarketTypes(): Promise<string[]> {
+    const availableTypes = new Set<string>();
+    if (this.availableMarkets !== null) {
+      Object.values(this.availableMarkets).forEach((market) => {
+        if (market.type) {
+          availableTypes.add(
+            `${market.type.charAt(0).toUpperCase()}${market.type.slice(1)}s`
+          );
+        }
+      });
+
+      return Array.from(availableTypes);
+    } else {
+      console.error(
+        `[ExchangeClient] Available markets not initialized. Please call 'init' or 'setExchange' before fetching instruments.`
+      );
+      return [];
+    }
+  }
+
   getExchangeInstance(): Exchange | null {
     return this.exchange;
   }
 
   getSelectedExchangeName(): string | null {
     return this.exchange ? this.exchange.name : null;
+  }
+
+  async getMarketSymbols(): Promise<Array<string>> {
+    if (this.exchange === null) {
+      console.error(
+        `[ExchangeClient] Exchange not initialized. Please call 'init' or 'setExchange' before fetching instruments.`
+      );
+      return [];
+    }
+
+    if (this.availableMarkets !== null) {
+      return Object.keys(this.availableMarkets);
+    } else {
+      console.error(
+        `[ExchangeClient] Available markets not initialized. Please call 'init' or 'setExchange' before fetching instruments.`
+      );
+      return [];
+    }
   }
 
   async executeOrder(

@@ -103,8 +103,6 @@ export class Client {
 
     await this.exchangeClient.init(selectedExchange);
 
-    console.log(`Using exchange: ${selectedExchange}`);
-
     this.userInterface.startTradingInterface();
   }
 
