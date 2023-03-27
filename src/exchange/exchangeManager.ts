@@ -46,14 +46,8 @@ export class ExchangeManager {
       supportedExchanges
     );
 
-    const key = await this.userInterface.addExchangeCredentials(
-      selectedExchange,
-      'key'
-    );
-    const secret = await this.userInterface.addExchangeCredentials(
-      selectedExchange,
-      'secret'
-    );
+    const key = await this.userInterface.addExchangeCredentials('key');
+    const secret = await this.userInterface.addExchangeCredentials('secret');
 
     await this.configManager.addExchange(selectedExchange, key, secret);
     console.log(`${selectedExchange} added successfully.`);

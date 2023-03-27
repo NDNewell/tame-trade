@@ -1,6 +1,7 @@
 // src/client/userInterface.ts
 
 import inquirer from 'inquirer';
+import autocomplete from 'inquirer-autocomplete-prompt';
 import clear from 'console-clear';
 import * as readline from 'readline';
 import { formatOutput as fo } from '../utils/formatOutput';
@@ -17,6 +18,7 @@ export class UserInterface {
     this.exchangeCommand = new ExchangeCommand();
     this.currentInstrument = '';
     this.availableMarkets = [];
+    inquirer.registerPrompt('autocomplete', autocomplete);
   }
 
   async displayWelcomeScreen(): Promise<void> {
@@ -87,12 +89,22 @@ export class UserInterface {
   }
 
   async selectExchange(supportedExchanges: any): Promise<string> {
+    async function searchExchanges(
+      answers: Record<string, unknown>,
+      input: string | null
+    ) {
+      input = input || '';
+      return supportedExchanges.filter((exchange: string) =>
+        exchange.toLowerCase().includes(input!.toLowerCase())
+      );
+    }
+
     const { exchange } = await inquirer.prompt([
       {
-        type: 'list',
+        type: 'autocomplete',
         name: 'exchange',
         message: 'Choose an exchange:',
-        choices: supportedExchanges,
+        source: searchExchanges,
       },
     ]);
 
@@ -101,25 +113,15 @@ export class UserInterface {
     return exchange;
   }
 
-  async addExchangeCredentials(
-    exchange: string,
-    credential: string
-  ): Promise<any> {
+  async addExchangeCredentials(credential: string): Promise<any> {
     let message;
 
-    if (exchange.toLowerCase() === 'kraken') {
-      if (credential === 'key') {
-        message = 'Enter your API Key:';
-      } else if (credential === 'secret') {
-        message = 'Enter your Private Key';
-      }
-    } else if (exchange.toLowerCase() === 'deribit') {
-      if (credential === 'key') {
-        message = 'Enter your Client ID:';
-      } else if (credential === 'secret') {
-        message = 'Enter your Client Secret:';
-      }
+    if (credential === 'key') {
+      message = 'Enter your API Key:';
+    } else if (credential === 'secret') {
+      message = 'Enter your Secret';
     }
+
     const { [credential]: enteredCred } = await inquirer.prompt([
       {
         type: 'input',
@@ -269,15 +271,22 @@ export class UserInterface {
       .getExchangeClient()
       .getMarketByType(instrumentType);
 
+    async function searchMarkets(
+      answers: Record<string, unknown>,
+      input: string | null
+    ) {
+      input = input || '';
+      return marketsByType.filter((market) =>
+        market.toLowerCase().includes(input!.toLowerCase())
+      );
+    }
+
     const { market } = await inquirer.prompt([
       {
-        type: 'list',
+        type: 'autocomplete',
         name: 'market',
         message: 'Select market:',
-        choices: [
-          ...Array.from(marketsByType),
-          { name: 'Back', value: 'back' },
-        ],
+        source: searchMarkets,
       },
     ]);
 
