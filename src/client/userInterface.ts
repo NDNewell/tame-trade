@@ -6,7 +6,11 @@ import * as readline from 'readline';
 import { TradingApi } from '../trading/tradingApi';
 import { formatOutput as fo } from '../utils/formatOutput';
 import { ExchangeProfile } from '../config/configManager';
-import { ExchangeCommand, CommandType } from '../commands/exchangeCommand';
+import {
+  ExchangeCommand,
+  CommandType,
+  InstrumentType,
+} from '../commands/exchangeCommand';
 
 export class UserInterface {
   private rl?: readline.Interface;
@@ -146,9 +150,17 @@ export class UserInterface {
     this.promptForCommand();
   }
 
+  private pauseReadline() {
+    this.rl?.pause();
+  }
+
+  private resumeReadline() {
+    this.rl?.resume();
+  }
+
   private promptForCommand() {
     const exchangeClient = this.exchangeCommand.getExchangeClient();
-    const exchangeName = exchangeClient.getSelectedExchange();
+    const exchangeName = exchangeClient.getSelectedExchangeName();
     const tameDisplay = `<${fo('Tame', 'yellow', 'italic')}>`;
     const instrumentDisplay = `<${fo(
       `${this.currentInstrument}`,
@@ -177,6 +189,8 @@ export class UserInterface {
       } else {
         console.log(`Invalid instrument: ${instrument}`);
       }
+    } else if (command === 'list instruments') {
+      await this.selectInstrumentType();
     } else if (command === 'quit' || command === 'q') {
       this.quit();
     } else {
@@ -218,6 +232,29 @@ export class UserInterface {
       }
     }
     this.promptForCommand();
+  }
+
+  private async selectInstrumentType(): Promise<void> {
+    this.pauseReadline();
+    const { instrumentType } = await inquirer.prompt([
+      {
+        type: 'list',
+        name: 'instrumentType',
+        message: 'Choose an instrument type:',
+        choices: [
+          ...Object.values(InstrumentType),
+          { name: 'Back', value: 'back' },
+        ],
+      },
+    ]);
+
+    if (instrumentType === 'back') {
+      this.resumeReadline();
+    } else {
+      this.exchangeCommand.listInstruments(instrumentType);
+    }
+
+    clear();
   }
 
   quit() {

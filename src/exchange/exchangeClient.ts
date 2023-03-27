@@ -37,7 +37,11 @@ export class ExchangeClient {
     });
   }
 
-  getSelectedExchange(): string | null {
+  getExchangeInstance(): Exchange | null {
+    return this.exchange;
+  }
+
+  getSelectedExchangeName(): string | null {
     return this.exchange ? this.exchange.name : null;
   }
 

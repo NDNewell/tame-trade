@@ -13,6 +13,13 @@ export enum CommandType {
   NULL,
 }
 
+export enum InstrumentType {
+  FUTURES = 'Futures',
+  PERPETUAL_SWAPS = 'Perpetual Swaps',
+  OPTIONS = 'Options',
+  SPOT = 'Spot',
+}
+
 export interface Command {
   execute(
     commandType: CommandType,
@@ -27,6 +34,11 @@ export class ExchangeCommand implements Command {
 
   constructor() {
     this.exchangeClient = ExchangeClient.getInstance();
+  }
+
+  async listInstruments(instrumentType: InstrumentType) {
+    console.log(`Listing instruments of type: ${instrumentType}`);
+    // Implement the logic for fetching and displaying instruments for the chosen type
   }
 
   async execute(

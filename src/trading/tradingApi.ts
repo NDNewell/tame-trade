@@ -22,7 +22,6 @@ export class TradingApi {
 
     const symbols = Object.keys(markets);
     this.cachedMarkets = symbols;
-    console.log('Fetched markets:', symbols);
     return symbols;
   }
 }
