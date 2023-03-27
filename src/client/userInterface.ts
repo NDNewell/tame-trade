@@ -184,7 +184,8 @@ export class UserInterface {
         console.log(`Invalid instrument: ${instrument}`);
       }
     } else if (command === 'markets') {
-      await this.selectInstrumentType();
+      const instrumentType = await this.selectInstrumentType();
+      this.currentInstrument = await this.selectMarketByType(instrumentType);
     } else if (command === 'quit' || command === 'q') {
       this.quit();
     } else {
@@ -228,7 +229,7 @@ export class UserInterface {
     this.promptForCommand();
   }
 
-  private async selectInstrumentType(): Promise<void> {
+  private async selectInstrumentType(): Promise<string | undefined> {
     this.pauseReadline();
 
     const availableTypes = await this.exchangeCommand
@@ -247,13 +248,43 @@ export class UserInterface {
       },
     ]);
 
+    clear();
+
     if (instrumentType === 'back') {
       this.resumeReadline();
+      return;
     } else {
-      this.exchangeCommand.listInstruments(instrumentType);
+      return instrumentType;
+    }
+  }
+
+  private async selectMarketByType(
+    instrumentType: string | undefined
+  ): Promise<string> {
+    if (instrumentType === undefined) {
+      return 'back';
     }
 
+    const marketsByType = await this.exchangeCommand
+      .getExchangeClient()
+      .getMarketByType(instrumentType);
+
+    const { market } = await inquirer.prompt([
+      {
+        type: 'list',
+        name: 'market',
+        message: 'Select market:',
+        choices: [
+          ...Array.from(marketsByType),
+          { name: 'Back', value: 'back' },
+        ],
+      },
+    ]);
+
     clear();
+
+    this.resumeReadline();
+    return market;
   }
 
   quit() {

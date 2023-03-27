@@ -114,6 +114,26 @@ export class ExchangeClient {
     }
   }
 
+  async getMarketByType(type: string): Promise<Array<string>> {
+    if (this.exchange === null) {
+      console.error(
+        `[ExchangeClient] Exchange not initialized. Please call 'init' or 'setExchange' before fetching instruments.`
+      );
+      return [];
+    }
+
+    if (this.availableMarkets !== null) {
+      return Object.keys(this.availableMarkets).filter(
+        (symbol) => this.availableMarkets![symbol].type === type
+      );
+    } else {
+      console.error(
+        `[ExchangeClient] Available markets not initialized. Please call 'init' or 'setExchange' before fetching instruments.`
+      );
+      return [];
+    }
+  }
+
   async executeOrder(
     method: string,
     instrument: string,
