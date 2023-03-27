@@ -183,7 +183,7 @@ export class UserInterface {
       } else {
         console.log(`Invalid instrument: ${instrument}`);
       }
-    } else if (command === 'list instruments') {
+    } else if (command === 'markets') {
       await this.selectInstrumentType();
     } else if (command === 'quit' || command === 'q') {
       this.quit();

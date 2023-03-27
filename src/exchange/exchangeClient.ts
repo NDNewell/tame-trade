@@ -71,11 +71,7 @@ export class ExchangeClient {
     if (this.availableMarkets !== null) {
       Object.values(this.availableMarkets).forEach((market) => {
         if (market.type) {
-          const formattedMarketType =
-            market.type !== 'spot'
-              ? `${market.type.charAt(0).toUpperCase()}${market.type.slice(1)}s`
-              : `${market.type.charAt(0).toUpperCase()}${market.type.slice(1)}`;
-          availableTypes.add(formattedMarketType);
+          availableTypes.add(market.type);
         }
       });
 
