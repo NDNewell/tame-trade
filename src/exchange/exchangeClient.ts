@@ -1,5 +1,7 @@
-import ccxt, { Exchange, Market } from 'ccxt';
+import { pro as ccxtpro, Exchange, Market } from 'ccxt';
+import ccxt from 'ccxt';
 import { ConfigManager } from '../config/configManager';
+import { WebSocket } from 'ws';
 
 export class ExchangeClient {
   private static instance: ExchangeClient | null = null;
@@ -7,6 +9,7 @@ export class ExchangeClient {
   private supportedExchanges: string[] | null = null;
   exchange: Exchange | null = null;
   exchangeManager: ConfigManager;
+  private ws: WebSocket | null = null;
 
   private constructor() {
     this.exchangeManager = new ConfigManager();
@@ -29,6 +32,37 @@ export class ExchangeClient {
 
   isInitialized(): boolean {
     return this.supportedExchanges !== null;
+  }
+
+  async watchOrderBook(symbol: string): Promise<void> {
+    if (this.exchange === null) {
+      console.error(
+        `[ExchangeClient/watchOrderBook] Exchange not initialized. Please call 'init' or 'setExchange' before fetching order book.`
+      );
+      return;
+    }
+
+    if (!this.exchange.has.ws) {
+      console.error(
+        `[ExchangeClient/watchOrderBook] WebSocket not supported for the current exchange (${this.exchange.name}).`
+      );
+      return;
+    }
+
+    console.log(
+      `[ExchangeClient/watchOrderBook] Subscribing to order book for ${symbol}`
+    );
+    try {
+      while (true) {
+        const orderbook = await this.exchange.watchOrderBook(symbol);
+        console.log(new Date(), orderbook['asks'][0], orderbook['bids'][0]);
+      }
+    } catch (error) {
+      console.error(
+        `[ExchangeClient/watchOrderBook] Failed to subscribe to order book:`,
+        error
+      );
+    }
   }
 
   async loadExchanges(): Promise<void> {
@@ -56,7 +90,7 @@ export class ExchangeClient {
       exchangeId
     );
 
-    this.exchange = new (ccxt as any)[exchangeId.toLowerCase()]({
+    this.exchange = new (ccxtpro as any)[exchangeId.toLowerCase()]({
       apiKey: key,
       secret: secret,
       enableRateLimit: true,

@@ -181,6 +181,26 @@ export class UserInterface {
       } else {
         console.log(`Invalid market: ${market}`);
       }
+    } else if (command.startsWith('watch')) {
+      const commandParts = command.split(' ');
+
+      if (commandParts.length === 3 && commandParts[2] === 'orderbook') {
+        const market = commandParts[1];
+
+        if (this.availableMarkets.includes(market)) {
+          try {
+            await this.exchangeCommand
+              .getExchangeClient()
+              .watchOrderBook(market);
+          } catch (error: unknown) {
+            console.log((error as Error).message);
+          }
+        } else {
+          console.log(`Invalid market: ${market}`);
+        }
+      } else {
+        console.log('Invalid command format. Usage: watch [symbol] orderbook');
+      }
     } else if (command === 'list markets') {
       const marketType = await this.selectMarketType();
       this.currentMarket = await this.selectMarketByType(marketType);
