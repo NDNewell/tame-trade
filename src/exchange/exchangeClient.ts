@@ -13,6 +13,7 @@ export class ExchangeClient {
 
   private constructor() {
     this.exchangeManager = new ConfigManager();
+    this.supportedExchanges = [];
   }
 
   static getInstance(): ExchangeClient {
@@ -25,9 +26,9 @@ export class ExchangeClient {
   async init(exchangeId?: string): Promise<void> {
     if (exchangeId) {
       await this.setExchange(exchangeId);
+      await this.loadMarkets();
     }
     await this.loadExchanges();
-    await this.loadMarkets();
   }
 
   isInitialized(): boolean {
@@ -66,7 +67,20 @@ export class ExchangeClient {
   }
 
   async loadExchanges(): Promise<void> {
-    this.supportedExchanges = ccxt.exchanges;
+    const supportedExchanges: Set<string> = new Set();
+    const exchangeIds = ccxt.exchanges;
+    for (let i = 0; i < exchangeIds.length; i++) {
+      const exchangeId = exchangeIds[i];
+      try {
+        const exchange = new (ccxtpro as any)[exchangeId]();
+        if (exchange.has.ws) {
+          supportedExchanges.add(exchange.name);
+        }
+      } catch (e) {
+        continue;
+      }
+    }
+    this.supportedExchanges = Array.from(supportedExchanges);
   }
 
   async loadMarkets(): Promise<void> {
