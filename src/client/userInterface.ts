@@ -6,17 +6,17 @@ import clear from 'console-clear';
 import * as readline from 'readline';
 import { formatOutput as fo } from '../utils/formatOutput';
 import { ExchangeProfile } from '../config/configManager';
-import { ExchangeCommand, CommandType } from '../commands/exchangeCommand';
+import { ExchangeCommand, OrderType } from '../commands/exchangeCommand';
 
 export class UserInterface {
   private rl?: readline.Interface;
-  private currentInstrument: string;
+  private currentMarket: string;
   private availableMarkets: string[];
   private exchangeCommand: ExchangeCommand;
 
   constructor() {
     this.exchangeCommand = new ExchangeCommand();
-    this.currentInstrument = '';
+    this.currentMarket = '';
     this.availableMarkets = [];
     inquirer.registerPrompt('autocomplete', autocomplete);
   }
@@ -158,17 +158,13 @@ export class UserInterface {
     const exchangeClient = this.exchangeCommand.getExchangeClient();
     const exchangeName = exchangeClient.getSelectedExchangeName();
     const tameDisplay = `<${fo('Tame', 'yellow', 'italic')}>`;
-    const instrumentDisplay = `<${fo(
-      `${this.currentInstrument}`,
-      'green',
-      'italic'
-    )}>`;
+    const marketDisplay = `<${fo(`${this.currentMarket}`, 'green', 'italic')}>`;
     const exchangeDisplay = exchangeName
       ? `<${fo(exchangeName, 'orange', 'italic')}>`
       : '';
 
-    const promptMessage = this.currentInstrument
-      ? `${tameDisplay}${exchangeDisplay}${instrumentDisplay} `
+    const promptMessage = this.currentMarket
+      ? `${tameDisplay}${exchangeDisplay}${marketDisplay} `
       : `${tameDisplay}${exchangeDisplay} `;
 
     this.rl?.question(promptMessage, (command) => {
@@ -177,43 +173,43 @@ export class UserInterface {
   }
 
   private async handleCommand(command: string) {
-    if (command.startsWith('instrument ')) {
-      const instrument = command.split(' ')[1];
-      if (this.availableMarkets.includes(instrument)) {
-        this.currentInstrument = instrument;
-        console.log(`Switched to instrument: ${instrument}`);
+    if (command.startsWith('market')) {
+      const market = command.split(' ')[1];
+      if (this.availableMarkets.includes(market)) {
+        this.currentMarket = market;
+        console.log(`Switched to market: ${market}`);
       } else {
-        console.log(`Invalid instrument: ${instrument}`);
+        console.log(`Invalid market: ${market}`);
       }
-    } else if (command === 'markets') {
-      const instrumentType = await this.selectInstrumentType();
-      this.currentInstrument = await this.selectMarketByType(instrumentType);
+    } else if (command === 'list markets') {
+      const marketType = await this.selectMarketType();
+      this.currentMarket = await this.selectMarketByType(marketType);
     } else if (command === 'quit' || command === 'q') {
       this.quit();
     } else {
-      if (this.currentInstrument) {
+      if (this.currentMarket) {
         try {
-          const commandParams = await CommandType.parseCommand(command);
+          const commandParams = await OrderType.parseCommand(command);
           if (commandParams !== null) {
             const { type, quantity, price } = commandParams;
 
             if (
-              type === CommandType.MARKET_BUY ||
-              type === CommandType.MARKET_SELL
+              type === OrderType.MARKET_BUY ||
+              type === OrderType.MARKET_SELL
             ) {
               await this.exchangeCommand.execute(
                 type,
-                this.currentInstrument,
+                this.currentMarket,
                 Number(quantity)
               );
             } else if (
-              type === CommandType.STOP ||
-              type === CommandType.LIMIT_BUY ||
-              type === CommandType.LIMIT_SELL
+              type === OrderType.STOP ||
+              type === OrderType.LIMIT_BUY ||
+              type === OrderType.LIMIT_SELL
             ) {
               await this.exchangeCommand.execute(
                 type,
-                this.currentInstrument,
+                this.currentMarket,
                 Number(quantity),
                 Number(price)
               );
@@ -223,26 +219,24 @@ export class UserInterface {
           console.log((error as Error).message);
         }
       } else {
-        console.log(
-          'No instrument selected. Please select an instrument first.'
-        );
+        console.log('No market selected. Please select a market first.');
       }
     }
     this.promptForCommand();
   }
 
-  private async selectInstrumentType(): Promise<string | undefined> {
+  private async selectMarketType(): Promise<string | undefined> {
     this.pauseReadline();
 
     const availableTypes = await this.exchangeCommand
       .getExchangeClient()
       .getMarketTypes();
 
-    const { instrumentType } = await inquirer.prompt([
+    const { marketType } = await inquirer.prompt([
       {
         type: 'list',
-        name: 'instrumentType',
-        message: 'Select instrument type:',
+        name: 'marketType',
+        message: 'Select market type:',
         choices: [
           ...Array.from(availableTypes),
           { name: 'Back', value: 'back' },
@@ -252,24 +246,24 @@ export class UserInterface {
 
     clear();
 
-    if (instrumentType === 'back') {
+    if (marketType === 'back') {
       this.resumeReadline();
       return;
     } else {
-      return instrumentType;
+      return marketType;
     }
   }
 
   private async selectMarketByType(
-    instrumentType: string | undefined
+    marketType: string | undefined
   ): Promise<string> {
-    if (instrumentType === undefined) {
+    if (marketType === undefined) {
       return 'back';
     }
 
     const marketsByType = await this.exchangeCommand
       .getExchangeClient()
-      .getMarketByType(instrumentType);
+      .getMarketByType(marketType);
 
     async function searchMarkets(
       answers: Record<string, unknown>,

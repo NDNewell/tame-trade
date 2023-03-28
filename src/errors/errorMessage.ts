@@ -11,7 +11,7 @@ export const errorMessages = {
   exchangeCommand: {
     INVALID_PRICE: 'Invalid price',
     INVALID_QUANTITY: 'Invalid quantity',
-    INVALID_COMMAND: 'Invalid command ',
+    INVALID_COMMAND: 'Invalid command',
     INVALID_MARKET_ORDER: 'Invalid market order',
     INVALID_LIMIT_ORDER: 'Invalid limit order',
     INVALID_STOP_ORDER: 'Invalid stop order',

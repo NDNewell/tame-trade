@@ -4,7 +4,7 @@ import { ExchangeClient } from '../exchange/exchangeClient';
 import { AppError } from '../errors/appError';
 import { ErrorType } from '../errors/errorType';
 
-export enum CommandType {
+export enum OrderType {
   MARKET_BUY,
   MARKET_SELL,
   LIMIT_BUY,
@@ -13,7 +13,7 @@ export enum CommandType {
   NULL,
 }
 
-export enum InstrumentType {
+export enum MarketType {
   FUTURES = 'Futures',
   PERPETUAL_SWAPS = 'Perpetual Swaps',
   OPTIONS = 'Options',
@@ -22,8 +22,8 @@ export enum InstrumentType {
 
 export interface Command {
   execute(
-    commandType: CommandType,
-    currentInstrument: string,
+    orderType: OrderType,
+    currentMarket: string,
     quantity: number,
     price: number
   ): Promise<void>;
@@ -36,52 +36,52 @@ export class ExchangeCommand implements Command {
     this.exchangeClient = ExchangeClient.getInstance();
   }
 
-  async listInstruments(instrumentType: InstrumentType) {
-    console.log(`Listing instruments of type: ${instrumentType}`);
-    // Implement the logic for fetching and displaying instruments for the chosen type
+  async listMarkets(marketType: MarketType) {
+    console.log(`Listing markets of type: ${marketType}`);
+    // Implement the logic for fetching and displaying markets for the chosen type
   }
 
   async execute(
-    commandType: CommandType,
-    currentInstrument: string,
+    orderType: OrderType,
+    currentMarket: string,
     quantity: number,
     price?: number
   ): Promise<void> {
-    switch (commandType) {
-      case CommandType.MARKET_BUY:
-        await this.exchangeClient.createMarketBuyOrder(
-          currentInstrument,
-          quantity
-        );
+    switch (orderType) {
+      case OrderType.MARKET_BUY:
+        await this.exchangeClient.createMarketBuyOrder(currentMarket, quantity);
         break;
-      case CommandType.MARKET_SELL:
+      case OrderType.MARKET_SELL:
         await this.exchangeClient.createMarketSellOrder(
-          currentInstrument,
+          currentMarket,
           quantity
         );
         break;
-      case CommandType.LIMIT_BUY:
+      case OrderType.LIMIT_BUY:
         if (price) {
           await this.exchangeClient.createLimitBuyOrder(
-            currentInstrument,
+            currentMarket,
             quantity,
             price
           );
         }
         break;
-      case CommandType.LIMIT_SELL:
+      case OrderType.LIMIT_SELL:
         if (price) {
           await this.exchangeClient.createLimitSellOrder(
-            currentInstrument,
+            currentMarket,
             quantity,
             price
           );
         }
         break;
-      case CommandType.STOP:
+      case OrderType.STOP:
         if (price) {
+          console.log('CurrentMarket: ', currentMarket);
+          console.log('Quantity: ', quantity);
+          console.log('Price: ', price);
           await this.exchangeClient.createStopOrder(
-            currentInstrument,
+            currentMarket,
             quantity,
             price
           );
@@ -98,37 +98,37 @@ export class ExchangeCommand implements Command {
   }
 }
 
-export namespace CommandType {
+export namespace OrderType {
   export async function parseCommand(
-    command: string
-  ): Promise<{ type: CommandType; quantity?: number; price?: number } | null> {
-    let type: CommandType = CommandType.NULL; // initialize to default value
+    order: string
+  ): Promise<{ type: OrderType; quantity?: number; price?: number } | null> {
+    let type: OrderType = OrderType.NULL; // initialize to default value
     let quantity: number | undefined = undefined;
     let price: number | undefined = undefined;
 
-    const args = command.split(/\s+/);
-    const typeString = args[0];
+    const args = order.split(/\s+/);
+    const orderTypeString = args[0];
 
-    if (typeString === 'buy') {
-      type = CommandType.MARKET_BUY;
-    } else if (typeString === 'sell') {
-      type = CommandType.MARKET_SELL;
-    } else if (typeString === 'stop') {
-      type = CommandType.STOP;
-    } else if (typeString === 'limit' && args.length === 4) {
+    if (orderTypeString === 'buy') {
+      type = OrderType.MARKET_BUY;
+    } else if (orderTypeString === 'sell') {
+      type = OrderType.MARKET_SELL;
+    } else if (orderTypeString === 'stop') {
+      type = OrderType.STOP;
+    } else if (orderTypeString === 'limit' && args.length === 4) {
       const sideString = args[1];
       if (sideString === 'buy') {
-        type = CommandType.LIMIT_BUY;
+        type = OrderType.LIMIT_BUY;
       } else if (sideString === 'sell') {
-        type = CommandType.LIMIT_SELL;
+        type = OrderType.LIMIT_SELL;
       } else {
         throw new AppError(ErrorType.INVALID_COMMAND);
       }
     }
 
-    if (type !== CommandType.NULL) {
+    if (type !== OrderType.NULL) {
       // Apply your validation function here
-      validateCommand(command, type);
+      validateOrder(order, type);
 
       const quantityString = args.length === 4 ? args[2] : args[1];
       const priceString = args.length === 4 ? args[3] : args[2];
@@ -140,9 +140,9 @@ export namespace CommandType {
       }
 
       if (
-        type === CommandType.STOP ||
-        type === CommandType.LIMIT_BUY ||
-        type === CommandType.LIMIT_SELL
+        type === OrderType.STOP ||
+        type === OrderType.LIMIT_BUY ||
+        type === OrderType.LIMIT_SELL
       ) {
         if (!isNaN(Number(priceString))) {
           price = Number(priceString);
@@ -157,21 +157,18 @@ export namespace CommandType {
     }
   }
 
-  export function validateCommand(command: string, type: CommandType): void {
-    const args = command.trim().split(/\s+/);
+  export function validateOrder(order: string, type: OrderType): void {
+    const args = order.trim().split(/\s+/);
 
-    if (type === CommandType.MARKET_BUY || type === CommandType.MARKET_SELL) {
+    if (type === OrderType.MARKET_BUY || type === OrderType.MARKET_SELL) {
       if (args.length !== 2) {
         throw new AppError(ErrorType.INVALID_MARKET_ORDER);
       }
-    } else if (
-      type === CommandType.LIMIT_BUY ||
-      type === CommandType.LIMIT_SELL
-    ) {
+    } else if (type === OrderType.LIMIT_BUY || type === OrderType.LIMIT_SELL) {
       if (args.length !== 4) {
         throw new AppError(ErrorType.INVALID_LIMIT_ORDER);
       }
-    } else if (type === CommandType.STOP) {
+    } else if (type === OrderType.STOP) {
       if (args.length !== 3) {
         throw new AppError(ErrorType.INVALID_STOP_ORDER);
       }

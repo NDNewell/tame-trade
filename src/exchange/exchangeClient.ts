@@ -38,7 +38,7 @@ export class ExchangeClient {
   async loadMarkets(): Promise<void> {
     if (this.exchange === null) {
       console.error(
-        `[ExchangeClient] Exchange not initialized. Please call 'init' or 'setExchange' before fetching instruments.`
+        `[ExchangeClient] Exchange not initialized. Please call 'init' or 'setExchange' before fetching markets.`
       );
       return;
     }
@@ -46,7 +46,7 @@ export class ExchangeClient {
     try {
       this.availableMarkets = await this.exchange.loadMarkets();
     } catch (error) {
-      console.error(`[ExchangeClient] Failed to fetch instruments:`, error);
+      console.error(`[ExchangeClient] Failed to fetch markets:`, error);
     }
   }
 
@@ -82,7 +82,7 @@ export class ExchangeClient {
       return Array.from(availableTypes);
     } else {
       console.error(
-        `[ExchangeClient] Available markets not initialized. Please call 'init' or 'setExchange' before fetching instruments.`
+        `[ExchangeClient] Available markets not initialized. Please call 'init' or 'setExchange' before fetching markets.`
       );
       return [];
     }
@@ -103,7 +103,7 @@ export class ExchangeClient {
   async getMarketSymbols(): Promise<Array<string>> {
     if (this.exchange === null) {
       console.error(
-        `[ExchangeClient] Exchange not initialized. Please call 'init' or 'setExchange' before fetching instruments.`
+        `[ExchangeClient] Exchange not initialized. Please call 'init' or 'setExchange' before fetching markets.`
       );
       return [];
     }
@@ -112,7 +112,7 @@ export class ExchangeClient {
       return Object.keys(this.availableMarkets);
     } else {
       console.error(
-        `[ExchangeClient] Available markets not initialized. Please call 'init' or 'setExchange' before fetching instruments.`
+        `[ExchangeClient] Available markets not initialized. Please call 'init' or 'setExchange' before fetching markets.`
       );
       return [];
     }
@@ -121,7 +121,7 @@ export class ExchangeClient {
   async getMarketByType(type: string): Promise<Array<string>> {
     if (this.exchange === null) {
       console.error(
-        `[ExchangeClient] Exchange not initialized. Please call 'init' or 'setExchange' before fetching instruments.`
+        `[ExchangeClient] Exchange not initialized. Please call 'init' or 'setExchange' before fetching markets.`
       );
       return [];
     }
@@ -132,7 +132,7 @@ export class ExchangeClient {
       );
     } else {
       console.error(
-        `[ExchangeClient] Available markets not initialized. Please call 'init' or 'setExchange' before fetching instruments.`
+        `[ExchangeClient] Available markets not initialized. Please call 'init' or 'setExchange' before fetching markets.`
       );
       return [];
     }
@@ -140,7 +140,7 @@ export class ExchangeClient {
 
   async executeOrder(
     method: string,
-    instrument: string,
+    market: string,
     ...args: any[]
   ): Promise<void> {
     if (this.exchange === null) {
@@ -151,61 +151,67 @@ export class ExchangeClient {
     }
 
     try {
-      const order = await (this.exchange as any)[method](instrument, ...args);
-      const filledAmount = parseFloat(order.filled);
-      const trimmedFilledAmount = filledAmount.toFixed(
-        Math.max(
-          2,
-          filledAmount.toString().split('.')[1].replace(/0+$/, '').length
-        )
-      );
-      const trimmedPrice = parseFloat(order.price).toFixed(2);
-      console.log(`Filled ${trimmedFilledAmount} @${trimmedPrice}`);
+      const order = await (this.exchange as any)[method](market, ...args);
+      const orderType = order.type;
+
+      if (orderType === 'market') {
+        const filledAmount = parseFloat(order.filled);
+        const trimmedFilledAmount = filledAmount.toFixed(
+          Math.max(
+            2,
+            filledAmount.toString().split('.')[1].replace(/0+$/, '').length
+          )
+        );
+        const trimmedPrice = parseFloat(order.price).toFixed(2);
+        console.log(`Filled ${trimmedFilledAmount} @${trimmedPrice}`);
+      } else if (orderType === 'limit') {
+        const side = order.side;
+        const amount = parseFloat(order.amount);
+        const trimmedAmount = amount.toFixed(
+          Math.max(
+            2,
+            amount.toString().split('.')[1]?.replace(/0+$/, '').length || 0
+          )
+        );
+        const price = parseFloat(order.price).toFixed(2);
+        console.log(
+          `Limit order (${side}) of ${trimmedAmount} placed @${price}, order ID: ${order.id}`
+        );
+      }
     } catch (error) {
       console.error(`[ExchangeClient] Failed to place order:`, error);
     }
   }
 
-  async createMarketBuyOrder(
-    instrument: string,
-    quantity: number
-  ): Promise<void> {
-    await this.executeOrder('createMarketBuyOrder', instrument, quantity);
+  async createMarketBuyOrder(market: string, quantity: number): Promise<void> {
+    await this.executeOrder('createMarketBuyOrder', market, quantity);
   }
 
-  async createMarketSellOrder(
-    instrument: string,
-    quantity: number
-  ): Promise<void> {
-    await this.executeOrder('createMarketSellOrder', instrument, quantity);
+  async createMarketSellOrder(market: string, quantity: number): Promise<void> {
+    await this.executeOrder('createMarketSellOrder', market, quantity);
   }
 
   async createLimitBuyOrder(
-    instrument: string,
+    market: string,
     quantity: number,
     price: number
   ): Promise<void> {
-    await this.executeOrder('createLimitBuyOrder', instrument, quantity, price);
+    await this.executeOrder('createLimitBuyOrder', market, quantity, price);
   }
 
   async createLimitSellOrder(
-    instrument: string,
+    market: string,
     quantity: number,
     price: number
   ): Promise<void> {
-    await this.executeOrder(
-      'createLimitSellOrder',
-      instrument,
-      quantity,
-      price
-    );
+    await this.executeOrder('createLimitSellOrder', market, quantity, price);
   }
 
   async createStopOrder(
-    instrument: string,
+    market: string,
     stopPrice: number,
     quantity: number
   ): Promise<void> {
-    await this.executeOrder('createStopOrder', instrument, stopPrice, quantity);
+    await this.executeOrder('createStopOrder', market, stopPrice, quantity);
   }
 }

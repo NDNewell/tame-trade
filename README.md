@@ -35,7 +35,7 @@ With this alias configuration, typing b in the terminal will execute the limit b
 
 ### General Commands
 
-`instrument [symbol]`: Switch to another instrument (e.g., instrument btc-perp or instrument eth-perp).
+`market [symbol]`: Switch to another market (e.g., market btc-perp or market eth-perp).
 
 `buy [size] @ [price]`: Place a limit buy order (e.g., buy 0.001 @ 9000).
 
