@@ -227,12 +227,21 @@ export class UserInterface {
               type === OrderType.LIMIT_BUY ||
               type === OrderType.LIMIT_SELL
             ) {
-              await this.exchangeCommand.execute(
-                type,
-                this.currentMarket,
-                Number(quantity),
-                Number(price)
-              );
+              if (quantity !== undefined) {
+                await this.exchangeCommand.execute(
+                  type,
+                  this.currentMarket,
+                  Number(price),
+                  Number(quantity)
+                );
+              } else {
+                await this.exchangeCommand.execute(
+                  type,
+                  this.currentMarket,
+                  undefined,
+                  Number(price)
+                );
+              }
             }
           }
         } catch (error: unknown) {

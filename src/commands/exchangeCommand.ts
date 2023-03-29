@@ -91,7 +91,7 @@ export class ExchangeCommand implements Command {
         console.log('Invalid command. Please enter a valid command.');
         break;
     }
-    await this.exchangeClient.watchOrders(currentMarket);
+    // await this.exchangeClient.watchOrders(currentMarket);
   }
 
   getExchangeClient(): ExchangeClient {
@@ -106,6 +106,8 @@ export namespace OrderType {
     let type: OrderType = OrderType.NULL; // initialize to default value
     let quantity: number | undefined = undefined;
     let price: number | undefined = undefined;
+
+    console.log(order);
 
     const args = order.split(/\s+/);
     const orderTypeString = args[0];
@@ -131,13 +133,29 @@ export namespace OrderType {
       // Apply your validation function here
       validateOrder(order, type);
 
-      const quantityString = args.length === 4 ? args[2] : args[1];
-      const priceString = args.length === 4 ? args[3] : args[2];
+      let priceString;
+      let quantityString;
 
-      if (!isNaN(Number(quantityString))) {
-        quantity = Number(quantityString);
+      if (type === OrderType.STOP) {
+        if (args.length === 3) {
+          if (!isNaN(Number(args[1]))) {
+            quantity = Number(args[1]);
+            priceString = args[2];
+          } else {
+            throw new AppError(ErrorType.INVALID_QUANTITY);
+          }
+        } else if (args.length === 2) {
+          priceString = args[1];
+        }
       } else {
-        throw new AppError(ErrorType.INVALID_QUANTITY);
+        quantityString = args.length === 4 ? args[2] : args[1];
+        priceString = args.length === 4 ? args[3] : args[2];
+
+        if (!isNaN(Number(quantityString))) {
+          quantity = Number(quantityString);
+        } else {
+          throw new AppError(ErrorType.INVALID_QUANTITY);
+        }
       }
 
       if (
@@ -170,7 +188,7 @@ export namespace OrderType {
         throw new AppError(ErrorType.INVALID_LIMIT_ORDER);
       }
     } else if (type === OrderType.STOP) {
-      if (args.length !== 3) {
+      if (args.length < 2 || args.length > 3) {
         throw new AppError(ErrorType.INVALID_STOP_ORDER);
       }
     }

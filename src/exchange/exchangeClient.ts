@@ -331,41 +331,30 @@ export class ExchangeClient {
     price: number,
     quantity?: number
   ): Promise<void> {
-    let side;
-
     try {
       const position = await this.exchange!.fetchPosition(market);
-      if (position) {
-        side = position.info.direction === 'buy' ? 'sell' : 'buy';
+      quantity = Math.abs(position.notional);
+      if (quantity > 0) {
+        const side = position.info.direction === 'buy' ? 'sell' : 'buy';
+        const params = {
+          stopLossPrice: price,
+        };
 
-        if (quantity === undefined) {
-          quantity = position.notional;
-          if (side === 'sell') {
-            quantity = -1 * quantity!;
-          }
-        }
+        await this.executeOrder(
+          'createOrder',
+          market,
+          'market',
+          side,
+          quantity,
+          price,
+          params
+        );
+      } else {
+        console.error(
+          `[ExchangeClient] No positions found for ${market}. Please open a position before placing a stop order.`
+        );
+        return;
       }
-    } catch (error) {
-      console.error(
-        `[ExchangeClient] No positions. Failed to place stop order`,
-        error
-      );
-    }
-
-    try {
-      const params = {
-        stopLossPrice: price,
-      };
-
-      await this.executeOrder(
-        'createOrder',
-        market,
-        'market',
-        side,
-        quantity,
-        price,
-        params
-      );
     } catch (error) {
       console.error(`[ExchangeClient] Failed to place order:`, error);
     }
