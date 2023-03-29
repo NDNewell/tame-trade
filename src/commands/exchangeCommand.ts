@@ -44,24 +44,27 @@ export class ExchangeCommand implements Command {
   async execute(
     orderType: OrderType,
     currentMarket: string,
-    quantity: number,
+    quantity?: number,
     price?: number
   ): Promise<void> {
     switch (orderType) {
       case OrderType.MARKET_BUY:
-        await this.exchangeClient.createMarketBuyOrder(currentMarket, quantity);
+        await this.exchangeClient.createMarketBuyOrder(
+          currentMarket,
+          quantity!
+        );
         break;
       case OrderType.MARKET_SELL:
         await this.exchangeClient.createMarketSellOrder(
           currentMarket,
-          quantity
+          quantity!
         );
         break;
       case OrderType.LIMIT_BUY:
         if (price) {
           await this.exchangeClient.createLimitBuyOrder(
             currentMarket,
-            quantity,
+            quantity!,
             price
           );
         }
@@ -70,20 +73,17 @@ export class ExchangeCommand implements Command {
         if (price) {
           await this.exchangeClient.createLimitSellOrder(
             currentMarket,
-            quantity,
+            quantity!,
             price
           );
         }
         break;
       case OrderType.STOP:
         if (price) {
-          console.log('CurrentMarket: ', currentMarket);
-          console.log('Quantity: ', quantity);
-          console.log('Price: ', price);
           await this.exchangeClient.createStopOrder(
             currentMarket,
-            quantity,
-            price
+            price,
+            quantity
           );
         }
         break;

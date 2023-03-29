@@ -261,7 +261,17 @@ export class ExchangeClient {
 
     try {
       const order = await (this.exchange as any)[method](market, ...args);
-      const orderType = order.type;
+      let isStop = false;
+
+      if (args[0] && args.includes('params')) {
+        const paramsIndex = args.indexOf('params');
+        const params = args[paramsIndex + 1];
+        if (params && params.stopLossPrice) {
+          isStop = true;
+        }
+      }
+
+      const orderType = isStop ? 'stop' : order.type;
 
       if (orderType === 'market') {
         const filledAmount = parseFloat(order.filled);
@@ -276,9 +286,19 @@ export class ExchangeClient {
         console.log(
           `Limit order (${side}) of ${trimmedAmount} placed @${price}, order ID: ${order.id}`
         );
+      } else if (orderType === 'stop') {
+        const amount = parseFloat(order.amount);
+        const trimmedAmount = this.trimAmount(amount);
+        const price = parseFloat(order.price).toFixed(2);
+        console.log(
+          `Placed stop ${trimmedAmount} @${price}, order ID: ${order.id}`
+        );
       }
     } catch (error) {
-      console.error(`[ExchangeClient] Failed to place order:`, error);
+      console.error(
+        `[ExchangeClient/executeOrder] Failed to place order:`,
+        error
+      );
     }
   }
 
@@ -300,17 +320,54 @@ export class ExchangeClient {
 
   async createLimitSellOrder(
     market: string,
-    quantity: number,
-    price: number
+    price: number,
+    quantity: number
   ): Promise<void> {
     await this.executeOrder('createLimitSellOrder', market, quantity, price);
   }
 
   async createStopOrder(
     market: string,
-    stopPrice: number,
-    quantity: number
+    price: number,
+    quantity?: number
   ): Promise<void> {
-    await this.executeOrder('createStopOrder', market, stopPrice, quantity);
+    let side;
+
+    try {
+      const position = await this.exchange!.fetchPosition(market);
+      if (position) {
+        side = position.info.direction === 'buy' ? 'sell' : 'buy';
+
+        if (quantity === undefined) {
+          quantity = position.notional;
+          if (side === 'sell') {
+            quantity = -1 * quantity!;
+          }
+        }
+      }
+    } catch (error) {
+      console.error(
+        `[ExchangeClient] No positions. Failed to place stop order`,
+        error
+      );
+    }
+
+    try {
+      const params = {
+        stopLossPrice: price,
+      };
+
+      await this.executeOrder(
+        'createOrder',
+        market,
+        'market',
+        side,
+        quantity,
+        price,
+        params
+      );
+    } catch (error) {
+      console.error(`[ExchangeClient] Failed to place order:`, error);
+    }
   }
 }
