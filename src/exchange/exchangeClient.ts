@@ -2,6 +2,7 @@ import { pro as ccxtpro, Exchange, Market } from 'ccxt';
 import ccxt from 'ccxt';
 import { ConfigManager } from '../config/configManager';
 import { WebSocket } from 'ws';
+import { EventEmitter } from 'events';
 
 export class ExchangeClient {
   private static instance: ExchangeClient | null = null;
@@ -10,10 +11,12 @@ export class ExchangeClient {
   exchange: Exchange | null = null;
   exchangeManager: ConfigManager;
   private ws: WebSocket | null = null;
+  private eventEmitter: EventEmitter;
 
   private constructor() {
     this.exchangeManager = new ConfigManager();
     this.supportedExchanges = [];
+    this.eventEmitter = new EventEmitter();
   }
 
   static getInstance(): ExchangeClient {
@@ -116,6 +119,7 @@ export class ExchangeClient {
 
     await this.loadMarkets();
     await this.loadExchanges();
+    this.setEventListeners();
   }
 
   async getMarketTypes(): Promise<string[]> {
@@ -186,6 +190,63 @@ export class ExchangeClient {
     }
   }
 
+  trimAmount(amount: number): string {
+    const trimmedAmount = amount.toFixed(
+      Math.max(
+        2,
+        amount.toString().split('.')[1]?.replace(/0+$/, '').length || 0
+      )
+    );
+
+    return trimmedAmount;
+  }
+
+  setEventListeners(): void {
+    this.eventEmitter.on('limitOrderFilled', (data) => {
+      console.log(
+        `${data.side[0].toUpperCase()}${data.side.slice(1)} limit filled ${
+          data.filled
+        } @${data.price}`
+      );
+    });
+
+    this.eventEmitter.on('orderCanceled', (data) => {
+      console.log(
+        `${data.side[0].toUpperCase()}${data.side.slice(1)} order canceled!`
+      );
+    });
+  }
+
+  async watchOrders(symbol: string): Promise<void> {
+    try {
+      // Subscribe to order updates
+      const orders: any[] = await this.exchange!.watchOrders(symbol);
+      orders.forEach((order) => {
+        const { status, type, side, price, filled, average } = order;
+        if (status === 'closed') {
+          if (type === 'limit') {
+            this.eventEmitter.emit('limitOrderFilled', {
+              side,
+              filled,
+              price,
+            });
+          }
+          // You can add other types of orders like 'stop' or 'stop-limit' if needed.
+        } else if (status === 'canceled') {
+          this.eventEmitter.emit('orderCanceled', {
+            side,
+          });
+        }
+      });
+      this.exchange!.watchOrders(symbol, undefined, { fetchOrder: 'stop' });
+    } catch (error) {
+      console.error(
+        `[ExchangeClient/watchOrders] Failed to subscribe to order updates:`,
+        error
+      );
+    }
+  }
+
   async executeOrder(
     method: string,
     market: string,
@@ -204,23 +265,13 @@ export class ExchangeClient {
 
       if (orderType === 'market') {
         const filledAmount = parseFloat(order.filled);
-        const trimmedFilledAmount = filledAmount.toFixed(
-          Math.max(
-            2,
-            filledAmount.toString().split('.')[1].replace(/0+$/, '').length
-          )
-        );
+        const trimmedFilledAmount = this.trimAmount(filledAmount);
         const trimmedPrice = parseFloat(order.price).toFixed(2);
         console.log(`Filled ${trimmedFilledAmount} @${trimmedPrice}`);
       } else if (orderType === 'limit') {
         const side = order.side;
         const amount = parseFloat(order.amount);
-        const trimmedAmount = amount.toFixed(
-          Math.max(
-            2,
-            amount.toString().split('.')[1]?.replace(/0+$/, '').length || 0
-          )
-        );
+        const trimmedAmount = this.trimAmount(amount);
         const price = parseFloat(order.price).toFixed(2);
         console.log(
           `Limit order (${side}) of ${trimmedAmount} placed @${price}, order ID: ${order.id}`
