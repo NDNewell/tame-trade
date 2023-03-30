@@ -321,6 +321,25 @@ export class ExchangeClient {
     }
   }
 
+  async cancelAllLimitOrders(symbol: string): Promise<void> {
+    try {
+      const openOrders = await this.exchange!.fetchOpenOrders(symbol);
+      const limitOrders = openOrders.filter((order) => order.type === 'limit');
+
+      if (limitOrders.length > 0) {
+        const cancelPromises = limitOrders.map((order) =>
+          this.exchange!.cancelOrder(order.id, symbol)
+        );
+        await Promise.all(cancelPromises);
+      } else {
+        throw new Error('No open limit orders to cancel');
+      }
+    } catch (error) {
+      console.error('Error cancelling limit orders:', error);
+      throw error;
+    }
+  }
+
   async createMarketBuyOrder(market: string, quantity: number): Promise<void> {
     await this.executeOrder(
       'createMarketBuyOrder',
