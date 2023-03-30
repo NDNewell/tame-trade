@@ -3,6 +3,7 @@ import ccxt from 'ccxt';
 import { ConfigManager } from '../config/configManager';
 import { WebSocket } from 'ws';
 import { EventEmitter } from 'events';
+import { Decimal } from 'decimal.js';
 
 export class ExchangeClient {
   private static instance: ExchangeClient | null = null;
@@ -247,6 +248,20 @@ export class ExchangeClient {
     }
   }
 
+  async getQuantityPrecision(
+    market: string,
+    quantity: number
+  ): Promise<number> {
+    const marketInfo = this.availableMarkets![market];
+    const minTradeAmount = marketInfo.precision.amount;
+
+    if (quantity < minTradeAmount!) {
+      throw new Error(`Minimum order size for ${market} is ${minTradeAmount}`);
+    } else {
+      return quantity;
+    }
+  }
+
   async executeOrder(
     method: string,
     market: string,
@@ -293,11 +308,19 @@ export class ExchangeClient {
   }
 
   async createMarketBuyOrder(market: string, quantity: number): Promise<void> {
-    await this.executeOrder('createMarketBuyOrder', market, quantity);
+    await this.executeOrder(
+      'createMarketBuyOrder',
+      market,
+      await this.getQuantityPrecision(market, quantity)
+    );
   }
 
   async createMarketSellOrder(market: string, quantity: number): Promise<void> {
-    await this.executeOrder('createMarketSellOrder', market, quantity);
+    await this.executeOrder(
+      'createMarketSellOrder',
+      market,
+      await this.getQuantityPrecision(market, quantity)
+    );
   }
 
   async createLimitBuyOrder(
@@ -305,7 +328,12 @@ export class ExchangeClient {
     price: number,
     quantity: number
   ): Promise<void> {
-    await this.executeOrder('createLimitBuyOrder', market, quantity, price);
+    await this.executeOrder(
+      'createLimitBuyOrder',
+      market,
+      await this.getQuantityPrecision(market, quantity),
+      price
+    );
   }
 
   async createLimitSellOrder(
@@ -313,7 +341,12 @@ export class ExchangeClient {
     price: number,
     quantity: number
   ): Promise<void> {
-    await this.executeOrder('createLimitSellOrder', market, quantity, price);
+    await this.executeOrder(
+      'createLimitSellOrder',
+      market,
+      await this.getQuantityPrecision(market, quantity),
+      price
+    );
   }
 
   async createStopOrder(
@@ -350,7 +383,7 @@ export class ExchangeClient {
           market,
           'market',
           side,
-          quantity,
+          await this.getQuantityPrecision(market, quantity),
           price,
           params
         );
