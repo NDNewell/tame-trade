@@ -386,6 +386,34 @@ export class ExchangeClient {
     }
   }
 
+  async closePosition(market: string): Promise<void> {
+    if (this.exchange === null) {
+      console.error(
+        `[ExchangeClient] Exchange not initialized. Please call 'init' or 'setExchange' before closing a position.`
+      );
+      return;
+    }
+
+    try {
+      const position = await this.exchange.fetchPosition(market);
+      const side = position.info.side === 'long' ? 'sell' : 'buy';
+      const quantity = Math.abs(position.notional);
+
+      if (quantity > 0) {
+        await this.executeOrder(
+          'createMarketOrder',
+          market,
+          side,
+          await this.getQuantityPrecision(market, quantity)
+        );
+      } else {
+        console.error(`[ExchangeClient] No positions found for ${market}.`);
+      }
+    } catch (error) {
+      console.error(`[ExchangeClient] Failed to close position:`, error);
+    }
+  }
+
   async createMarketBuyOrder(market: string, quantity: number): Promise<void> {
     await this.executeOrder(
       'createMarketBuyOrder',

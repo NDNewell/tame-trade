@@ -232,6 +232,19 @@ export class UserInterface {
       } else {
         console.log('No market selected. Please select a market first.');
       }
+    } else if (command === 'close position') {
+      if (this.currentMarket) {
+        try {
+          const result = await this.exchangeCommand
+            .getExchangeClient()
+            .closePosition(this.currentMarket);
+          console.log('Position closed);
+        } catch (error: unknown) {
+          console.log((error as Error).message);
+        }
+      } else {
+        console.log('No market selected. Please select a market first.');
+      }
     } else if (command === 'cancel stops') {
       if (this.currentMarket) {
         try {
