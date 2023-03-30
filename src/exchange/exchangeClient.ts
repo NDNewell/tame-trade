@@ -363,9 +363,10 @@ export class ExchangeClient {
   async bumpOrders(symbol: string, priceChange: number): Promise<void> {
     try {
       const openOrders = await this.exchange!.fetchOpenOrders(symbol);
+      const limitOrders = openOrders.filter((order) => order.type === 'limit');
 
-      if (openOrders.length > 0) {
-        for (const order of openOrders) {
+      if (limitOrders.length > 0) {
+        for (const order of limitOrders) {
           const newPrice = order.price + priceChange;
           await this.exchange!.editOrder(
             order.id,
