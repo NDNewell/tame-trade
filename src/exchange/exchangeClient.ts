@@ -340,6 +340,26 @@ export class ExchangeClient {
     }
   }
 
+  async cancelAllStopOrders(symbol: string): Promise<void> {
+    try {
+      const openOrders = await this.exchange!.fetchOpenOrders(symbol);
+      const stopOrders = openOrders.filter(
+        (order) => order.info.order_type === 'stop_market'
+      );
+
+      if (stopOrders.length > 0) {
+        for (const order of stopOrders) {
+          await this.exchange!.cancelOrder(order.id, symbol);
+        }
+      } else {
+        throw new Error('No open stop orders to cancel');
+      }
+    } catch (error) {
+      console.error('Error cancelling stop orders:', error);
+      throw error;
+    }
+  }
+
   async createMarketBuyOrder(market: string, quantity: number): Promise<void> {
     await this.executeOrder(
       'createMarketBuyOrder',
