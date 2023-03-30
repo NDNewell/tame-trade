@@ -307,6 +307,20 @@ export class ExchangeClient {
     }
   }
 
+  async cancelAllOrders(symbol: string): Promise<void> {
+    try {
+      const openOrders = await this.exchange!.fetchOpenOrders(symbol);
+      if (openOrders.length > 0) {
+        await this.exchange!.cancelAllOrders(symbol);
+      } else {
+        throw new Error('No open orders to cancel');
+      }
+    } catch (error) {
+      console.error('Error cancelling orders:', error);
+      throw error;
+    }
+  }
+
   async createMarketBuyOrder(market: string, quantity: number): Promise<void> {
     await this.executeOrder(
       'createMarketBuyOrder',

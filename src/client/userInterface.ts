@@ -206,6 +206,19 @@ export class UserInterface {
       this.currentMarket = await this.selectMarketByType(marketType);
     } else if (command === 'quit' || command === 'q') {
       this.quit();
+    } else if (command === 'cancel all') {
+      if (this.currentMarket) {
+        try {
+          await this.exchangeCommand
+            .getExchangeClient()
+            .cancelAllOrders(this.currentMarket);
+          console.log('All orders cancelled for market:', this.currentMarket);
+        } catch (error: unknown) {
+          console.log((error as Error).message);
+        }
+      } else {
+        console.log('No market selected. Please select a market first.');
+      }
     } else {
       if (this.currentMarket) {
         try {
