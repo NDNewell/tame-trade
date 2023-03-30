@@ -261,17 +261,7 @@ export class ExchangeClient {
 
     try {
       const order = await (this.exchange as any)[method](market, ...args);
-      let isStop = false;
-
-      if (args[0] && args.includes('params')) {
-        const paramsIndex = args.indexOf('params');
-        const params = args[paramsIndex + 1];
-        if (params && params.stopLossPrice) {
-          isStop = true;
-        }
-      }
-
-      const orderType = isStop ? 'stop' : order.type;
+      const orderType = order.info.order_type;
 
       if (orderType === 'market') {
         const filledAmount = parseFloat(order.filled);
@@ -286,12 +276,12 @@ export class ExchangeClient {
         console.log(
           `Limit order (${side}) of ${trimmedAmount} placed @${price}, order ID: ${order.id}`
         );
-      } else if (orderType === 'stop') {
+      } else if (orderType === 'stop_market') {
         const amount = parseFloat(order.amount);
         const trimmedAmount = this.trimAmount(amount);
-        const price = parseFloat(order.price).toFixed(2);
+        const price = parseFloat(order.stopPrice).toFixed(2);
         console.log(
-          `Placed stop ${trimmedAmount} @${price}, order ID: ${order.id}`
+          `Placed stop @${price} for amount ${trimmedAmount}, order ID: ${order.id}`
         );
       }
     } catch (error) {
@@ -342,10 +332,7 @@ export class ExchangeClient {
         const params = {
           stopLossPrice: price,
         };
-        // log args passed to executeOrder
-        console.log(
-          `[ExchangeClient] Placing stop order for ${market} ${side} ${quantity} @ ${price}`
-        );
+
         await this.executeOrder(
           'createOrder',
           market,

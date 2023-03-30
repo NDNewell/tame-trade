@@ -24,8 +24,10 @@ export interface Command {
   execute(
     orderType: OrderType,
     currentMarket: string,
-    price: number,
-    quantity?: number
+    options: {
+      price?: number;
+      quantity?: number;
+    }
   ): Promise<void>;
 }
 
@@ -44,9 +46,10 @@ export class ExchangeCommand implements Command {
   async execute(
     orderType: OrderType,
     currentMarket: string,
-    price: number,
-    quantity?: number
+    options: { price?: number; quantity?: number }
   ): Promise<void> {
+    const { price, quantity } = options;
+
     switch (orderType) {
       case OrderType.MARKET_BUY:
         await this.exchangeClient.createMarketBuyOrder(
@@ -106,8 +109,6 @@ export namespace OrderType {
     let type: OrderType = OrderType.NULL; // initialize to default value
     let quantity: number | undefined = undefined;
     let price: number | undefined = undefined;
-
-    console.log(order);
 
     const args = order.split(/\s+/);
     const orderTypeString = args[0];

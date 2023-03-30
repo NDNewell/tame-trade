@@ -217,30 +217,20 @@ export class UserInterface {
               type === OrderType.MARKET_BUY ||
               type === OrderType.MARKET_SELL
             ) {
-              await this.exchangeCommand.execute(
-                type,
-                this.currentMarket,
-                Number(quantity)
-              );
+              await this.exchangeCommand.execute(type, this.currentMarket, {
+                quantity: Number(quantity),
+              });
             } else if (
               type === OrderType.STOP ||
               type === OrderType.LIMIT_BUY ||
               type === OrderType.LIMIT_SELL
             ) {
-              if (quantity !== undefined) {
-                await this.exchangeCommand.execute(
-                  type,
-                  this.currentMarket,
-                  Number(price),
-                  Number(quantity)
-                );
-              } else {
-                await this.exchangeCommand.execute(
-                  type,
-                  this.currentMarket,
-                  Number(price)
-                );
-              }
+              await this.exchangeCommand.execute(type, this.currentMarket, {
+                price: Number(price),
+                ...(quantity !== undefined
+                  ? { quantity: Number(quantity) }
+                  : {}),
+              });
             }
           }
         } catch (error: unknown) {
