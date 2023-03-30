@@ -109,7 +109,6 @@ export namespace OrderType {
     let type: OrderType = OrderType.NULL; // initialize to default value
     let quantity: number | undefined = undefined;
     let price: number | undefined = undefined;
-
     const args = order.split(/\s+/);
     const orderTypeString = args[0];
 

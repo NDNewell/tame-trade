@@ -322,9 +322,21 @@ export class ExchangeClient {
     quantity?: number
   ): Promise<void> {
     try {
+      const openOrders = await this.exchange!.fetchOpenOrders(market);
+      const openOrdersQuantity = openOrders.reduce((acc, order) => {
+        if (order.type === 'limit') {
+          return acc + order.remaining;
+        } else {
+          return acc;
+        }
+      }, 0);
+
       const position = await this.exchange!.fetchPosition(market);
       if (!quantity) {
         quantity = Math.abs(position.notional);
+        if (openOrdersQuantity > 0) {
+          quantity += openOrdersQuantity;
+        }
       }
 
       if (quantity > 0) {
