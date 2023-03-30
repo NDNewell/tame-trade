@@ -238,7 +238,6 @@ export class UserInterface {
                 await this.exchangeCommand.execute(
                   type,
                   this.currentMarket,
-                  undefined,
                   Number(price)
                 );
               }

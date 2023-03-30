@@ -24,8 +24,8 @@ export interface Command {
   execute(
     orderType: OrderType,
     currentMarket: string,
-    quantity: number,
-    price: number
+    price: number,
+    quantity?: number
   ): Promise<void>;
 }
 
@@ -44,8 +44,8 @@ export class ExchangeCommand implements Command {
   async execute(
     orderType: OrderType,
     currentMarket: string,
-    quantity?: number,
-    price?: number
+    price: number,
+    quantity?: number
   ): Promise<void> {
     switch (orderType) {
       case OrderType.MARKET_BUY:
@@ -64,8 +64,8 @@ export class ExchangeCommand implements Command {
         if (price) {
           await this.exchangeClient.createLimitBuyOrder(
             currentMarket,
-            quantity!,
-            price
+            price,
+            quantity!
           );
         }
         break;
@@ -73,8 +73,8 @@ export class ExchangeCommand implements Command {
         if (price) {
           await this.exchangeClient.createLimitSellOrder(
             currentMarket,
-            quantity!,
-            price
+            price,
+            quantity!
           );
         }
         break;
@@ -83,7 +83,7 @@ export class ExchangeCommand implements Command {
           await this.exchangeClient.createStopOrder(
             currentMarket,
             price,
-            quantity
+            quantity!
           );
         }
         break;

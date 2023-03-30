@@ -312,8 +312,8 @@ export class ExchangeClient {
 
   async createLimitBuyOrder(
     market: string,
-    quantity: number,
-    price: number
+    price: number,
+    quantity: number
   ): Promise<void> {
     await this.executeOrder('createLimitBuyOrder', market, quantity, price);
   }
@@ -333,13 +333,19 @@ export class ExchangeClient {
   ): Promise<void> {
     try {
       const position = await this.exchange!.fetchPosition(market);
-      quantity = Math.abs(position.notional);
+      if (!quantity) {
+        quantity = Math.abs(position.notional);
+      }
+
       if (quantity > 0) {
         const side = position.info.direction === 'buy' ? 'sell' : 'buy';
         const params = {
           stopLossPrice: price,
         };
-
+        // log args passed to executeOrder
+        console.log(
+          `[ExchangeClient] Placing stop order for ${market} ${side} ${quantity} @ ${price}`
+        );
         await this.executeOrder(
           'createOrder',
           market,
