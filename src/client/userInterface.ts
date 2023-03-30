@@ -245,6 +245,28 @@ export class UserInterface {
       } else {
         console.log('No market selected. Please select a market first.');
       }
+    } else if (command.startsWith('bump')) {
+      const bumpRegex = /^bump\s+([-+]?\d*\.?\d+)/;
+      const match = command.match(bumpRegex);
+      if (match) {
+        const priceChange = parseFloat(match[1]);
+        if (this.currentMarket) {
+          try {
+            await this.exchangeCommand
+              .getExchangeClient()
+              .bumpOrders(this.currentMarket, priceChange);
+            console.log(`All orders have been bumped by ${priceChange}.`);
+          } catch (error: unknown) {
+            console.log((error as Error).message);
+          }
+        } else {
+          console.log('No market selected. Please select a market first.');
+        }
+      } else {
+        console.log(
+          'Invalid bump command format. Use "bump + [value]" or "bump - [value]".'
+        );
+      }
     } else {
       if (this.currentMarket) {
         try {

@@ -360,6 +360,31 @@ export class ExchangeClient {
     }
   }
 
+  async bumpOrders(symbol: string, priceChange: number): Promise<void> {
+    try {
+      const openOrders = await this.exchange!.fetchOpenOrders(symbol);
+
+      if (openOrders.length > 0) {
+        for (const order of openOrders) {
+          const newPrice = order.price + priceChange;
+          await this.exchange!.editOrder(
+            order.id,
+            symbol,
+            order.type,
+            order.side,
+            order.amount,
+            newPrice
+          );
+        }
+      } else {
+        throw new Error('No open orders to bump');
+      }
+    } catch (error) {
+      console.error('Error bumping orders:', error);
+      throw error;
+    }
+  }
+
   async createMarketBuyOrder(market: string, quantity: number): Promise<void> {
     await this.executeOrder(
       'createMarketBuyOrder',
