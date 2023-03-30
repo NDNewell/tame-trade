@@ -235,10 +235,10 @@ export class UserInterface {
     } else if (command === 'close position') {
       if (this.currentMarket) {
         try {
-          const result = await this.exchangeCommand
+          await this.exchangeCommand
             .getExchangeClient()
             .closePosition(this.currentMarket);
-          console.log('Position closed);
+          console.log('Position closed');
         } catch (error: unknown) {
           console.log((error as Error).message);
         }
