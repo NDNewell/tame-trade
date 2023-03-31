@@ -304,6 +304,18 @@ export class ExchangeClient {
     }
   }
 
+  async getPositionSize(symbol: string): Promise<number> {
+    const position = await this.exchange!.fetchPosition(symbol);
+    const positionSize = position.notional;
+    if (positionSize === 0) {
+      return 0;
+    } else if (positionSize > 0) {
+      return positionSize;
+    } else {
+      return Math.abs(positionSize);
+    }
+  }
+
   async cancelAllOrders(symbol: string): Promise<void> {
     try {
       const openOrders = await this.exchange!.fetchOpenOrders(symbol);

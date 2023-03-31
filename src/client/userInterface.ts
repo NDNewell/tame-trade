@@ -280,6 +280,13 @@ export class UserInterface {
           'Invalid bump command format. Use "bump + [value]" or "bump - [value]".'
         );
       }
+    } else if (command.startsWith('print')) {
+      if (command.includes('possize')) {
+        const positionSize = await this.exchangeCommand
+          .getExchangeClient()
+          .getPositionSize(this.currentMarket);
+        console.log(positionSize);
+      }
     } else {
       if (this.currentMarket) {
         try {
