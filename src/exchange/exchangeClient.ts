@@ -1,7 +1,7 @@
 import { pro as ccxtpro, Exchange, Market } from 'ccxt';
 import ccxt from 'ccxt';
 import { ConfigManager } from '../config/configManager';
-import { WebSocket } from 'ws';
+import { ErrorEvent, WebSocket } from 'ws';
 import { EventEmitter } from 'events';
 import { Decimal } from 'decimal.js';
 
@@ -299,11 +299,8 @@ export class ExchangeClient {
           `Placed stop @${price} for amount ${trimmedAmount}, order ID: ${order.id}`
         );
       }
-    } catch (error) {
-      console.error(
-        `[ExchangeClient/executeOrder] Failed to place order:`,
-        error
-      );
+    } catch (error: any) {
+      console.error(`[ExchangeClient] Failed to place order`);
     }
   }
 
@@ -483,6 +480,7 @@ export class ExchangeClient {
         const side = position.info.direction === 'buy' ? 'sell' : 'buy';
         const params = {
           stopLossPrice: price,
+          reduce_only: true,
         };
 
         await this.executeOrder(
