@@ -12,7 +12,7 @@ interface FileError extends Error {
 class InquirerExpanded extends InputPrompt {
   private commandHistory: string[] = [];
   private commandHistoryIndex: number = 0;
-  private commandHistoryFile = 'command-history.log';
+  private commandHistoryFile = `${process.env.HOME}/.tame_command_history.log`;
 
   constructor(
     question: any,
