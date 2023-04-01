@@ -4,6 +4,11 @@ import { ConfigManager } from '../config/configManager';
 import { ErrorEvent, WebSocket } from 'ws';
 import { EventEmitter } from 'events';
 
+interface Position {
+  symbol: string;
+  notional: number;
+}
+
 export class ExchangeClient {
   private static instance: ExchangeClient | null = null;
   private availableMarkets: Record<string, Market> | null = null;
@@ -308,8 +313,29 @@ export class ExchangeClient {
   }
 
   async getPositionSize(symbol: string): Promise<number> {
-    const position = await this.exchange!.fetchPosition(symbol);
-    const positionSize = position.notional;
+    let positionSize = 0;
+
+    try {
+      const position = await this.exchange!.fetchPosition(symbol);
+      positionSize = position.notional;
+    } catch (error) {
+      if (error instanceof ccxt.NotSupported) {
+        try {
+          const positions = await this.exchange!.fetchPositions();
+          const position = positions.find(
+            (pos: Position) => pos.symbol === symbol
+          );
+          if (position) {
+            positionSize = position.notional;
+          }
+        } catch (error: unknown) {
+          console.log('Error fetching positions:', (error as Error).message);
+        }
+      } else {
+        console.log('Error fetching position:', (error as Error).message);
+      }
+    }
+
     if (positionSize === 0) {
       return 0;
     } else if (positionSize > 0) {
