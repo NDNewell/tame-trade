@@ -173,7 +173,9 @@ export class UserInterface {
   }
 
   private async handleCommand(command: string) {
-    if (command.startsWith('market')) {
+    if (command === 'list methods') {
+      this.displayAvailableMethods();
+    } else if (command.startsWith('market')) {
       const market = command.split(' ')[1];
       if (this.availableMarkets.includes(market)) {
         this.currentMarket = market;
@@ -387,6 +389,23 @@ export class UserInterface {
 
     this.resumeReadline();
     return market;
+  }
+
+  public async displayAvailableMethods(): Promise<void> {
+    const methods = this.exchangeCommand.getAvailableMethods();
+    Object.keys(methods)
+      .sort()
+      .forEach((key) => {
+        const temp = methods[key];
+        delete methods[key];
+        methods[key] = temp;
+      });
+    console.log('Available methods:');
+    for (const [method, availability] of Object.entries(methods)) {
+      if (availability) {
+        console.log(`- ${method}`);
+      }
+    }
   }
 
   quit() {

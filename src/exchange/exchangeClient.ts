@@ -3,7 +3,6 @@ import ccxt from 'ccxt';
 import { ConfigManager } from '../config/configManager';
 import { ErrorEvent, WebSocket } from 'ws';
 import { EventEmitter } from 'events';
-import { Decimal } from 'decimal.js';
 
 export class ExchangeClient {
   private static instance: ExchangeClient | null = null;
@@ -33,6 +32,10 @@ export class ExchangeClient {
       await this.loadMarkets();
     }
     await this.loadExchanges();
+  }
+
+  public getAvailableMethods(): Record<string, boolean | 'emulated'> {
+    return this.exchange!.has;
   }
 
   isInitialized(): boolean {

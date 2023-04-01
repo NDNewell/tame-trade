@@ -38,17 +38,16 @@ export class ExchangeCommand implements Command {
     this.exchangeClient = ExchangeClient.getInstance();
   }
 
-  async listMarkets(marketType: MarketType) {
-    console.log(`Listing markets of type: ${marketType}`);
-    // Implement the logic for fetching and displaying markets for the chosen type
+  getAvailableMethods(): Record<string, boolean | 'emulated'> {
+    return this.exchangeClient.getAvailableMethods();
   }
 
   async execute(
     orderType: OrderType,
     currentMarket: string,
-    options: { price?: number; quantity?: number }
+    orderOptions: { price?: number; quantity?: number }
   ): Promise<void> {
-    const { price, quantity } = options;
+    const { price, quantity } = orderOptions;
 
     switch (orderType) {
       case OrderType.MARKET_BUY:
