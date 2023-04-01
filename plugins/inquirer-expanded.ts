@@ -86,6 +86,10 @@ class InquirerExpanded extends InputPrompt {
   private async logCommand(command: string): Promise<void> {
     this.commandHistory.push(command);
 
+    if (this.commandHistory.length > 100) {
+      this.commandHistory = this.commandHistory.slice(-100);
+    }
+
     try {
       await writeFile(
         `${process.env.HOME}/.tame_command_history.log`,
