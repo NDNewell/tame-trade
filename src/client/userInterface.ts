@@ -1,6 +1,8 @@
 // src/client/userInterface.ts
 
 import inquirer from 'inquirer';
+import InquirerExpanded from '../../plugins/inquirer-expanded';
+
 import autocomplete from 'inquirer-autocomplete-prompt';
 import clear from 'console-clear';
 import { formatOutput as fo } from '../utils/formatOutput';
@@ -17,6 +19,7 @@ export class UserInterface {
     this.currentMarket = '';
     this.availableMarkets = [];
     inquirer.registerPrompt('autocomplete', autocomplete);
+    inquirer.registerPrompt('inquirer-expanded', InquirerExpanded);
   }
 
   async displayWelcomeScreen(): Promise<void> {
@@ -153,12 +156,14 @@ export class UserInterface {
       ? `${tameDisplay}${exchangeDisplay}${marketDisplay} `
       : `${tameDisplay}${exchangeDisplay} `;
 
-    const { command } = await inquirer.prompt({
-      type: 'input',
-      name: 'command',
-      message: promptMessage,
-      prefix: '',
-    });
+    const { command } = await inquirer.prompt<{ command: string }>([
+      {
+        type: 'inquirer-expanded' as any, // Update the type to use the new plugin and bypass type checking
+        name: 'command',
+        message: promptMessage,
+        prefix: '',
+      },
+    ]);
 
     this.handleCommand(command.trim());
   }
