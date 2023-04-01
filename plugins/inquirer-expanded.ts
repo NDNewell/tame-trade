@@ -87,7 +87,11 @@ class InquirerExpanded extends InputPrompt {
     this.commandHistory.push(command);
 
     try {
-      await writeFile('command-history.log', `${command}\n`, { flag: 'a' });
+      await writeFile(
+        `${process.env.HOME}/.tame_command_history.log`,
+        `${command}\n`,
+        { flag: 'a' }
+      );
     } catch (error) {
       console.error('Failed to log command:', error);
     }
