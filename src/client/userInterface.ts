@@ -3,13 +3,11 @@
 import inquirer from 'inquirer';
 import autocomplete from 'inquirer-autocomplete-prompt';
 import clear from 'console-clear';
-import * as readline from 'readline';
 import { formatOutput as fo } from '../utils/formatOutput';
 import { ExchangeProfile } from '../config/configManager';
 import { ExchangeCommand, OrderType } from '../commands/exchangeCommand';
 
 export class UserInterface {
-  private rl?: readline.Interface;
   private currentMarket: string;
   private availableMarkets: string[];
   private exchangeCommand: ExchangeCommand;
@@ -138,23 +136,11 @@ export class UserInterface {
   async startTradingInterface(): Promise<void> {
     this.availableMarkets =
       (await this.exchangeCommand.getExchangeClient().getMarketSymbols()) || [];
-    this.rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
 
     this.promptForCommand();
   }
 
-  private pauseReadline() {
-    this.rl?.pause();
-  }
-
-  private resumeReadline() {
-    this.rl?.resume();
-  }
-
-  private promptForCommand() {
+  private async promptForCommand() {
     const exchangeClient = this.exchangeCommand.getExchangeClient();
     const exchangeName = exchangeClient.getSelectedExchangeName();
     const tameDisplay = `<${fo('Tame', 'yellow', 'italic')}>`;
@@ -167,9 +153,14 @@ export class UserInterface {
       ? `${tameDisplay}${exchangeDisplay}${marketDisplay} `
       : `${tameDisplay}${exchangeDisplay} `;
 
-    this.rl?.question(promptMessage, (command) => {
-      this.handleCommand(command);
+    const { command } = await inquirer.prompt({
+      type: 'input',
+      name: 'command',
+      message: promptMessage,
+      prefix: '',
     });
+
+    this.handleCommand(command.trim());
   }
 
   private async handleCommand(command: string) {
@@ -327,8 +318,6 @@ export class UserInterface {
   }
 
   private async selectMarketType(): Promise<string | undefined> {
-    this.pauseReadline();
-
     const availableTypes = await this.exchangeCommand
       .getExchangeClient()
       .getMarketTypes();
@@ -348,7 +337,6 @@ export class UserInterface {
     clear();
 
     if (marketType === 'back') {
-      this.resumeReadline();
       return;
     } else {
       return marketType;
@@ -387,7 +375,6 @@ export class UserInterface {
 
     clear();
 
-    this.resumeReadline();
     return market;
   }
 
@@ -410,7 +397,6 @@ export class UserInterface {
 
   quit() {
     console.log('Exiting...');
-    this.rl?.close();
     process.exit(0);
   }
 }

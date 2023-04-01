@@ -13,8 +13,9 @@
     "noEmit": true,
     "sourceMap": true,
     "outDir": "dist",
-    "lib": ["esnext", "dom"]
+    "lib": ["esnext", "dom"],
+    "typeRoots": ["./node_modules/@types", "src/types"]
   },
-  "include": ["src/**/*.ts"],
+  "include": ["src/**/*.ts", "src/types/inquirer-command-prompt.d.ts"],
   "exclude": ["node_modules", "dist"]
 }
