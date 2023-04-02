@@ -202,6 +202,14 @@ export class UserInterface {
     } else if (command === 'list markets') {
       const marketType = await this.selectMarketType();
       this.currentMarket = await this.selectMarketByType(marketType);
+    } else if (command === 'get market structure') {
+      if (this.currentMarket.length > 0) {
+        this.exchangeCommand
+          .getExchangeClient()
+          .getMarketStructure(this.currentMarket);
+      } else {
+        console.log('No market selected. Please select a market first.');
+      }
     } else if (command === 'quit' || command === 'q') {
       this.quit();
     } else if (command === 'cancel all') {

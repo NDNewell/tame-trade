@@ -95,6 +95,13 @@ export class ExchangeClient {
     this.supportedExchanges = Array.from(supportedExchanges);
   }
 
+  getMarketStructure(market: string): void {
+    const marketStructure = Object.values(this.availableMarkets!).filter(
+      (marketObj) => marketObj.symbol === market
+    )[0];
+    console.log(marketStructure);
+  }
+
   async loadMarkets(): Promise<void> {
     if (this.exchange === null) {
       console.error(
@@ -307,8 +314,8 @@ export class ExchangeClient {
           `Placed stop @${price} for amount ${trimmedAmount}, order ID: ${order.id}`
         );
       }
-    } catch (error: any) {
-      console.error(`[ExchangeClient] Failed to place order`);
+    } catch (error) {
+      console.error(`[ExchangeClient] Failed to place order:`, error);
     }
   }
 
