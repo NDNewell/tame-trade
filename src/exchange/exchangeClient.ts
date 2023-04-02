@@ -1,4 +1,4 @@
-import { pro as ccxtpro, Exchange, Market } from 'ccxt';
+import { pro as ccxtpro, Exchange, Market, Order } from 'ccxt';
 import ccxt from 'ccxt';
 import { ConfigManager } from '../config/configManager';
 import { ErrorEvent, WebSocket } from 'ws';
@@ -9,6 +9,14 @@ interface Position {
   contracts: number;
   notional: number;
   side: string;
+}
+
+interface StopOrder extends Order {
+  stopPrice: number;
+  stopDirection: 'Rising' | 'Falling';
+  trigger: 'ByLastPrice' | 'ByMarkPrice' | 'ByIndexPrice';
+  pegOffsetValueRp: number;
+  pegOffsetProportionRr: number;
 }
 
 export class ExchangeClient {
@@ -413,6 +421,7 @@ export class ExchangeClient {
     try {
       let stopOrders;
       const openOrders = await this.exchange!.fetchOpenOrders(symbol);
+      console.log('openOrders:', openOrders);
       stopOrders = openOrders.filter(
         (order) => order.info.order_type === 'stop_market'
       );
@@ -439,18 +448,33 @@ export class ExchangeClient {
   async bumpOrders(symbol: string, priceChange: number): Promise<void> {
     try {
       const openOrders = await this.exchange!.fetchOpenOrders(symbol);
-      const limitOrders = openOrders.filter((order) => order.type === 'limit');
 
-      if (limitOrders.length > 0) {
-        for (const order of limitOrders) {
-          const newPrice = order.price + priceChange;
+      if (openOrders.length > 0) {
+        for (const order of openOrders) {
+          const orderType = order.type.toLowerCase();
+          let params;
+          let newPrice;
+
+          if (orderType.toLowerCase() === 'stop') {
+            const stopOrder = order as StopOrder;
+            newPrice = stopOrder.stopPrice + priceChange;
+            params = {
+              // stopLossPrice: price, // only available on Deribit so far
+              stopPrice: newPrice, // Phemex's property name for a stop order
+              // reduce_only: true, // only available on Deribit so far
+            };
+          } else if (orderType.toLowerCase() === 'limit') {
+            newPrice = order.price + priceChange;
+          }
+
           await this.exchange!.editOrder(
             order.id,
             symbol,
-            order.type,
+            orderType,
             order.side,
             order.amount,
-            newPrice
+            newPrice,
+            params ? params : {}
           );
         }
       } else {
