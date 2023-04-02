@@ -6,6 +6,7 @@ import { EventEmitter } from 'events';
 
 interface Position {
   symbol: string;
+  contracts: number;
   notional: number;
   side: string;
 }
@@ -323,6 +324,7 @@ export class ExchangeClient {
   async getPositionStructure(symbol: string): Promise<Position> {
     let positionStructure: Position = {
       symbol: '',
+      contracts: 0,
       notional: 0,
       side: '',
     };
@@ -340,7 +342,7 @@ export class ExchangeClient {
     } catch (error) {
       if (error instanceof ccxt.NotSupported) {
         try {
-          const positions = await this.exchange.fetchPositions();
+          const positions = await this.exchange.fetchPositions([symbol]);
           positionStructure = positions.find(
             (pos: Position) => pos.symbol === symbol
           );
@@ -363,7 +365,7 @@ export class ExchangeClient {
 
     const position = await this.getPositionStructure(symbol);
     if (position) {
-      positionSize = position.notional;
+      positionSize = position.contracts;
     }
     if (positionSize === 0) {
       return 0;
@@ -464,7 +466,7 @@ export class ExchangeClient {
     try {
       const position = await this.getPositionStructure(market);
       const side = position.side === 'long' ? 'sell' : 'buy';
-      const quantity = Math.abs(position.notional);
+      const quantity = Math.abs(position.contracts);
 
       if (quantity > 0) {
         await this.executeOrder(
@@ -529,17 +531,18 @@ export class ExchangeClient {
     quantity?: number
   ): Promise<void> {
     try {
-      const openOrders = await this.exchange!.fetchOpenOrders(market);
-      const openOrdersQuantity = openOrders.reduce((acc, order) => {
-        if (order.type === 'limit') {
-          return acc + order.remaining;
-        } else {
-          return acc;
-        }
-      }, 0);
-
       if (!quantity) {
+        const openOrders = await this.exchange!.fetchOpenOrders(market);
         quantity = await this.getPositionSize(market);
+
+        const openOrdersQuantity = openOrders.reduce((acc, order) => {
+          if (order.type === 'limit') {
+            return acc + order.remaining;
+          } else {
+            return acc;
+          }
+        }, 0);
+
         if (openOrdersQuantity > 0) {
           quantity += openOrdersQuantity;
         }
@@ -549,16 +552,19 @@ export class ExchangeClient {
         const position = await this.getPositionStructure(market);
         const side = position.side === 'buy' ? 'sell' : 'buy';
         const params = {
-          stopLossPrice: price,
-          reduce_only: true,
+          // stopLossPrice: price, // only available on Deribit so far
+          stopPrice: price, // Phemex's property name for a stop order
+          reduce_only: true, // only available on Deribit so far
         };
+
+        quantity = await this.getQuantityPrecision(market, quantity);
 
         await this.executeOrder(
           'createOrder',
           market,
-          'market',
+          'stop', // Phemex's order type for a stop order is 'stop'
           side,
-          await this.getQuantityPrecision(market, quantity),
+          quantity,
           price,
           params
         );
