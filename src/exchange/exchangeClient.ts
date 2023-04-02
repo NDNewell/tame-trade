@@ -1,4 +1,4 @@
-import { pro as ccxtpro, Exchange, Market as Position } from 'ccxt';
+import { pro as ccxtpro, Exchange, Market } from 'ccxt';
 import ccxt from 'ccxt';
 import { ConfigManager } from '../config/configManager';
 import { ErrorEvent, WebSocket } from 'ws';
@@ -12,7 +12,7 @@ interface Position {
 
 export class ExchangeClient {
   private static instance: ExchangeClient | null = null;
-  private availableMarkets: Record<string, Position> | null = null;
+  private availableMarkets: Record<string, Market> | null = null;
   private supportedExchanges: string[] | null = null;
   exchange: Exchange | null = null;
   exchangeManager: ConfigManager;
@@ -546,7 +546,8 @@ export class ExchangeClient {
       }
 
       if (quantity > 0) {
-        const side = position.info.direction === 'buy' ? 'sell' : 'buy';
+        const position = await this.getPositionStructure(market);
+        const side = position.side === 'buy' ? 'sell' : 'buy';
         const params = {
           stopLossPrice: price,
           reduce_only: true,
