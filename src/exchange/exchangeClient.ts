@@ -385,17 +385,8 @@ export class ExchangeClient {
   }
 
   async cancelAllOrders(symbol: string): Promise<void> {
-    try {
-      const openOrders = await this.exchange!.fetchOpenOrders(symbol);
-      if (openOrders.length > 0) {
-        await this.exchange!.cancelAllOrders(symbol);
-      } else {
-        throw new Error('No open orders to cancel');
-      }
-    } catch (error) {
-      console.error('Error cancelling orders:', error);
-      throw error;
-    }
+    this.cancelAllStopOrders(symbol);
+    this.cancelAllLimitOrders(symbol);
   }
 
   async cancelAllLimitOrders(symbol: string): Promise<void> {
@@ -421,7 +412,6 @@ export class ExchangeClient {
     try {
       let stopOrders;
       const openOrders = await this.exchange!.fetchOpenOrders(symbol);
-      console.log('openOrders:', openOrders);
       stopOrders = openOrders.filter(
         (order) => order.info.order_type === 'stop_market'
       );
