@@ -411,10 +411,17 @@ export class ExchangeClient {
 
   async cancelAllStopOrders(symbol: string): Promise<void> {
     try {
+      let stopOrders;
       const openOrders = await this.exchange!.fetchOpenOrders(symbol);
-      const stopOrders = openOrders.filter(
+      stopOrders = openOrders.filter(
         (order) => order.info.order_type === 'stop_market'
       );
+
+      if (stopOrders.length === 0) {
+        stopOrders = openOrders.filter(
+          (order) => order.type!.toLowerCase() === 'stop'
+        );
+      }
 
       if (stopOrders.length > 0) {
         for (const order of stopOrders) {
