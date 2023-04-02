@@ -1,4 +1,4 @@
-import { pro as ccxtpro, Exchange, Market } from 'ccxt';
+import { pro as ccxtpro, Exchange, Market as Position } from 'ccxt';
 import ccxt from 'ccxt';
 import { ConfigManager } from '../config/configManager';
 import { ErrorEvent, WebSocket } from 'ws';
@@ -7,11 +7,12 @@ import { EventEmitter } from 'events';
 interface Position {
   symbol: string;
   notional: number;
+  side: string;
 }
 
 export class ExchangeClient {
   private static instance: ExchangeClient | null = null;
-  private availableMarkets: Record<string, Market> | null = null;
+  private availableMarkets: Record<string, Position> | null = null;
   private supportedExchanges: string[] | null = null;
   exchange: Exchange | null = null;
   exchangeManager: ConfigManager;
@@ -319,30 +320,51 @@ export class ExchangeClient {
     }
   }
 
-  async getPositionSize(symbol: string): Promise<number> {
-    let positionSize = 0;
+  async getPositionStructure(symbol: string): Promise<Position> {
+    let positionStructure: Position = {
+      symbol: '',
+      notional: 0,
+      side: '',
+    };
+
+    if (!this.exchange) {
+      console.error(
+        `[ExchangeClient] Exchange not initialized. Please call 'init' or 'setExchange' before fetching position.`
+      );
+      return positionStructure;
+    }
 
     try {
-      const position = await this.exchange!.fetchPosition(symbol);
-      positionSize = position.notional;
+      positionStructure = await this.exchange.fetchPosition(symbol);
+      return positionStructure;
     } catch (error) {
       if (error instanceof ccxt.NotSupported) {
         try {
-          const positions = await this.exchange!.fetchPositions();
-          const position = positions.find(
+          const positions = await this.exchange.fetchPositions();
+          positionStructure = positions.find(
             (pos: Position) => pos.symbol === symbol
           );
-          if (position) {
-            positionSize = position.notional;
+          if (positionStructure) {
+            return positionStructure;
           }
         } catch (error: unknown) {
-          console.log('Error fetching positions:', (error as Error).message);
+          console.error('Error fetching positions:', (error as Error).message);
         }
       } else {
-        console.log('Error fetching position:', (error as Error).message);
+        console.error('Error fetching position:', (error as Error).message);
       }
     }
 
+    return positionStructure;
+  }
+
+  async getPositionSize(symbol: string): Promise<number> {
+    let positionSize = 0;
+
+    const position = await this.getPositionStructure(symbol);
+    if (position) {
+      positionSize = position.notional;
+    }
     if (positionSize === 0) {
       return 0;
     } else if (positionSize > 0) {
@@ -440,8 +462,8 @@ export class ExchangeClient {
     }
 
     try {
-      const position = await this.exchange.fetchPosition(market);
-      const side = position.info.side === 'long' ? 'sell' : 'buy';
+      const position = await this.getPositionStructure(market);
+      const side = position.side === 'long' ? 'sell' : 'buy';
       const quantity = Math.abs(position.notional);
 
       if (quantity > 0) {
@@ -516,9 +538,8 @@ export class ExchangeClient {
         }
       }, 0);
 
-      const position = await this.exchange!.fetchPosition(market);
       if (!quantity) {
-        quantity = Math.abs(position.notional);
+        quantity = await this.getPositionSize(market);
         if (openOrdersQuantity > 0) {
           quantity += openOrdersQuantity;
         }
