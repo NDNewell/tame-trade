@@ -5,6 +5,7 @@ import ccxt from 'ccxt';
 import { ConfigManager } from '../config/configManager';
 import { ErrorEvent, WebSocket } from 'ws';
 import { EventEmitter } from 'events';
+import { exchangeParams } from './exchangeParams';
 
 interface Position {
   symbol: string;
@@ -327,7 +328,10 @@ export class ExchangeClient {
         );
       }
     } catch (error) {
-      console.error(`[ExchangeClient] Failed to place order:`, error);
+      console.error(
+        `[ExchangeClient] Failed to place order:`,
+        (error as Error).message
+      );
     }
   }
 
@@ -450,14 +454,24 @@ export class ExchangeClient {
       let stopOrders;
       const openOrders = await this.exchange!.fetchOpenOrders(symbol);
       stopOrders = openOrders.filter(
-        (order) => order.info.order_type === 'stop_market'
+        (order) => order.info.order_type === 'stop_market' // Deribit
       );
 
       if (stopOrders.length === 0) {
         stopOrders = openOrders.filter(
-          (order) => order.type!.toLowerCase() === 'stop'
+          (order) => order.type!.toLowerCase() === 'stop' // Phemex
         );
       }
+
+      stopOrders = openOrders.filter(
+        (order) =>
+          order.info.order_type ===
+            exchangeParams[this.exchange!.id].orders.stopLoss.ORDER_TYPE || // Deribit
+          order.type!.toLowerCase() ===
+            exchangeParams[
+              this.exchange!.id
+            ].orders.stopLoss.ORDER_TYPE.toLowerCase() // Phemex
+      );
 
       if (stopOrders.length > 0) {
         for (const order of stopOrders) {
@@ -589,10 +603,14 @@ export class ExchangeClient {
     quantity?: number
   ): Promise<void> {
     try {
+      // If no quantity is provided, calculate the quantity based on open orders and position size
       if (!quantity) {
+        // Fetch open orders for the given market
         const openOrders = await this.exchange!.fetchOpenOrders(market);
+        // Get the position size for the given market
         quantity = await this.getPositionSize(market);
 
+        // Calculate the total quantity of open limit orders
         const openOrdersQuantity = openOrders.reduce((acc, order) => {
           if (order.type === 'limit') {
             return acc + order.remaining;
@@ -601,39 +619,63 @@ export class ExchangeClient {
           }
         }, 0);
 
+        // Add the open limit orders quantity to the calculated position size
         if (openOrdersQuantity > 0) {
           quantity += openOrdersQuantity;
         }
       }
 
+      // If there's a non-zero quantity, proceed with creating the stop order
       if (quantity > 0) {
+        // Get the position structure (side, size, etc.) for the given market
         const position = await this.getPositionStructure(market);
+        // Determine the side of the stop order based on the position's side
         const side = position.side === 'long' ? 'sell' : 'buy';
-        const params = {
-          // stopLossPrice: price, // only available on Deribit so far
-          stopPrice: price, // Phemex's property name for a stop order
-          reduce_only: true, // only available on Deribit so far
+
+        // Get the appropriate exchange parameters based on the current exchange
+        const exchangeName = this.exchange!.id;
+        const orderType =
+          exchangeParams[exchangeName].orders.stopLoss.ORDER_TYPE;
+        const stopLossProp =
+          exchangeParams[exchangeName].orders.stopLoss.STOP_LOSS_PROP;
+        const reduceOnlySupported =
+          exchangeParams[exchangeName].orders.stopLoss.REDUCE_ONLY.SUPPORTED;
+        const reduceOnlyProp =
+          exchangeParams[exchangeName].orders.stopLoss.REDUCE_ONLY
+            .REDUCE_ONLY_PROP || '';
+
+        // Create an object for the order parameters, setting the stop loss price according to the appropriate property
+        const params: { [key: string]: any } = {
+          [stopLossProp]: price,
         };
 
-        quantity = await this.getQuantityPrecision(market, quantity);
-        // log all variables for order
+        // If the reduce-only feature is supported by the exchange, add the corresponding property to the parameters object
+        if (reduceOnlySupported) {
+          params[reduceOnlyProp] = true;
+        }
 
+        // Adjust the quantity to match the exchange's precision requirements
+        quantity = await this.getQuantityPrecision(market, quantity);
+
+        // Execute the stop order with the provided details
         await this.executeOrder(
           'createOrder',
           market,
-          'stop', // Phemex's order type for a stop order is 'stop'
+          orderType,
           side,
           quantity,
           price,
           params
         );
       } else {
+        // If there's no position found, log an error message and return
         console.error(
           `[ExchangeClient] No positions found for ${market}. Please open a position before placing a stop order.`
         );
         return;
       }
     } catch (error) {
+      // If any errors occur during the process, log the error message
       console.error(`[ExchangeClient] Failed to place order:`, error);
     }
   }
