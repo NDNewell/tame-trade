@@ -1,3 +1,5 @@
+// src/exchange/exchangeClient.ts
+
 import { pro as ccxtpro, Exchange, Market, Order } from 'ccxt';
 import ccxt from 'ccxt';
 import { ConfigManager } from '../config/configManager';
@@ -382,6 +384,41 @@ export class ExchangeClient {
     } else {
       return Math.abs(positionSize);
     }
+  }
+
+  async cancelOrdersByDirection(
+    market: string,
+    direction?: string,
+    rangeStart?: number,
+    rangeEnd?: number
+  ): Promise<void> {
+    // Fetch the orders from the market symbol
+    const orders = await this.exchange!.fetchOpenOrders(market);
+
+    // Filter out stop orders
+    const filteredOrders = orders.filter(
+      (order) => order.type.toLowerCase() !== 'stop'
+    );
+
+    // Sort orders by price depending on the direction
+    const sortedOrders =
+      direction === 'bottom'
+        ? filteredOrders.sort((a, b) => a.price - b.price)
+        : filteredOrders.sort((a, b) => b.price - a.price);
+
+    // Determine the range of orders to be canceled
+    let start = rangeStart ? rangeStart - 1 : 0;
+    let end = rangeEnd ? rangeEnd : sortedOrders.length;
+
+    // Slice the orders array based on the determined range
+    const ordersToCancel = sortedOrders.slice(start, end);
+
+    // Cancel the orders within the range
+    for (const order of ordersToCancel) {
+      await this.exchange!.cancelOrder(order.id, market);
+    }
+
+    console.log(`${ordersToCancel.length} orders have been canceled.`);
   }
 
   async cancelAllOrders(symbol: string): Promise<void> {

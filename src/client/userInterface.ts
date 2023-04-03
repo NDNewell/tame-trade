@@ -293,6 +293,40 @@ export class UserInterface {
           .getPositionSize(this.currentMarket);
         console.log(positionSize);
       }
+    } else if (command.startsWith('cancel orders')) {
+      const regex = /^cancel orders\s*(top|bottom)?\s*(\d+)?(\:)?(\d+)?$/;
+      const match = command.match(regex);
+      if (match) {
+        const [, direction, rangeStartStr, colon, rangeEndStr] = match;
+        let rangeStart: number | undefined;
+        let rangeEnd: number | undefined;
+
+        if (rangeStartStr !== undefined) {
+          rangeStart = parseInt(rangeStartStr, 10);
+          if (colon !== undefined && rangeEndStr !== undefined) {
+            rangeEnd = parseInt(rangeEndStr, 10);
+          } else {
+            rangeEnd = rangeStart;
+          }
+        }
+
+        try {
+          await this.exchangeCommand
+            .getExchangeClient()
+            .cancelOrdersByDirection(
+              this.currentMarket,
+              direction || 'top',
+              rangeStart,
+              rangeEnd
+            );
+        } catch (error: unknown) {
+          console.log((error as Error).message);
+        }
+      } else {
+        console.log(
+          'Invalid command format. Usage: cancel orders [top | bottom] [start:end | specific order]'
+        );
+      }
     } else {
       if (this.currentMarket) {
         try {

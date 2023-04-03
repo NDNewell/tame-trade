@@ -1,3 +1,5 @@
+// plugins/inquirer-expanded.ts
+
 import { createInterface, ReadLine } from 'readline';
 import fs from 'fs';
 import { writeFile, readFile } from 'fs/promises';
