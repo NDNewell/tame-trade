@@ -571,7 +571,7 @@ export class ExchangeClient {
 
       if (quantity > 0) {
         const position = await this.getPositionStructure(market);
-        const side = position.side === 'buy' ? 'sell' : 'buy';
+        const side = position.side === 'long' ? 'sell' : 'buy';
         const params = {
           // stopLossPrice: price, // only available on Deribit so far
           stopPrice: price, // Phemex's property name for a stop order
@@ -579,6 +579,7 @@ export class ExchangeClient {
         };
 
         quantity = await this.getQuantityPrecision(market, quantity);
+        // log all variables for order
 
         await this.executeOrder(
           'createOrder',
