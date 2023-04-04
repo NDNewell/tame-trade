@@ -332,56 +332,89 @@ export class UserInterface {
       command.startsWith('range sell')
     ) {
       const commandParts = command.split(' ');
+      const action = commandParts[1];
+      const market = this.currentMarket;
+      const questions = [
+        {
+          type: 'number',
+          name: 'startPrice',
+          message: 'Enter the start price:',
+        },
+        {
+          type: 'number',
+          name: 'endPrice',
+          message: 'Enter the end price:',
+        },
+        {
+          type: 'number',
+          name: 'numOrders',
+          message: 'Enter the number of orders:',
+        },
+        {
+          type: 'number',
+          name: 'totalRiskPercentage',
+          message: 'Enter the total risk percentage:',
+        },
+        {
+          type: 'number',
+          name: 'stopPrice',
+          message: 'Enter the stop price:',
+        },
+        {
+          type: 'number',
+          name: 'takeProfitPrice',
+          message: 'Enter the take profit price:',
+        },
+        {
+          type: 'number',
+          name: 'totalCapitalToRisk',
+          message: 'Enter the total capital to risk:',
+        },
+        {
+          type: 'number',
+          name: 'riskReturnRatioThreshold',
+          message: 'Enter the risk-return ratio threshold:',
+        },
+      ];
 
-      if (commandParts.length === 10) {
-        const action = commandParts[1];
-        const market = this.currentMarket;
-        const startPrice = parseFloat(commandParts[2]);
-        const endPrice = parseFloat(commandParts[3]);
-        const numOrders = parseInt(commandParts[4]);
-        const totalRiskPercentage = parseFloat(commandParts[5]);
-        const stopPrice = parseFloat(commandParts[6]);
-        const takeProfitPrice = parseFloat(commandParts[7]);
-        const totalCapitalToRisk = parseFloat(commandParts[8]);
-        const riskReturnRatioThreshold = parseFloat(commandParts[9]);
+      const answers = await inquirer.prompt(questions);
 
-        if (
-          market &&
-          startPrice &&
-          endPrice &&
-          numOrders &&
-          totalRiskPercentage &&
-          stopPrice &&
-          takeProfitPrice &&
-          totalCapitalToRisk &&
-          riskReturnRatioThreshold
-        ) {
-          try {
-            await this.exchangeCommand
-              .getExchangeClient()
-              .submitRangeOrders(
-                action,
-                market,
-                startPrice,
-                endPrice,
-                numOrders,
-                totalRiskPercentage,
-                stopPrice,
-                takeProfitPrice,
-                totalCapitalToRisk,
-                riskReturnRatioThreshold
-              );
-            console.log(
-              `Range ${action} orders placed between ${startPrice} and ${endPrice}`
+      if (
+        market &&
+        answers.startPrice &&
+        answers.endPrice &&
+        answers.numOrders &&
+        answers.totalRiskPercentage &&
+        answers.stopPrice &&
+        answers.takeProfitPrice &&
+        answers.totalCapitalToRisk &&
+        answers.riskReturnRatioThreshold
+      ) {
+        try {
+          await this.exchangeCommand
+            .getExchangeClient()
+            .submitRangeOrders(
+              action,
+              market,
+              answers.startPrice,
+              answers.endPrice,
+              answers.numOrders,
+              answers.totalRiskPercentage,
+              answers.stopPrice,
+              answers.takeProfitPrice,
+              answers.totalCapitalToRisk,
+              answers.riskReturnRatioThreshold
             );
-          } catch (error: unknown) {
-            console.log((error as Error).message);
-          }
-        } else {
           console.log(
-            'Invalid range command format. Usage: range [buy/sell] [startPrice] [endPrice] [numOrders] [risk%] [stopPrice] [takeProfitPrice] [totalCapitalToRisk] [riskReturnRatioThreshold]'
+            `Range ${action} orders placed between ${answers.startPrice} and ${answers.endPrice}`
           );
+        } catch (error: unknown) {
+          console.log((error as Error).message);
         }
+      } else {
+        console.log(
+          'Invalid range command format. Usage: range [buy/sell] [startPrice] [endPrice] [numOrders] [risk%] [stopPrice] [takeProfitPrice] [totalCapitalToRisk] [riskReturnRatioThreshold]'
+        );
       }
     } else {
       if (this.currentMarket) {
