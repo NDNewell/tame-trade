@@ -451,7 +451,7 @@ export class ExchangeClient {
 
   async cancelAllStopOrders(symbol: string): Promise<void> {
     try {
-      let stopOrders;
+      let stopOrders = [];
       const openOrders = await this.exchange!.fetchOpenOrders(symbol);
       stopOrders = openOrders.filter(
         (order) => order.info.order_type === 'stop_market' // Deribit
@@ -462,16 +462,6 @@ export class ExchangeClient {
           (order) => order.type!.toLowerCase() === 'stop' // Phemex
         );
       }
-
-      stopOrders = openOrders.filter(
-        (order) =>
-          order.info.order_type ===
-            exchangeParams[this.exchange!.id].orders.stopLoss.ORDER_TYPE || // Deribit
-          order.type!.toLowerCase() ===
-            exchangeParams[
-              this.exchange!.id
-            ].orders.stopLoss.ORDER_TYPE.toLowerCase() // Phemex
-      );
 
       if (stopOrders.length > 0) {
         for (const order of stopOrders) {
@@ -553,6 +543,84 @@ export class ExchangeClient {
     } catch (error) {
       console.error(`[ExchangeClient] Failed to close position:`, error);
     }
+  }
+
+  calculatePositionSize(
+    totalCapitalToRisk: number,
+    riskPercentage: number,
+    entryPrice: number,
+    stopPrice: number
+  ): number {
+    const riskAmount = (totalCapitalToRisk * riskPercentage) / 100;
+    const positionRisk = Math.abs(entryPrice - stopPrice);
+    if (positionRisk === 0) {
+      throw new Error(
+        'Position risk cannot be zero. Entry price and stop price cannot be the same.'
+      );
+    }
+    return riskAmount / positionRisk;
+  }
+
+  calculateRiskReturnRatio(
+    entryPrice: number,
+    stopPrice: number,
+    takeProfitPrice: number
+  ): number {
+    const potentialProfit = Math.abs(entryPrice - takeProfitPrice);
+    const potentialLoss = Math.abs(entryPrice - stopPrice);
+    if (potentialLoss === 0) {
+      throw new Error(
+        'Potential loss cannot be zero. Entry price and stop price cannot be the same.'
+      );
+    }
+    return potentialProfit / potentialLoss;
+  }
+
+  async submitRangeOrders(
+    action: string,
+    market: string,
+    startPrice: number,
+    endPrice: number,
+    numOrders: number,
+    totalRiskPercentage: number,
+    stopPrice: number,
+    takeProfitPrice: number,
+    totalCapitalToRisk: number,
+    riskReturnRatioThreshold: number
+  ) {
+    const priceStep = (endPrice - startPrice) / (numOrders - 1);
+    const riskPercentagePerOrder = totalRiskPercentage / numOrders;
+
+    for (let i = 0; i < numOrders; i++) {
+      const orderPrice = startPrice + priceStep * i;
+      const positionSize = this.calculatePositionSize(
+        totalCapitalToRisk,
+        riskPercentagePerOrder,
+        orderPrice,
+        stopPrice
+      );
+      const riskReturnRatio = this.calculateRiskReturnRatio(
+        orderPrice,
+        stopPrice,
+        takeProfitPrice
+      );
+
+      if (riskReturnRatio <= riskReturnRatioThreshold) {
+        throw new Error(
+          `Risk/return ratio of ${riskReturnRatio} is below the threshold of ${riskReturnRatioThreshold}.`
+        );
+      }
+
+      if (action === 'buy') {
+        await this.createLimitBuyOrder(market, orderPrice, positionSize);
+      } else if (action === 'sell') {
+        await this.createLimitSellOrder(market, orderPrice, positionSize);
+      } else {
+        throw new Error(`Invalid action: ${action}. Expected 'buy' or 'sell'`);
+      }
+    }
+
+    this.createStopOrder(market, stopPrice);
   }
 
   async createMarketBuyOrder(market: string, quantity: number): Promise<void> {

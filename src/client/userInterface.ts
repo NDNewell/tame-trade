@@ -327,6 +327,62 @@ export class UserInterface {
           'Invalid command format. Usage: cancel orders [top | bottom] [start:end | specific order]'
         );
       }
+    } else if (
+      command.startsWith('range buy') ||
+      command.startsWith('range sell')
+    ) {
+      const commandParts = command.split(' ');
+
+      if (commandParts.length === 10) {
+        const action = commandParts[1];
+        const market = this.currentMarket;
+        const startPrice = parseFloat(commandParts[2]);
+        const endPrice = parseFloat(commandParts[3]);
+        const numOrders = parseInt(commandParts[4]);
+        const totalRiskPercentage = parseFloat(commandParts[5]);
+        const stopPrice = parseFloat(commandParts[6]);
+        const takeProfitPrice = parseFloat(commandParts[7]);
+        const totalCapitalToRisk = parseFloat(commandParts[8]);
+        const riskReturnRatioThreshold = parseFloat(commandParts[9]);
+
+        if (
+          market &&
+          startPrice &&
+          endPrice &&
+          numOrders &&
+          totalRiskPercentage &&
+          stopPrice &&
+          takeProfitPrice &&
+          totalCapitalToRisk &&
+          riskReturnRatioThreshold
+        ) {
+          try {
+            await this.exchangeCommand
+              .getExchangeClient()
+              .submitRangeOrders(
+                action,
+                market,
+                startPrice,
+                endPrice,
+                numOrders,
+                totalRiskPercentage,
+                stopPrice,
+                takeProfitPrice,
+                totalCapitalToRisk,
+                riskReturnRatioThreshold
+              );
+            console.log(
+              `Range ${action} orders placed between ${startPrice} and ${endPrice}`
+            );
+          } catch (error: unknown) {
+            console.log((error as Error).message);
+          }
+        } else {
+          console.log(
+            'Invalid range command format. Usage: range [buy/sell] [startPrice] [endPrice] [numOrders] [risk%] [stopPrice] [takeProfitPrice] [totalCapitalToRisk] [riskReturnRatioThreshold]'
+          );
+        }
+      }
     } else {
       if (this.currentMarket) {
         try {
