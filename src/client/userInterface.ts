@@ -416,6 +416,29 @@ export class UserInterface {
           'Invalid range command format. Usage: range [buy/sell] [startPrice] [endPrice] [numOrders] [risk%] [stopPrice] [takeProfitPrice] [totalCapitalToRisk] [riskReturnRatioThreshold]'
         );
       }
+    } else if (
+      command.startsWith('chase buy') ||
+      command.startsWith('chase sell')
+    ) {
+      const commandParts = command.split(' ');
+      const action = commandParts[1];
+      const market = this.currentMarket;
+      const amount = parseFloat(commandParts[2]);
+
+      if (market && amount) {
+        try {
+          await this.exchangeCommand
+            .getExchangeClient()
+            .chaseLimitOrder(market, action, amount);
+          console.log(`Chase ${action} order filled ${amount}`);
+        } catch (error: unknown) {
+          console.log((error as Error).message);
+        }
+      } else {
+        console.log(
+          'Invalid chase command format. Usage: chase [buy/sell] [amount]'
+        );
+      }
     } else {
       if (this.currentMarket) {
         try {

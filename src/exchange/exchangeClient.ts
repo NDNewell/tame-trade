@@ -2,6 +2,7 @@
 
 import { pro as ccxtpro, Exchange, Market, Order } from 'ccxt';
 import ccxt from 'ccxt';
+import ora, { spinners } from 'ora';
 import { ConfigManager } from '../config/configManager';
 import { ErrorEvent, WebSocket } from 'ws';
 import { EventEmitter } from 'events';
@@ -294,7 +295,7 @@ export class ExchangeClient {
     method: string,
     market: string,
     ...args: any[]
-  ): Promise<void> {
+  ): Promise<any> {
     if (this.exchange === null) {
       console.error(
         `[ExchangeClient] Exchange not initialized. Please call 'init' or 'setExchange' before placing an order.`
@@ -327,6 +328,8 @@ export class ExchangeClient {
           `Placed stop @${price} for amount ${trimmedAmount}, order ID: ${order.id}`
         );
       }
+
+      return order;
     } catch (error) {
       console.error(
         `[ExchangeClient] Failed to place order:`,
@@ -476,6 +479,99 @@ export class ExchangeClient {
     }
   }
 
+  async sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async chaseLimitOrder(
+    market: string,
+    side: string,
+    amount: number
+  ): Promise<void> {
+    const orderBook = await this.exchange!.fetchL2OrderBook(market);
+    const bestPrice =
+      side === 'buy' ? orderBook.bids[0][0] : orderBook.asks[0][0];
+    const order = await (side === 'buy'
+      ? await this.createLimitBuyOrder(market, bestPrice, amount)
+      : await this.createLimitSellOrder(market, bestPrice, amount));
+
+    if (!order) {
+      console.log('Order filled immediately');
+      return;
+    }
+
+    const orderId = order.id;
+    let remainingAmount = amount;
+
+    const spinner = ora('Executing chase order...').start();
+
+    while (remainingAmount > 0) {
+      const openOrders = await this.exchange!.fetchOpenOrders(market);
+      const order = openOrders.find((o) => o.id === orderId);
+
+      if (!order) {
+        break;
+      }
+
+      const updatedOrderBook = await this.exchange!.fetchL2OrderBook(market);
+      const updatedBestPrice =
+        side === 'buy'
+          ? updatedOrderBook.bids[0][0]
+          : updatedOrderBook.asks[0][0];
+
+      if (
+        (side === 'buy' && updatedBestPrice > order.price) ||
+        (side === 'sell' && updatedBestPrice < order.price)
+      ) {
+        console.log(`Updating ${side} order price to ${updatedBestPrice}`);
+        await this.editOrder(
+          orderId,
+          market,
+          'limit',
+          updatedBestPrice,
+          order.remaining
+        );
+      }
+
+      remainingAmount = order.remaining;
+
+      await this.sleep(500); // Adjust the sleep interval as needed
+    }
+    spinner.stop();
+  }
+
+  async editOrder(
+    orderId: string,
+    symbol: string,
+    orderType: string,
+    price: number,
+    quantity?: number
+  ): Promise<void> {
+    try {
+      const orders = await this.exchange!.fetchOrders(symbol);
+      let order = orders.find((order) => order.id === orderId);
+
+      if (!order) {
+        throw new Error(`Order with id ${orderId} not found`);
+      }
+
+      // If quantity is not provided, use the order's amount
+      quantity = quantity !== undefined ? quantity : order.amount;
+
+      await this.exchange!.editOrder(
+        order.id,
+        symbol,
+        orderType,
+        order.side,
+        quantity,
+        price
+      );
+    } catch (error) {
+      console.error('Error editing order:', error);
+      throw error;
+    }
+  }
+
   async bumpOrders(symbol: string, priceChange: number): Promise<void> {
     try {
       const openOrders = await this.exchange!.fetchOpenOrders(symbol);
@@ -621,6 +717,36 @@ export class ExchangeClient {
     }
 
     this.createStopOrder(market, stopPrice);
+
+    // When the order is finished being added, log how much the user is risking and what their expected profit will be and the risk/return.
+    const totalPositionSize = this.calculatePositionSize(
+      totalCapitalToRisk,
+      totalRiskPercentage,
+      startPrice,
+      stopPrice
+    );
+    const totalPotentialProfit =
+      Math.abs(startPrice - takeProfitPrice) * totalPositionSize;
+    const totalPotentialLoss =
+      Math.abs(startPrice - stopPrice) * totalPositionSize;
+    const totalRiskReturnRatio = totalPotentialProfit / totalPotentialLoss;
+
+    console.log(
+      `Total position size: ${totalPositionSize.toFixed(2)} ${
+        market.split('/')[1]
+      }`
+    );
+    console.log(
+      `Total potential profit: ${totalPotentialProfit.toFixed(2)} ${
+        market.split('/')[0]
+      }`
+    );
+    console.log(
+      `Total potential loss: ${totalPotentialLoss.toFixed(2)} ${
+        market.split('/')[0]
+      }`
+    );
+    console.log(`Total risk/return ratio: ${totalRiskReturnRatio.toFixed(2)}`);
   }
 
   async createMarketBuyOrder(market: string, quantity: number): Promise<void> {
@@ -643,26 +769,28 @@ export class ExchangeClient {
     market: string,
     price: number,
     quantity: number
-  ): Promise<void> {
-    await this.executeOrder(
+  ): Promise<any> {
+    const order = await this.executeOrder(
       'createLimitBuyOrder',
       market,
       await this.getQuantityPrecision(market, quantity),
       price
     );
+    return order;
   }
 
   async createLimitSellOrder(
     market: string,
     price: number,
     quantity: number
-  ): Promise<void> {
-    await this.executeOrder(
+  ): Promise<any> {
+    const order = await this.executeOrder(
       'createLimitSellOrder',
       market,
       await this.getQuantityPrecision(market, quantity),
       price
     );
+    return order;
   }
 
   async createStopOrder(
