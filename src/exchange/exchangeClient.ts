@@ -899,16 +899,6 @@ export class ExchangeClient {
         // Adjust the quantity to match the exchange's precision requirements
         quantity = await this.getQuantityPrecision(market, quantity);
 
-        // log all of the args passed to executeOrder: market, orderType, side, quantity, price, params
-        console.log(
-          `[ExchangeClient] Placing stop order for ${market} with the following details:`,
-          orderType,
-          side,
-          quantity,
-          price,
-          params
-        );
-
         // Execute the stop order with the provided details
         await this.executeOrder(
           'createOrder',
