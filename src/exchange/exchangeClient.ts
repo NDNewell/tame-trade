@@ -838,31 +838,15 @@ export class ExchangeClient {
     price: number,
     quantity?: number
   ): Promise<void> {
-    let side;
-
     try {
+      let side;
+      const openOrders = await this.exchange!.fetchOpenOrders(market);
+      const limitOrders = openOrders.filter((order) => order.type === 'limit');
+
       // If no quantity is provided, calculate the quantity based on open orders and position size
       if (!quantity) {
-        // Fetch open orders for the given market
-        const openOrders = await this.exchange!.fetchOpenOrders(market);
-        const limitOrders = openOrders.filter(
-          (order) => order.type === 'limit'
-        );
-
         // Get the position size for the given market
         quantity = await this.getPositionSize(market);
-
-        // Get limit orders only and determine their side if there are no open positions from which to determine the side
-        if (quantity > 0) {
-          const position = await this.getPositionStructure(market);
-          side = position.side === 'long' ? 'sell' : 'buy';
-        } else if (limitOrders.length > 0) {
-          side = limitOrders[0].side === 'buy' ? 'sell' : 'buy';
-        } else {
-          throw new Error(
-            `Unable to determine side of stop order for market ${market}.`
-          );
-        }
 
         // Calculate the total quantity of open limit orders
         const openOrdersQuantity = limitOrders.reduce((acc, order) => {
@@ -877,6 +861,19 @@ export class ExchangeClient {
 
       // If there's a non-zero quantity, proceed with creating the stop order
       if (quantity > 0) {
+        // Get limit orders only and determine their side if there are no open positions from which to determine the side
+        const position = await this.getPositionStructure(market);
+
+        if (position.contracts > 0) {
+          side = position.side === 'long' ? 'sell' : 'buy';
+        } else if (limitOrders.length > 0) {
+          side = limitOrders[0].side === 'buy' ? 'sell' : 'buy';
+        } else {
+          throw new Error(
+            `Unable to determine side of stop order for market ${market}.`
+          );
+        }
+
         // Get the appropriate exchange parameters based on the current exchange
         const exchangeName = this.exchange!.id;
         const orderType =
@@ -901,6 +898,16 @@ export class ExchangeClient {
 
         // Adjust the quantity to match the exchange's precision requirements
         quantity = await this.getQuantityPrecision(market, quantity);
+
+        // log all of the args passed to executeOrder: market, orderType, side, quantity, price, params
+        console.log(
+          `[ExchangeClient] Placing stop order for ${market} with the following details:`,
+          orderType,
+          side,
+          quantity,
+          price,
+          params
+        );
 
         // Execute the stop order with the provided details
         await this.executeOrder(
