@@ -687,7 +687,7 @@ export class ExchangeClient {
       ? this.createLimitBuyOrder(market, entryPrice, quantity)
       : this.createLimitSellOrder(market, entryPrice, quantity));
 
-    await this.createStopOrder(market, stopPrice);
+    await this.createStopOrder(market, stopPrice, quantity);
 
     const potentialLoss = Math.abs(entryPrice - stopPrice) * quantity;
     console.log(
@@ -838,21 +838,35 @@ export class ExchangeClient {
     price: number,
     quantity?: number
   ): Promise<void> {
+    let side;
+
     try {
       // If no quantity is provided, calculate the quantity based on open orders and position size
       if (!quantity) {
         // Fetch open orders for the given market
         const openOrders = await this.exchange!.fetchOpenOrders(market);
+        const limitOrders = openOrders.filter(
+          (order) => order.type === 'limit'
+        );
+
         // Get the position size for the given market
         quantity = await this.getPositionSize(market);
 
+        // Get limit orders only and determine their side if there are no open positions from which to determine the side
+        if (quantity > 0) {
+          const position = await this.getPositionStructure(market);
+          side = position.side === 'long' ? 'sell' : 'buy';
+        } else if (limitOrders.length > 0) {
+          side = limitOrders[0].side === 'buy' ? 'sell' : 'buy';
+        } else {
+          throw new Error(
+            `Unable to determine side of stop order for market ${market}.`
+          );
+        }
+
         // Calculate the total quantity of open limit orders
-        const openOrdersQuantity = openOrders.reduce((acc, order) => {
-          if (order.type === 'limit') {
-            return acc + order.remaining;
-          } else {
-            return acc;
-          }
+        const openOrdersQuantity = limitOrders.reduce((acc, order) => {
+          return acc + order.remaining;
         }, 0);
 
         // Add the open limit orders quantity to the calculated position size
@@ -863,11 +877,6 @@ export class ExchangeClient {
 
       // If there's a non-zero quantity, proceed with creating the stop order
       if (quantity > 0) {
-        // Get the position structure (side, size, etc.) for the given market
-        const position = await this.getPositionStructure(market);
-        // Determine the side of the stop order based on the position's side
-        const side = position.side === 'long' ? 'sell' : 'buy';
-
         // Get the appropriate exchange parameters based on the current exchange
         const exchangeName = this.exchange!.id;
         const orderType =
