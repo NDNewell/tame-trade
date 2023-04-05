@@ -430,7 +430,7 @@ export class UserInterface {
           await this.exchangeCommand
             .getExchangeClient()
             .chaseLimitOrder(market, action, amount);
-          console.log(`Chase ${action} order filled ${amount}`);
+          console.log(`Chase ${action} order filled ${amount} ${market}`);
         } catch (error: unknown) {
           console.log((error as Error).message);
         }

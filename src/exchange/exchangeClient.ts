@@ -687,6 +687,8 @@ export class ExchangeClient {
     const priceStep = (endPrice - startPrice) / (numOrders - 1);
     const riskPercentagePerOrder = totalRiskPercentage / numOrders;
 
+    const spinner = ora(`Posting range ${action} orders...`).start();
+
     for (let i = 0; i < numOrders; i++) {
       const orderPrice = startPrice + priceStep * i;
       const positionSize = this.calculatePositionSize(
@@ -716,34 +718,46 @@ export class ExchangeClient {
       }
     }
 
+    spinner.stop();
+
     this.createStopOrder(market, stopPrice);
 
-    // When the order is finished being added, log how much the user is risking and what their expected profit will be and the risk/return.
-    const totalPositionSize = this.calculatePositionSize(
-      totalCapitalToRisk,
-      totalRiskPercentage,
-      startPrice,
-      stopPrice
-    );
+    const allOrders = await this.exchange!.fetchOrders(market);
+    const openOrders = allOrders.filter((order) => order.status === 'open');
+    const openQuantity = openOrders.reduce((acc, order) => {
+      if (order.type !== 'stop' && !isNaN(order.remaining)) {
+        return acc + order.remaining;
+      } else {
+        return acc;
+      }
+    }, 0);
+    const avgOrderPrice =
+      openOrders.reduce((acc, order) => {
+        if (!isNaN(order.price)) {
+          return acc + order.price;
+        } else {
+          return acc;
+        }
+      }, 0) / openOrders.length;
     const totalPotentialProfit =
-      Math.abs(startPrice - takeProfitPrice) * totalPositionSize;
+      Math.abs(avgOrderPrice - takeProfitPrice) * openQuantity;
     const totalPotentialLoss =
-      Math.abs(startPrice - stopPrice) * totalPositionSize;
+      Math.abs(avgOrderPrice - stopPrice) * openQuantity;
     const totalRiskReturnRatio = totalPotentialProfit / totalPotentialLoss;
 
+    console.log(`Average order price: ${avgOrderPrice.toFixed(2)}`);
+
     console.log(
-      `Total position size: ${totalPositionSize.toFixed(2)} ${
-        market.split('/')[1]
-      }`
+      `Total position size: ${openQuantity.toFixed(3)} ${market.split('/')[0]}`
     );
     console.log(
       `Total potential profit: ${totalPotentialProfit.toFixed(2)} ${
-        market.split('/')[0]
+        market.split('/')[1].split(':')[0]
       }`
     );
     console.log(
       `Total potential loss: ${totalPotentialLoss.toFixed(2)} ${
-        market.split('/')[0]
+        market.split('/')[1].split(':')[0]
       }`
     );
     console.log(`Total risk/return ratio: ${totalRiskReturnRatio.toFixed(2)}`);
