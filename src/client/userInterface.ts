@@ -439,6 +439,52 @@ export class UserInterface {
           'Invalid chase command format. Usage: chase [buy/sell] [amount]'
         );
       }
+    } else if (
+      command.startsWith('bracket buy') ||
+      command.startsWith('bracket sell')
+    ) {
+      const side = command.split(' ')[1];
+      const entryPrice = parseFloat(command.split(' ')[2]);
+      const stopPrice = parseFloat(command.split(' ')[3]);
+
+      const questions = [
+        {
+          type: 'number',
+          name: 'capitalToRisk',
+          message: 'Enter the amount of capital you want to risk:',
+        },
+        {
+          type: 'number',
+          name: 'riskPercentage',
+          message: 'Enter the percentage of capital you want to risk:',
+        },
+      ];
+
+      const answers = await inquirer.prompt(questions);
+
+      if (
+        answers.capitalToRisk &&
+        answers.riskPercentage &&
+        stopPrice &&
+        entryPrice
+      ) {
+        try {
+          await this.exchangeCommand
+            .getExchangeClient()
+            .createBracketLimitOrder(
+              this.currentMarket,
+              side,
+              answers.capitalToRisk,
+              answers.riskPercentage,
+              stopPrice,
+              entryPrice
+            );
+        } catch (error: unknown) {
+          console.log((error as Error).message);
+        }
+      } else {
+        console.log('Invalid bracket command format. Please try again.');
+      }
     } else {
       if (this.currentMarket) {
         try {

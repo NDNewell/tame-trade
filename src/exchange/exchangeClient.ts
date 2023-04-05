@@ -672,6 +672,32 @@ export class ExchangeClient {
     return potentialProfit / potentialLoss;
   }
 
+  async createBracketLimitOrder(
+    market: string,
+    side: string,
+    capitalToRisk: number,
+    riskPercentage: number,
+    stopPrice: number,
+    entryPrice: number
+  ): Promise<void> {
+    const riskAmount = (capitalToRisk * riskPercentage) / 100;
+    const quantity = riskAmount / Math.abs(entryPrice - stopPrice);
+
+    await (side === 'buy'
+      ? this.createLimitBuyOrder(market, entryPrice, quantity)
+      : this.createLimitSellOrder(market, entryPrice, quantity));
+
+    await this.createStopOrder(market, stopPrice);
+
+    const potentialLoss = Math.abs(entryPrice - stopPrice) * quantity;
+    console.log(
+      `Bracket ${side} order of ${quantity.toFixed(
+        2
+      )} placed @ $${entryPrice.toFixed(2)}`
+    );
+    console.log(`Potential loss: $${potentialLoss.toFixed(2)}`);
+  }
+
   async submitRangeOrders(
     action: string,
     market: string,
