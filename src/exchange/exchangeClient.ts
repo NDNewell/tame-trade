@@ -503,14 +503,12 @@ export class ExchangeClient {
     const orderId = order.id;
     let remainingAmount = amount;
 
-    const spinner = ora('Executing chase order...').start();
-
-    while (remainingAmount > 0) {
+    const executeChaseOrder = async () => {
       const openOrders = await this.exchange!.fetchOpenOrders(market);
       const order = openOrders.find((o) => o.id === orderId);
 
       if (!order) {
-        break;
+        return;
       }
 
       const updatedOrderBook = await this.exchange!.fetchL2OrderBook(market);
@@ -523,7 +521,6 @@ export class ExchangeClient {
         (side === 'buy' && updatedBestPrice > order.price) ||
         (side === 'sell' && updatedBestPrice < order.price)
       ) {
-        console.log(`Updating ${side} order price to ${updatedBestPrice}`);
         await this.editOrder(
           orderId,
           market,
@@ -535,9 +532,11 @@ export class ExchangeClient {
 
       remainingAmount = order.remaining;
 
-      await this.sleep(500); // Adjust the sleep interval as needed
-    }
-    spinner.stop();
+      if (remainingAmount > 0) {
+        setTimeout(executeChaseOrder, 100); // Adjust the delay interval as needed
+      }
+    };
+    executeChaseOrder();
   }
 
   async editOrder(
