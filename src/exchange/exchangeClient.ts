@@ -31,11 +31,13 @@ export class ExchangeClient {
   exchangeManager: ConfigManager;
   private ws: WebSocket | null = null;
   private eventEmitter: EventEmitter;
+  private chaseLimitOrderActive: boolean = false;
 
   private constructor() {
     this.exchangeManager = new ConfigManager();
     this.supportedExchanges = [];
     this.eventEmitter = new EventEmitter();
+    this.chaseLimitOrderActive = false;
   }
 
   static getInstance(): ExchangeClient {
@@ -486,10 +488,15 @@ export class ExchangeClient {
   async cancelChaseOrder(orderId: string, market: string): Promise<void> {
     try {
       await this.exchange!.cancelOrder(orderId, market);
+      this.chaseLimitOrderActive = false;
     } catch (error) {
       console.error('Error cancelling chase order:', error);
       throw error;
     }
+  }
+
+  getChaseLimitOrderStatus(): boolean {
+    return this.chaseLimitOrderActive;
   }
 
   async chaseLimitOrder(
@@ -497,6 +504,7 @@ export class ExchangeClient {
     side: string,
     amount: number
   ): Promise<string | undefined | void> {
+    this.chaseLimitOrderActive = true;
     const orderBook = await this.exchange!.fetchL2OrderBook(market);
     const bestPrice =
       side === 'buy' ? orderBook.bids[0][0] : orderBook.asks[0][0];
@@ -506,6 +514,7 @@ export class ExchangeClient {
 
     if (!order) {
       console.log('Order filled immediately');
+      this.chaseLimitOrderActive = false;
       return;
     }
 
@@ -517,6 +526,12 @@ export class ExchangeClient {
       const order = openOrders.find((o) => o.id === orderId);
 
       if (!order) {
+        if (this.chaseLimitOrderActive) {
+          console.log(`Chase ${side} order filled ${amount} ${market}`);
+          this.chaseLimitOrderActive = false;
+        } else {
+          console.log(`Chase ${side} order cancelled ${amount} ${market}`);
+        }
         return;
       }
 

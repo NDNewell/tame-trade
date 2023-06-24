@@ -427,37 +427,45 @@ export class UserInterface {
       const market = this.currentMarket;
       const amount = parseFloat(commandParts[2]);
 
-      if (market && amount) {
-        try {
-          const orderId = await this.exchangeCommand
-            .getExchangeClient()
-            .chaseLimitOrder(market, action, amount);
-          if (orderId) {
-            // check if orderId is not undefined
-            this.chaseOrderId = orderId;
-          } else {
-            throw new Error('orderId is undefined');
+      if (
+        !this.exchangeCommand.getExchangeClient().getChaseLimitOrderStatus()
+      ) {
+        if (market && amount) {
+          try {
+            const orderId = await this.exchangeCommand
+              .getExchangeClient()
+              .chaseLimitOrder(market, action, amount);
+            if (orderId) {
+              this.chaseOrderId = orderId;
+            } else {
+              throw new Error('orderId is undefined');
+            }
+          } catch (error: unknown) {
+            console.log((error as Error).message);
           }
-        } catch (error: unknown) {
-          console.log((error as Error).message);
+        } else {
+          console.log(
+            'Invalid chase command format. Usage: chase [buy/sell] [amount]'
+          );
         }
       } else {
-        console.log(
-          'Invalid chase command format. Usage: chase [buy/sell] [amount]'
-        );
+        console.log('Chase order already active.');
       }
     } else if (command.startsWith('cancel chase')) {
-      if (this.chaseOrderId) {
+      if (
+        this.chaseOrderId !== undefined &&
+        this.exchangeCommand.getExchangeClient().getChaseLimitOrderStatus()
+      ) {
         try {
           await this.exchangeCommand
             .getExchangeClient()
             .cancelChaseOrder(this.chaseOrderId, this.currentMarket);
-          console.log('Chase order canceled!');
         } catch (error: unknown) {
           console.log((error as Error).message);
         }
+        this.chaseOrderId = '';
       } else {
-        console.log('No chase order available to cancel.');
+        console.log('No chase orders active.');
       }
     } else if (
       command.startsWith('bracket buy') ||
