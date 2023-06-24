@@ -483,11 +483,20 @@ export class ExchangeClient {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  async cancelChaseOrder(orderId: string, market: string): Promise<void> {
+    try {
+      await this.exchange!.cancelOrder(orderId, market);
+    } catch (error) {
+      console.error('Error cancelling chase order:', error);
+      throw error;
+    }
+  }
+
   async chaseLimitOrder(
     market: string,
     side: string,
     amount: number
-  ): Promise<void> {
+  ): Promise<string | undefined | void> {
     const orderBook = await this.exchange!.fetchL2OrderBook(market);
     const bestPrice =
       side === 'buy' ? orderBook.bids[0][0] : orderBook.asks[0][0];
@@ -537,6 +546,7 @@ export class ExchangeClient {
       }
     };
     executeChaseOrder();
+    return orderId;
   }
 
   async editOrder(

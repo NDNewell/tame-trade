@@ -13,11 +13,13 @@ export class UserInterface {
   private currentMarket: string;
   private availableMarkets: string[];
   private exchangeCommand: ExchangeCommand;
+  private chaseOrderId: string | undefined;
 
   constructor() {
     this.exchangeCommand = new ExchangeCommand();
     this.currentMarket = '';
     this.availableMarkets = [];
+    this.chaseOrderId = '';
     inquirer.registerPrompt('autocomplete', autocomplete);
     inquirer.registerPrompt('inquirer-expanded', InquirerExpanded);
   }
@@ -427,9 +429,15 @@ export class UserInterface {
 
       if (market && amount) {
         try {
-          await this.exchangeCommand
+          const orderId = await this.exchangeCommand
             .getExchangeClient()
             .chaseLimitOrder(market, action, amount);
+          if (orderId) {
+            // check if orderId is not undefined
+            this.chaseOrderId = orderId;
+          } else {
+            throw new Error('orderId is undefined');
+          }
         } catch (error: unknown) {
           console.log((error as Error).message);
         }
@@ -437,6 +445,19 @@ export class UserInterface {
         console.log(
           'Invalid chase command format. Usage: chase [buy/sell] [amount]'
         );
+      }
+    } else if (command.startsWith('cancel chase')) {
+      if (this.chaseOrderId) {
+        try {
+          await this.exchangeCommand
+            .getExchangeClient()
+            .cancelChaseOrder(this.chaseOrderId, this.currentMarket);
+          console.log('Chase order canceled!');
+        } catch (error: unknown) {
+          console.log((error as Error).message);
+        }
+      } else {
+        console.log('No chase order available to cancel.');
       }
     } else if (
       command.startsWith('bracket buy') ||
