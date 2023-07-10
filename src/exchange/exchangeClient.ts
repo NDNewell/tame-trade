@@ -704,8 +704,10 @@ export class ExchangeClient {
     stopPrice: number,
     entryPrice: number
   ): Promise<void> {
+    const slippageAdjustmentFactor = 2;
     const riskAmount = (capitalToRisk * riskPercentage) / 100;
-    const quantity = riskAmount / Math.abs(entryPrice - stopPrice);
+    const quantity =
+      riskAmount / Math.abs(entryPrice - stopPrice) / slippageAdjustmentFactor;
 
     await (side === 'buy'
       ? this.createLimitBuyOrder(market, entryPrice, quantity)
