@@ -706,22 +706,26 @@ export class ExchangeClient {
   ): Promise<void> {
     const slippageAdjustmentFactor = 2;
     const riskAmount = (capitalToRisk * riskPercentage) / 100;
-    const quantity =
-      riskAmount / Math.abs(entryPrice - stopPrice) / slippageAdjustmentFactor;
+    const quantity = riskAmount / Math.abs(entryPrice - stopPrice);
+    const slippageAdjustedQuantity = quantity / slippageAdjustmentFactor;
 
     await (side === 'buy'
-      ? this.createLimitBuyOrder(market, entryPrice, quantity)
-      : this.createLimitSellOrder(market, entryPrice, quantity));
+      ? this.createLimitBuyOrder(market, entryPrice, slippageAdjustedQuantity)
+      : this.createLimitSellOrder(
+          market,
+          entryPrice,
+          slippageAdjustedQuantity
+        ));
 
-    await this.createStopOrder(market, stopPrice, quantity);
+    await this.createStopOrder(market, stopPrice, slippageAdjustedQuantity);
 
     const potentialLoss = Math.abs(entryPrice - stopPrice) * quantity;
     console.log(
-      `Bracket ${side} order of ${quantity.toFixed(
+      `Bracket ${side} order of ${slippageAdjustedQuantity.toFixed(
         2
       )} placed @ $${entryPrice.toFixed(2)}`
     );
-    console.log(`Potential loss: $${potentialLoss.toFixed(2)}`);
+    console.log(`Potential loss of around: $${potentialLoss.toFixed(2)}`);
   }
 
   async submitRangeOrders(
