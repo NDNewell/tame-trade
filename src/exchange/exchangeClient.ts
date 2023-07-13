@@ -7,6 +7,7 @@ import { ConfigManager } from '../config/configManager';
 import { ErrorEvent, WebSocket } from 'ws';
 import { EventEmitter } from 'events';
 import { exchangeParams } from './exchangeParams';
+import { parse } from 'path';
 
 interface Position {
   symbol: string;
@@ -502,7 +503,8 @@ export class ExchangeClient {
   async chaseLimitOrder(
     market: string,
     side: string,
-    amount: number
+    amount: number,
+    decay?: string
   ): Promise<string | undefined | void> {
     this.chaseLimitOrderActive = true;
     const orderBook = await this.exchange!.fetchL2OrderBook(market);
@@ -561,6 +563,33 @@ export class ExchangeClient {
       }
     };
     executeChaseOrder();
+
+    // let's parse the decay time. 'decay' that takes a time argument in seconds e.g. `5s` or minutes e.g. `1m`
+    const parseDecayTime = (decay: string): number => {
+      const time = decay.slice(0, -1);
+      const unit = decay.slice(-1);
+      let decayTime = 0;
+
+      if (unit === 's') {
+        decayTime = parseInt(time) * 1000;
+      } else if (unit === 'm') {
+        decayTime = parseInt(time) * 60000;
+      } else {
+        throw new Error('Invalid decay time');
+      }
+
+      return decayTime;
+    };
+
+    if (decay) {
+      const decayTime = parseDecayTime(decay);
+      setTimeout(() => {
+        if (this.chaseLimitOrderActive) {
+          this.cancelChaseOrder(orderId, market);
+        }
+      }, decayTime);
+    }
+
     return orderId;
   }
 

@@ -426,6 +426,7 @@ export class UserInterface {
       const action = commandParts[1];
       const market = this.currentMarket;
       const amount = parseFloat(commandParts[2]);
+      const decay = commandParts[3] ? commandParts[3] : undefined;
 
       if (
         !this.exchangeCommand.getExchangeClient().getChaseLimitOrderStatus()
@@ -434,7 +435,7 @@ export class UserInterface {
           try {
             const orderId = await this.exchangeCommand
               .getExchangeClient()
-              .chaseLimitOrder(market, action, amount);
+              .chaseLimitOrder(market, action, amount, decay);
             if (orderId) {
               this.chaseOrderId = orderId;
             } else {
