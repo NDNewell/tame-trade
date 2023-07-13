@@ -8,6 +8,7 @@ import { ErrorEvent, WebSocket } from 'ws';
 import { EventEmitter } from 'events';
 import { exchangeParams } from './exchangeParams';
 import { parse } from 'path';
+import readline from 'readline';
 
 interface Position {
   symbol: string;
@@ -62,6 +63,12 @@ export class ExchangeClient {
 
   isInitialized(): boolean {
     return this.supportedExchanges !== null;
+  }
+
+  logAndReplace(msg: string) {
+    readline.clearLine(process.stdout, 0);
+    readline.cursorTo(process.stdout, 0);
+    console.log(msg);
   }
 
   async watchOrderBook(symbol: string): Promise<void> {
@@ -529,10 +536,14 @@ export class ExchangeClient {
 
       if (!order) {
         if (this.chaseLimitOrderActive) {
-          console.log(`Chase ${side} order filled ${amount} ${market}`);
+          // console.log(`Chase ${side} order filled ${amount} ${market}`);
+          this.logAndReplace(`Chase ${side} order filled ${amount} ${market}`);
           this.chaseLimitOrderActive = false;
         } else {
-          console.log(`Chase ${side} order cancelled ${amount} ${market}`);
+          // console.log(`Chase ${side} order cancelled ${amount} ${market}`);
+          this.logAndReplace(
+            `Chase ${side} order cancelled ${amount} ${market}`
+          );
         }
         return;
       }

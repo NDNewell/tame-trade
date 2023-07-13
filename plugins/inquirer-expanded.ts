@@ -1,6 +1,6 @@
 // plugins/inquirer-expanded.ts
 
-import { createInterface, ReadLine } from 'readline';
+import readline, { createInterface, ReadLine } from 'readline';
 import fs from 'fs';
 import { writeFile, readFile } from 'fs/promises';
 import InputPrompt from 'inquirer/lib/prompts/input';
@@ -101,6 +101,13 @@ class InquirerExpanded extends InputPrompt {
     } catch (error) {
       console.error('Failed to log command:', error);
     }
+  }
+
+  logAndReplace(msg: string) {
+    readline.clearLine(process.stdout, 0);
+    readline.cursorTo(process.stdout, 0);
+    console.log(msg);
+    this.rl.resume();
   }
 }
 
