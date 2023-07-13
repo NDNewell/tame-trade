@@ -149,7 +149,11 @@ export class UserInterface {
     const exchangeClient = this.exchangeCommand.getExchangeClient();
     const exchangeName = exchangeClient.getSelectedExchangeName();
     const tameDisplay = `[${fo('Tame', 'yellow')}]`;
-    const marketDisplay = `[${fo(`${this.currentMarket}`, 'green')}]`;
+    // remove market string after ':' if it exists
+    const currentMarket = this.currentMarket
+      ? this.currentMarket.split(':')[0]
+      : '';
+    const marketDisplay = `[${fo(`${currentMarket}`, 'green')}]`;
     const exchangeDisplay = exchangeName
       ? `[${fo(exchangeName, 'orange')}]`
       : '';
