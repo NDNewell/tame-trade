@@ -148,14 +148,14 @@ export class UserInterface {
   private async promptForCommand() {
     const exchangeClient = this.exchangeCommand.getExchangeClient();
     const exchangeName = exchangeClient.getSelectedExchangeName();
-    const tameDisplay = `<${fo('Tame', 'yellow', 'italic')}>`;
-    const marketDisplay = `<${fo(`${this.currentMarket}`, 'green', 'italic')}>`;
+    const tameDisplay = `[${fo('Tame', 'yellow', 'italic')}]`;
+    const marketDisplay = `[${fo(`${this.currentMarket}`, 'green', 'italic')}]`;
     const exchangeDisplay = exchangeName
       ? `<${fo(exchangeName, 'orange', 'italic')}>`
       : '';
 
     const promptMessage = this.currentMarket
-      ? `${tameDisplay}${exchangeDisplay}${marketDisplay} `
+      ? `${marketDisplay} `
       : `${tameDisplay}${exchangeDisplay} `;
 
     const { command } = await inquirer.prompt<{ command: string }>([
