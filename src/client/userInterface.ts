@@ -151,7 +151,7 @@ export class UserInterface {
     const tameDisplay = `[${fo('Tame', 'yellow', 'italic')}]`;
     const marketDisplay = `[${fo(`${this.currentMarket}`, 'green', 'italic')}]`;
     const exchangeDisplay = exchangeName
-      ? `<${fo(exchangeName, 'orange', 'italic')}>`
+      ? `[${fo(exchangeName, 'orange', 'italic')}]`
       : '';
 
     const promptMessage = this.currentMarket
