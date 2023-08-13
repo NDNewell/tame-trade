@@ -93,7 +93,6 @@ export class ExchangeCommand implements Command {
         console.log('Invalid command. Please enter a valid command.');
         break;
     }
-    // await this.exchangeClient.watchOrders(currentMarket);
   }
 
   getExchangeClient(): ExchangeClient {

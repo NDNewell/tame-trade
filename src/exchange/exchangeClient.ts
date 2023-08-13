@@ -12,8 +12,8 @@ import readline from 'readline';
 
 interface Position {
   symbol: string;
-  contracts: number;
-  notional: number;
+  contracts?: number | undefined;
+  notional?: number | undefined;
   side: string;
 }
 
@@ -257,36 +257,6 @@ export class ExchangeClient {
     });
   }
 
-  async watchOrders(symbol: string): Promise<void> {
-    try {
-      // Subscribe to order updates
-      const orders: any[] = await this.exchange!.watchOrders(symbol);
-      orders.forEach((order) => {
-        const { status, type, side, price, filled, average } = order;
-        if (status === 'closed') {
-          if (type === 'limit') {
-            this.eventEmitter.emit('limitOrderFilled', {
-              side,
-              filled,
-              price,
-            });
-          }
-          // You can add other types of orders like 'stop' or 'stop-limit' if needed.
-        } else if (status === 'canceled') {
-          this.eventEmitter.emit('orderCanceled', {
-            side,
-          });
-        }
-      });
-      this.exchange!.watchOrders(symbol, undefined, { fetchOrder: 'stop' });
-    } catch (error) {
-      console.error(
-        `[ExchangeClient/watchOrders] Failed to subscribe to order updates:`,
-        error
-      );
-    }
-  }
-
   async getQuantityPrecision(
     market: string,
     quantity: number
@@ -348,8 +318,8 @@ export class ExchangeClient {
     }
   }
 
-  async getPositionStructure(symbol: string): Promise<Position> {
-    let positionStructure: Position = {
+  async getPositionStructure(symbol: string): Promise<Position | undefined> {
+    let positionStructure: Position | undefined = {
       symbol: '',
       contracts: 0,
       notional: 0,
@@ -391,7 +361,7 @@ export class ExchangeClient {
     let positionSize = 0;
 
     const position = await this.getPositionStructure(symbol);
-    if (position) {
+    if (position && position.contracts !== undefined) {
       positionSize = position.contracts;
     }
     if (positionSize === 0) {
@@ -687,8 +657,18 @@ export class ExchangeClient {
 
     try {
       const position = await this.getPositionStructure(market);
+      let quantity = 0;
+      if (!position) {
+        console.error('Position is not defined');
+        return;
+      }
       const side = position.side === 'long' ? 'sell' : 'buy';
-      const quantity = Math.abs(position.contracts);
+
+      if (typeof position.contracts === 'number') {
+        quantity = Math.abs(position.contracts);
+      } else {
+        throw new Error('Position size is not defined');
+      }
 
       if (quantity > 0) {
         await this.executeOrder(
@@ -934,8 +914,8 @@ export class ExchangeClient {
         // Get limit orders only and determine their side if there are no open positions from which to determine the side
         const position = await this.getPositionStructure(market);
 
-        if (position.contracts > 0) {
-          side = position.side === 'long' ? 'sell' : 'buy';
+        if (position?.contracts !== undefined && position.contracts > 0) {
+          side = position?.side === 'long' ? 'sell' : 'buy';
         } else if (limitOrders.length > 0) {
           side = limitOrders[0].side === 'buy' ? 'sell' : 'buy';
         } else {
