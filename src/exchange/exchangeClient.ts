@@ -724,7 +724,7 @@ export class ExchangeClient {
     stopPrice: number,
     entryPrice: number
   ): Promise<void> {
-    const slippageAdjustmentFactor = 2;
+    const slippageAdjustmentFactor = 1.75;
     const riskAmount = (capitalToRisk * riskPercentage) / 100;
     const quantity = riskAmount / Math.abs(entryPrice - stopPrice);
     const slippageAdjustedQuantity = quantity / slippageAdjustmentFactor;
@@ -881,6 +881,47 @@ export class ExchangeClient {
       price
     );
     return order;
+  }
+
+  async editCurrentStopOrder(symbol: string, newStopPrice: number): Promise<string | undefined> {
+    if (this.exchange === null) {
+        console.error(
+            `[ExchangeClient] Exchange not initialized. Please call 'init' or 'setExchange' before fetching the stop order ID.`
+        );
+        return;
+    }
+    try {
+        const openOrders = await this.exchange.fetchOpenOrders(symbol);
+        const stopOrder = openOrders.find(
+            (order) => (order as any).type.toLowerCase() === 'stop'
+        );
+
+        if (!stopOrder) {
+          return undefined;
+        } else {
+          let params;
+
+          // stopOrder = order as StopOrder;
+          params = {
+            // stopLossPrice: price, // only available on Deribit so far
+            stopPrice: newStopPrice, // Phemex's property name for a stop order
+            // reduce_only: true, // only available on Deribit so far
+          }
+
+          await this.exchange!.editOrder(
+            stopOrder.id,
+            symbol,
+            'stop',
+            stopOrder.side,
+            stopOrder.amount,
+            newStopPrice,
+            params ? params : {}
+          );
+          return stopOrder.id;
+        }
+    } catch (error) {
+        console.error(`[ExchangeClient] Failed to fetch stop order ID:`, error);
+    }
   }
 
   async createStopOrder(

@@ -518,6 +518,27 @@ export class UserInterface {
       } else {
         console.log('Invalid bracket command format. Please try again.');
       }
+    } else if (command.startsWith('move stop')) {
+      const parts = command.split(' ');
+      if (parts.length === 3 && this.currentMarket) {
+          const newStopPrice = parseFloat(parts[2]);
+          if (!isNaN(newStopPrice)) {
+              try {
+                  const currentStopOrderId = await this.exchangeCommand.getExchangeClient().editCurrentStopOrder(this.currentMarket, newStopPrice);
+                  if (currentStopOrderId) {
+                      console.log(`Stop moved to new price: ${newStopPrice}`);
+                  } else {
+                      console.log('No active stop order found for the current market.');
+                  }
+              } catch (error: unknown) {
+                  console.log((error as Error).message);
+              }
+          } else {
+              console.log('Invalid stop price.');
+          }
+      } else {
+          console.log('Usage: move stop <new stop price>');
+      }
     } else {
       if (this.currentMarket) {
         try {
