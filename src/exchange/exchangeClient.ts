@@ -415,47 +415,53 @@ export class ExchangeClient {
 
   async cancelAllLimitOrders(symbol: string): Promise<void> {
     try {
+      // Fetch open orders for the given symbol/market
       const openOrders = await this.exchange!.fetchOpenOrders(symbol);
+      // Filter orders to obtain only limit orders
       const limitOrders = openOrders.filter((order) => order.type === 'limit');
 
-      if (limitOrders.length > 0) {
-        const cancelPromises = limitOrders.map((order) =>
-          this.exchange!.cancelOrder(order.id, symbol)
-        );
-        await Promise.all(cancelPromises);
-      } else {
-        throw new Error('No open limit orders to cancel');
+      // If there are no limit orders, simply return without doing anything further
+      if (limitOrders.length === 0) {
+        console.log('No open limit orders to cancel.');
+        return;
       }
+
+      // If there are limit orders, proceed with canceling them
+      const cancelPromises = limitOrders.map((order) =>
+        this.exchange!.cancelOrder(order.id, symbol)
+      );
+      // Wait for all cancellations to complete
+      await Promise.all(cancelPromises);
     } catch (error) {
+      // Log the error instead of throwing it
       console.error('Error cancelling limit orders:', error);
-      throw error;
     }
   }
 
   async cancelAllStopOrders(symbol: string): Promise<void> {
     try {
-      let stopOrders = [];
-      const openOrders = await this.exchange!.fetchOpenOrders(symbol);
-      stopOrders = openOrders.filter(
-        (order) => order.info.order_type === 'stop_market' // Deribit
-      );
-
-      if (stopOrders.length === 0) {
+        let stopOrders = [];
+        const openOrders = await this.exchange!.fetchOpenOrders(symbol);
         stopOrders = openOrders.filter(
-          (order) => order.type!.toLowerCase() === 'stop' // Phemex
+            (order) => order.info.order_type === 'stop_market'
         );
-      }
-
-      if (stopOrders.length > 0) {
-        for (const order of stopOrders) {
-          await this.exchange!.cancelOrder(order.id, symbol);
+        if (stopOrders.length === 0) {
+            stopOrders = openOrders.filter(
+                (order) => order.type!.toLowerCase() === 'stop'
+            );
         }
-      } else {
-        throw new Error('No open stop orders to cancel');
-      }
+        if (stopOrders.length > 0) {
+            const cancelPromises = stopOrders.map((order) =>
+                this.exchange!.cancelOrder(order.id, symbol)
+            );
+            await Promise.all(cancelPromises);
+        } else {
+            console.log('No open stop orders to cancel.');
+            return;  // Use return to gracefully exit without throwing an error.
+        }
     } catch (error) {
-      console.error('Error cancelling stop orders:', error);
-      throw error;
+        // Instead of throwing an error, log it and handle it gracefully.
+        console.error('Error cancelling stop orders:', error);
     }
   }
 
