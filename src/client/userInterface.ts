@@ -175,6 +175,21 @@ export class UserInterface {
     this.handleCommand(command.trim());
   }
 
+  private processPositionSize(command: string, lastPositionSize: number): string {
+    let modifiedCommand = command;
+
+    const percentModifierMatch = command.match(/(\d+)%possize/);
+    if (percentModifierMatch) {
+      const percentModifier = Number(percentModifierMatch[1]) / 100;
+      const adjustedPositionSize = lastPositionSize * percentModifier;
+      modifiedCommand = command.replace(/(\d+)%possize/g, adjustedPositionSize.toString());
+    } else if (command.includes("possize")) {
+      modifiedCommand = command.replace(/possize/g, lastPositionSize.toString());
+    }
+
+    return modifiedCommand;
+  }
+
   private async handleCommand(command: string) {
     if (command.includes("possize")) {
       // Replace 'possize' with the latest position size
@@ -190,7 +205,7 @@ export class UserInterface {
       }
 
       // Replace all instances of 'possize' with the actual position size
-      command = command.replace(/possize/g, this.lastPositionSize.toString());
+      command = this.processPositionSize(command, this.lastPositionSize);
     }
     if (command === 'list methods') {
       this.displayAvailableMethods();
