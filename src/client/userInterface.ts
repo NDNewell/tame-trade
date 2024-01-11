@@ -14,6 +14,7 @@ export class UserInterface {
   private availableMarkets: string[];
   private exchangeCommand: ExchangeCommand;
   private chaseOrderId: string | undefined;
+  private lastPositionSize: number | null = null;
 
   constructor() {
     this.exchangeCommand = new ExchangeCommand();
@@ -175,6 +176,22 @@ export class UserInterface {
   }
 
   private async handleCommand(command: string) {
+    if (command.includes("possize")) {
+      // Replace 'possize' with the latest position size
+      this.lastPositionSize = await this.exchangeCommand
+        .getExchangeClient()
+        .getPositionSize(this.currentMarket);
+      // If the position size is zero, throw an error and do not proceed
+
+      if (this.lastPositionSize === 0) {
+        console.log('Error: Cannot execute an order with a position size of zero.');
+        this.promptForCommand();
+        return;
+      }
+
+      // Replace all instances of 'possize' with the actual position size
+      command = command.replace(/possize/g, this.lastPositionSize.toString());
+    }
     if (command === 'list methods') {
       this.displayAvailableMethods();
     } else if (command.startsWith('market')) {
