@@ -15,6 +15,7 @@ interface Position {
   contracts?: number | undefined;
   notional?: number | undefined;
   side: string;
+  entryPrice?: number;
 }
 
 interface StopOrder extends Order {
@@ -318,6 +319,25 @@ export class ExchangeClient {
     }
   }
 
+  async getMarketPrecision(market: string): Promise<number> {
+    if (this.exchange === null) {
+        console.error(
+            `[ExchangeClient] Exchange not initialized. Please call 'init' or 'setExchange' before fetching market precision.`
+        );
+        return 0;
+    }
+    // Ensure markets are loaded
+    if (!this.availableMarkets) {
+      await this.loadMarkets();
+    }
+    // Use the market name to access precision details
+    const marketInfo = this.availableMarkets![market];
+    if (!marketInfo) {
+      throw new Error(`Market ${market} not found.`);
+    }
+    return marketInfo.precision.price ?? 0;
+  }
+
   async getPositionStructure(symbol: string): Promise<Position | undefined> {
     let positionStructure: Position | undefined = {
       symbol: '',
@@ -355,6 +375,13 @@ export class ExchangeClient {
     }
 
     return positionStructure;
+  }
+
+  async getEntryPrice(symbol: string): Promise<number | undefined> {
+    const position = await this.getPositionStructure(symbol);
+    if (position && position.contracts !== undefined) {
+      return position.entryPrice ?? 0;
+    }
   }
 
   async getPositionSize(symbol: string): Promise<number> {

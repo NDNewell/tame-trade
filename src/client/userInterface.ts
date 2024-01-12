@@ -15,6 +15,7 @@ export class UserInterface {
   private exchangeCommand: ExchangeCommand;
   private chaseOrderId: string | undefined;
   private lastPositionSize: number | null = null;
+  private entryPrice: number | null = null;
 
   constructor() {
     this.exchangeCommand = new ExchangeCommand();
@@ -175,6 +176,18 @@ export class UserInterface {
     this.handleCommand(command.trim());
   }
 
+  private async formatPriceToMarketPrecision(price: number, market: string): Promise<number> {
+      try {
+          const precision = await this.exchangeCommand.getExchangeClient().getMarketPrecision(market);
+          const decimalPlaces = precision.toString().split('.')[1].length;
+          const updatedPrice = price.toFixed(decimalPlaces);
+          return Number(updatedPrice);
+      } catch (error) {
+          console.error('Failed to format price to market precision:', error);
+          return price
+      }
+  }
+
   private processPositionSize(command: string, lastPositionSize: number): string {
     let modifiedCommand = command;
 
@@ -190,7 +203,40 @@ export class UserInterface {
     return modifiedCommand;
   }
 
+  private replaceCommandVariable(command: string, value: number, variable: string): string {
+    command = command.replace(variable, value.toString());
+    console.log(command);
+    return command;
+  }
+
   private async handleCommand(command: string) {
+    if (command.startsWith('print')) {
+      if (command.includes('possize')) {
+        const positionSize = await this.exchangeCommand
+          .getExchangeClient()
+          .getPositionSize(this.currentMarket);
+        console.log(positionSize);
+      } else if (command.includes('entry')) {
+        this.entryPrice = await this.exchangeCommand
+          .getExchangeClient()
+          .getEntryPrice(this.currentMarket) ?? null;
+        if (this.entryPrice !== null) {
+          this.entryPrice = await this.formatPriceToMarketPrecision(this.entryPrice, this.currentMarket);
+        } else {
+          this.entryPrice = null;
+        }
+        console.log(this.entryPrice);
+      }  else if (command.includes('precision')) {
+        const precision = await this.exchangeCommand
+          .getExchangeClient()
+          .getMarketPrecision(this.currentMarket);
+        console.log(precision);
+      }
+
+      this.promptForCommand();
+      return;
+    }
+
     if (command.includes("possize")) {
       // Replace 'possize' with the latest position size
       this.lastPositionSize = await this.exchangeCommand
@@ -206,6 +252,30 @@ export class UserInterface {
 
       // Replace all instances of 'possize' with the actual position size
       command = this.processPositionSize(command, this.lastPositionSize);
+    }
+
+    if (command.includes("entry")) {
+      this.entryPrice = await this.exchangeCommand
+          .getExchangeClient()
+          .getEntryPrice(this.currentMarket) ?? null;
+
+      if (this.entryPrice === null) {
+        console.log('Error: Cannot execute an order with an entry price of null.');
+        this.promptForCommand();
+        return;
+      }
+
+      this.entryPrice = await this.formatPriceToMarketPrecision(this.entryPrice, this.currentMarket);
+
+      if (this.entryPrice === 0) {
+        console.log('Error: Cannot execute an order with an entry price of zero.');
+        this.promptForCommand();
+        return;
+      }
+
+      if (this.entryPrice !== null) {
+        command = this.replaceCommandVariable(command, this.entryPrice, 'entry');
+      }
     }
     if (command === 'list methods') {
       this.displayAvailableMethods();
@@ -323,13 +393,6 @@ export class UserInterface {
         console.log(
           'Invalid bump command format. Use "bump + [value]" or "bump - [value]".'
         );
-      }
-    } else if (command.startsWith('print')) {
-      if (command.includes('possize')) {
-        const positionSize = await this.exchangeCommand
-          .getExchangeClient()
-          .getPositionSize(this.currentMarket);
-        console.log(positionSize);
       }
     } else if (command.startsWith('cancel orders')) {
       const regex = /^cancel orders\s*(top|bottom)?\s*(\d+)?(\:)?(\d+)?$/;
