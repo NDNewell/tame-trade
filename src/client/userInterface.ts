@@ -634,7 +634,42 @@ export class UserInterface {
       } else {
           console.log('Usage: move stop <new stop price>');
       }
-    } else {
+    } else if (command.startsWith('update stop')) {
+      const parts = command.split(' ');
+      let amount: number | undefined;
+      if (parts.length > 3 || parts.length < 2) {
+          console.log('Usage: update stop <amount>');
+          this.promptForCommand();
+          return;
+      }
+
+      if (parts[1] !== 'stop') {
+          console.log('Invalid command. Only stop order can be updated.');
+          this.promptForCommand();
+          return;
+      }
+
+      if (parts.length === 3) {
+          amount = parseFloat(parts[2]);
+          if (isNaN(amount)) {
+              console.log('Invalid amount. Amount should be a number.');
+              this.promptForCommand();
+              return;
+          }
+      }
+
+      try {
+        if(amount !== undefined) {
+          await this.exchangeCommand.getExchangeClient().updateStopOrder(this.currentMarket, amount);
+          console.log(`Stop order updated with amount: ${amount}`);
+        } else {
+          await this.exchangeCommand.getExchangeClient().updateStopOrder(this.currentMarket);
+          console.log('Stop order updated.');
+        }
+      } catch (error: unknown) {
+          console.log((error as Error).message);
+      }
+  } else {
       if (this.currentMarket) {
         try {
           const commandParams = await OrderType.parseCommand(command);

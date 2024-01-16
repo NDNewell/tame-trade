@@ -1045,4 +1045,47 @@ export class ExchangeClient {
       console.error(`[ExchangeClient] Failed to place order:`, error);
     }
   }
+  async updateStopOrder(market: string, newAmount?: number): Promise<void> {
+    try {
+        const openOrders = await this.exchange?.fetchOpenOrders(market);
+        const stopOrders = openOrders?.filter(order => order.type.toLowerCase().includes('stop'));
+        if (stopOrders?.length === 0) {
+          throw new Error('No active stop orders found.');
+        } else if ((stopOrders?.length ?? 0) > 1) {
+          throw new Error('Multiple stop orders found. Cannot update multiple stops.');
+        }
+        let order = stopOrders?.[0] as StopOrder
+        let amountToUpdate = newAmount;
+
+        if (!newAmount) {
+          // Calculate quantity to be used for the stop order
+          let positionSize = 0;
+          const position = await this.getPositionStructure(market);
+          if (position) {
+            positionSize += position.contracts ?? 0;
+          }
+
+          const limitOrders = openOrders?.filter(order => order.type === 'limit') ?? [];
+          const openOrdersQuantity = limitOrders.reduce((acc, order) => acc + order.remaining, 0);
+
+          amountToUpdate = positionSize + openOrdersQuantity;
+        }
+
+        // check if amountToUpdate is defined and greater than zero
+        if (!amountToUpdate || amountToUpdate <= 0) {
+          throw new Error('Calculated quantity for stop order is zero or negative.');
+        }
+
+        try {
+          await this.cancelAllStopOrders(market);
+          await this.createStopOrder(market, order.stopPrice, amountToUpdate);
+        } catch (error) {
+          console.error(`[ExchangeClient] Failed to update stop order: ${error}`);
+          throw error;
+        }
+    } catch (error) {
+        console.error(`[ExchangeClient] Failed to update stop order: ${error}`);
+        throw error;
+    }
+  }
 }
