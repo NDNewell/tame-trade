@@ -61,6 +61,58 @@ With this alias configuration, typing b in the terminal will execute the limit b
 
 `q`: Quit the application.
 
+## Cancel Specific Orders by Range
+
+You can cancel a range of orders based on their position in the order
+book:
+
+```
+cancel orders top 5
+```
+Cancels the top 5 orders from the order book.
+
+```
+cancel orders bottom 5
+```
+Cancels the bottom 5 orders from the order book.
+
+## Cancel Orders by Specific Range
+
+To cancel orders within a specific price range:
+
+```
+cancel orders top 3:5
+```
+Cancels orders from top positions 3 to 5 in the order book.
+
+```
+cancel orders bottom 2:4
+```
+Cancels orders from bottom positions 2 to 4 in the order book.
+
+## Cancel Orders by Specific Index
+
+To cancel a specific order by its index in the order book, you can use
+the same command without the colon:
+
+```
+cancel orders top 3
+```
+Cancels the third order from the top of the order book.
+
+```
+cancel orders bottom 1
+```
+Cancels the very first order from the bottom of the order book.
+
+Remember that these commands are context-sensitive and apply to the
+orders of the market that is currently selected within the client
+session.
+
+Please ensure that you have selected the appropriate market when using
+these commands to cancel limit orders.
+```
+
 ## License
 
 Tame is released under the MIT License.
