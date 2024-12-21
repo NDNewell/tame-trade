@@ -539,14 +539,10 @@ export class ExchangeClient {
 
       if (!order) {
         if (this.chaseLimitOrderActive) {
-          // console.log(`Chase ${side} order filled ${amount} ${market}`);
-          this.logAndReplace(`Chase ${side} order filled ${amount} ${market}`);
+          this.logAndReplace(`Chase ${side} order filled for ${amount} ${market}`);
           this.chaseLimitOrderActive = false;
         } else {
-          // console.log(`Chase ${side} order cancelled ${amount} ${market}`);
-          this.logAndReplace(
-            `Chase ${side} order cancelled ${amount} ${market}`
-          );
+          this.logAndReplace(`Chase ${side} order cancelled for ${amount} ${market}`);
         }
         return;
       }
@@ -557,17 +553,22 @@ export class ExchangeClient {
           ? updatedOrderBook.bids[0][0]
           : updatedOrderBook.asks[0][0];
 
-      if (
-        (side === 'buy' && updatedBestPrice > order.price) ||
-        (side === 'sell' && updatedBestPrice < order.price)
-      ) {
-        await this.editOrder(
-          orderId,
-          market,
-          'limit',
-          updatedBestPrice,
-          order.remaining
-        );
+      try {
+        if (
+          (side === 'buy' && updatedBestPrice > order.price) ||
+          (side === 'sell' && updatedBestPrice < order.price)
+        ) {
+          await this.editOrder(
+            orderId,
+            market,
+            'limit',
+            updatedBestPrice,
+            order.remaining
+          );
+        }
+      } catch (error) {
+        // Suppress the error output
+        // Optionally, you can log the error to a file or handle it in another way
       }
 
       remainingAmount = order.remaining;
@@ -576,6 +577,7 @@ export class ExchangeClient {
         setTimeout(executeChaseOrder, 100); // Adjust the delay interval as needed
       }
     };
+
     executeChaseOrder();
 
     // let's parse the decay time. 'decay' that takes a time argument in seconds e.g. `5s` or minutes e.g. `1m`
