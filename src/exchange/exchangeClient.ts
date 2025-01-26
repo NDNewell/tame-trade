@@ -161,6 +161,9 @@ export class ExchangeClient {
     await this.loadMarkets();
     await this.loadExchanges();
     this.setEventListeners();
+
+    // Call the time synchronization method here
+    await this.synchronizeTimeWithExchange();
   }
 
   async getMarketTypes(): Promise<string[]> {
@@ -636,7 +639,8 @@ export class ExchangeClient {
         price
       );
     } catch (error) {
-      console.error('Error editing order:', error);
+      // console.error('Error editing order:', error);
+      // This has been disabled for now since it keeps throwing an error and polluting the console
       throw error;
     }
   }
@@ -1088,6 +1092,29 @@ export class ExchangeClient {
     } catch (error) {
         console.error(`[ExchangeClient] Failed to update stop order: ${error}`);
         throw error;
+    }
+  }
+
+  async synchronizeTimeWithExchange() {
+    if (this.exchange === null) {
+      console.error(
+        `[ExchangeClient] Exchange not initialized. Please call 'init' or 'setExchange' before synchronizing time.`
+      );
+      return;
+    }
+
+    try {
+      const serverTime = await this.exchange.fetchTime();
+      const localTime = Date.now();
+      const timeDifference = serverTime - localTime;
+
+      // Adjust the exchange's API object to account for the time difference
+      this.exchange.options.adjustForTimeDifference = true;
+      this.exchange.options.timeDifference = timeDifference;
+
+      console.log(`Time synchronized with exchange. Time difference: ${timeDifference} ms`);
+    } catch (error) {
+      console.error(`[ExchangeClient] Failed to synchronize time with exchange:`, error);
     }
   }
 }
