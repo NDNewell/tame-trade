@@ -1103,16 +1103,27 @@ export class ExchangeClient {
       return;
     }
 
+    // Check if the exchange supports the fetchTime method
+    if (!this.exchange.has['fetchTime']) {
+      console.log(`[ExchangeClient] fetchTime not supported by ${this.exchange.name}.`);
+      return;
+    }
+
     try {
       const serverTime = await this.exchange.fetchTime();
       const localTime = Date.now();
       const timeDifference = serverTime - localTime;
 
-      // Adjust the exchange's API object to account for the time difference
-      this.exchange.options.adjustForTimeDifference = true;
-      this.exchange.options.timeDifference = timeDifference;
+      // Synchronize time if there is any difference
+      if (timeDifference !== 0) {
+        // Adjust the exchange's API object to account for the time difference
+        this.exchange.options.adjustForTimeDifference = true;
+        this.exchange.options.timeDifference = timeDifference;
 
-      console.log(`Time synchronized with exchange. Time difference: ${timeDifference} ms`);
+        console.log(`Time synchronized with exchange. Time difference: ${timeDifference} ms`);
+      } else {
+        console.log(`No need to synchronize time. Time difference: ${timeDifference} ms`);
+      }
     } catch (error) {
       console.error(`[ExchangeClient] Failed to synchronize time with exchange:`, error);
     }
