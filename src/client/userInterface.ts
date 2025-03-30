@@ -1,13 +1,13 @@
 // src/client/userInterface.ts
 
 import inquirer from 'inquirer';
-import InquirerExpanded from '../../plugins/inquirer-expanded';
+import InquirerExpanded from '../../plugins/inquirer-expanded.js';
 
 import autocomplete from 'inquirer-autocomplete-prompt';
 import clear from 'console-clear';
-import { formatOutput as fo } from '../utils/formatOutput';
-import { ExchangeProfile } from '../config/configManager';
-import { ExchangeCommand, OrderType } from '../commands/exchangeCommand';
+import { formatOutput as fo } from '../utils/formatOutput.js';
+import { ExchangeProfile } from '../config/configManager.js';
+import { ExchangeCommand, OrderType } from '../commands/exchangeCommand.js';
 
 export class UserInterface {
   private currentMarket: string;

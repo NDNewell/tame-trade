@@ -1,7 +1,7 @@
 // src/errors/appError.ts
 
-import { errorMessages } from './errorMessage';
-import { ErrorType } from './errorType';
+import { errorMessages } from './errorMessage.js';
+import { ErrorType } from './errorType.js';
 
 export class AppError extends Error {
   type: ErrorType;

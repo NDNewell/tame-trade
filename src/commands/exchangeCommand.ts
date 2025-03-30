@@ -1,8 +1,8 @@
 // src/commands/exchangeCommand.ts
 
-import { ExchangeClient } from '../exchange/exchangeClient';
-import { AppError } from '../errors/appError';
-import { ErrorType } from '../errors/errorType';
+import { ExchangeClient } from '../exchange/exchangeClient.js';
+import { AppError } from '../errors/appError.js';
+import { ErrorType } from '../errors/errorType.js';
 
 export enum OrderType {
   MARKET_BUY,

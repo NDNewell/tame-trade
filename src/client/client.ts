@@ -1,10 +1,10 @@
 // src/client/client.ts
 
-import { ConfigManager } from '../config/configManager';
-import { AuthManager } from '../auth/authManager';
-import { UserInterface } from './userInterface';
-import { ExchangeManager } from '../exchange/exchangeManager';
-import { ExchangeClient } from '../exchange/exchangeClient';
+import { ConfigManager } from '../config/configManager.js';
+import { AuthManager } from '../auth/authManager.js';
+import { UserInterface } from './userInterface.js';
+import { ExchangeManager } from '../exchange/exchangeManager.js';
+import { ExchangeClient } from '../exchange/exchangeClient.js';
 
 export class Client {
   private configManager: ConfigManager;

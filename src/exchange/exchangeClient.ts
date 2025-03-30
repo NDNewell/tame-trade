@@ -3,10 +3,10 @@
 import { pro as ccxtpro, Exchange, Market, Order } from 'ccxt';
 import ccxt from 'ccxt';
 import ora, { spinners } from 'ora';
-import { ConfigManager } from '../config/configManager';
+import { ConfigManager } from '../config/configManager.js';
 import { ErrorEvent, WebSocket } from 'ws';
 import { EventEmitter } from 'events';
-import { exchangeParams } from './exchangeParams';
+import { exchangeParams } from './exchangeParams.js';
 import { parse } from 'path';
 import readline from 'readline';
 

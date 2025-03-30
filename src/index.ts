@@ -1,6 +1,6 @@
 // src/index.ts
 
-import { Client } from "./client/client";
+import { Client } from "./client/client.js";
 
 async function main() {
   const client = new Client();

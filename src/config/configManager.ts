@@ -3,8 +3,8 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { AppError } from '../errors/appError';
-import { ErrorType } from '../errors/errorType';
+import { AppError } from '../errors/appError.js';
+import { ErrorType } from '../errors/errorType.js';
 
 export interface ExchangeProfile {
   exchange: string;
