@@ -305,7 +305,7 @@ export class ExchangeClient {
       if (this.exchange.id === 'hyperliquid' && method.includes('Market')) {
         // Get current market price
         const ticker = await this.exchange.fetchTicker(market);
-        const currentPrice = ticker.last;
+        const currentPrice = ticker.last || 0; // Add default value to avoid undefined
 
         // For Hyperliquid, we need to pass the price as a parameter object
         const params = {
@@ -911,7 +911,7 @@ export class ExchangeClient {
     if (this.exchange?.id === 'hyperliquid') {
       // For Hyperliquid, create a "limit" order that behaves like a market order
       const ticker = await this.exchange.fetchTicker(market);
-      const currentPrice = ticker.last;
+      const currentPrice = ticker.last || 0; // Add default value to avoid undefined
 
       // Add a buffer to ensure the order executes immediately
       const adjustedPrice = currentPrice * 1.05; // 5% above market price
@@ -935,7 +935,7 @@ export class ExchangeClient {
     if (this.exchange?.id === 'hyperliquid') {
       // For Hyperliquid, create a "limit" order that behaves like a market order
       const ticker = await this.exchange.fetchTicker(market);
-      const currentPrice = ticker.last;
+      const currentPrice = ticker.last || 0; // Add default value to avoid undefined
 
       // Add a buffer to ensure the order executes immediately
       const adjustedPrice = currentPrice * 0.95; // 5% below market price
@@ -1059,6 +1059,15 @@ export class ExchangeClient {
           side = position?.side === 'long' ? 'sell' : 'buy';
         } else if (limitOrders.length > 0) {
           side = limitOrders[0].side === 'buy' ? 'sell' : 'buy';
+        } else if (this.exchange!.id === 'hyperliquid') {
+          // For Hyperliquid, we need to fetch the current price
+          // and determine the side based on the stop price
+          const ticker = await this.exchange!.fetchTicker(market);
+          const currentPrice = ticker.last || 0; // Add default value to avoid undefined
+
+          // If stop price is below current price, it's a sell stop (for long positions)
+          // If stop price is above current price, it's a buy stop (for short positions)
+          side = price < currentPrice ? 'sell' : 'buy';
         } else {
           throw new Error(
             `Unable to determine side of stop order for market ${market}.`
@@ -1081,6 +1090,12 @@ export class ExchangeClient {
         const params: { [key: string]: any } = {
           [stopLossProp]: price,
         };
+
+        // Special handling for Hyperliquid stop orders
+        if (this.exchange!.id === 'hyperliquid') {
+          // Add any specific parameters needed for Hyperliquid stop orders
+          params.trigger = 'ByLastPrice'; // Assuming this is the default trigger type for Hyperliquid
+        }
 
         // If the reduce-only feature is supported by the exchange, add the corresponding property to the parameters object
         if (reduceOnlySupported) {

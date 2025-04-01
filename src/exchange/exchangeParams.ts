@@ -54,4 +54,15 @@ export const exchangeParams: ExchangeParams = {
       },
     },
   },
+  hyperliquid: {
+    orders: {
+      stopLoss: {
+        ORDER_TYPE: OrderType.STOP_MARKET,
+        STOP_LOSS_PROP: StopLossProp.STOP_PRICE,
+        REDUCE_ONLY: {
+          SUPPORTED: false,
+        },
+      },
+    },
+  },
 };
