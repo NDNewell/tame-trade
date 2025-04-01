@@ -144,19 +144,32 @@ export class ExchangeClient {
 
   async setExchange(exchangeId: string): Promise<void> {
     console.log(`[ExchangeClient] Setting exchange to ${exchangeId}...`);
-    const { key, secret } = await this.exchangeManager.getExchangeCredentials(
-      exchangeId
-    );
+    const credentials = await this.exchangeManager.getExchangeCredentials(exchangeId);
 
-    this.exchange = new (ccxtpro as any)[exchangeId.toLowerCase()]({
-      apiKey: key,
-      secret: secret,
+    const exchangeConfig: any = {
       enableRateLimit: true,
       options: {
         defaultType: 'future',
         adjustForTimeDifference: true,
-      },
-    });
+      }
+    };
+
+    if (exchangeId.toLowerCase() === 'hyperliquid') {
+      if (!credentials.privateKey || !credentials.walletAddress) {
+        throw new Error('Private key and wallet address are required for Hyperliquid');
+      }
+      exchangeConfig.privateKey = credentials.privateKey;
+      exchangeConfig.walletAddress = credentials.walletAddress;
+      exchangeConfig.options.defaultSlippage = 0.05;
+    } else {
+      if (!credentials.key || !credentials.secret) {
+        throw new Error('API key and secret are required for this exchange');
+      }
+      exchangeConfig.apiKey = credentials.key;
+      exchangeConfig.secret = credentials.secret;
+    }
+
+    this.exchange = new (ccxtpro as any)[exchangeId.toLowerCase()](exchangeConfig);
 
     await this.loadMarkets();
     await this.loadExchanges();
@@ -288,6 +301,22 @@ export class ExchangeClient {
     }
 
     try {
+      // Special handling for Hyperliquid market orders
+      if (this.exchange.id === 'hyperliquid' && method.includes('Market')) {
+        // Get current market price
+        const ticker = await this.exchange.fetchTicker(market);
+        const currentPrice = ticker.last;
+
+        // For Hyperliquid, we need to pass the price as a parameter object
+        const params = {
+          price: currentPrice,
+          slippage: 0.05 // 5% slippage
+        };
+
+        // Add params as the last argument
+        args.push(params);
+      }
+
       const order = await (this.exchange as any)[method](market, ...args);
       const orderType = order.info.order_type;
 
@@ -879,19 +908,51 @@ export class ExchangeClient {
   }
 
   async createMarketBuyOrder(market: string, quantity: number): Promise<void> {
-    await this.executeOrder(
-      'createMarketBuyOrder',
-      market,
-      await this.getQuantityPrecision(market, quantity)
-    );
+    if (this.exchange?.id === 'hyperliquid') {
+      // For Hyperliquid, create a "limit" order that behaves like a market order
+      const ticker = await this.exchange.fetchTicker(market);
+      const currentPrice = ticker.last;
+
+      // Add a buffer to ensure the order executes immediately
+      const adjustedPrice = currentPrice * 1.05; // 5% above market price
+
+      // Create a limit order with post-only=false to ensure it executes immediately
+      await this.createLimitBuyOrder(
+        market,
+        adjustedPrice,
+        await this.getQuantityPrecision(market, quantity)
+      );
+    } else {
+      await this.executeOrder(
+        'createMarketBuyOrder',
+        market,
+        await this.getQuantityPrecision(market, quantity)
+      );
+    }
   }
 
   async createMarketSellOrder(market: string, quantity: number): Promise<void> {
-    await this.executeOrder(
-      'createMarketSellOrder',
-      market,
-      await this.getQuantityPrecision(market, quantity)
-    );
+    if (this.exchange?.id === 'hyperliquid') {
+      // For Hyperliquid, create a "limit" order that behaves like a market order
+      const ticker = await this.exchange.fetchTicker(market);
+      const currentPrice = ticker.last;
+
+      // Add a buffer to ensure the order executes immediately
+      const adjustedPrice = currentPrice * 0.95; // 5% below market price
+
+      // Create a limit order with post-only=false to ensure it executes immediately
+      await this.createLimitSellOrder(
+        market,
+        adjustedPrice,
+        await this.getQuantityPrecision(market, quantity)
+      );
+    } else {
+      await this.executeOrder(
+        'createMarketSellOrder',
+        market,
+        await this.getQuantityPrecision(market, quantity)
+      );
+    }
   }
 
   async createLimitBuyOrder(

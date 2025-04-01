@@ -118,13 +118,26 @@ export class UserInterface {
     return exchange;
   }
 
-  async addExchangeCredentials(credential: string): Promise<any> {
+  async addExchangeCredentials(credential: string, exchangeName?: string): Promise<any> {
     let message;
 
-    if (credential === 'key') {
-      message = 'Enter your API Key:';
-    } else if (credential === 'secret') {
-      message = 'Enter your Secret';
+    // Special handling for Hyperliquid
+    if (exchangeName?.toLowerCase() === 'hyperliquid') {
+      if (credential === 'privateKey') {
+        message = 'Enter your Private Key:';
+      } else if (credential === 'walletAddress') {
+        message = 'Enter your Wallet Address:';
+      } else {
+        // Skip other credential types for Hyperliquid
+        return '';
+      }
+    } else {
+      // Standard handling for other exchanges
+      if (credential === 'key') {
+        message = 'Enter your API Key:';
+      } else if (credential === 'secret') {
+        message = 'Enter your Secret:';
+      }
     }
 
     const { [credential]: enteredCred } = await inquirer.prompt([

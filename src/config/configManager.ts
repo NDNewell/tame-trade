@@ -6,10 +6,17 @@ import * as path from 'path';
 import { AppError } from '../errors/appError.js';
 import { ErrorType } from '../errors/errorType.js';
 
+export type ExchangeAuthType = 'apiKey' | 'privateKey';
+
 export interface ExchangeProfile {
   exchange: string;
-  key: string;
-  secret: string;
+  authType: ExchangeAuthType;
+  // For API key based exchanges
+  key?: string;
+  secret?: string;
+  // For private key based exchanges (like Hyperliquid)
+  privateKey?: string;
+  walletAddress?: string;
 }
 
 export interface Profile {
@@ -55,13 +62,13 @@ export class ConfigManager {
 
   async addExchange(
     exchange: string,
-    key: string,
-    secret: string
+    authType: ExchangeAuthType,
+    credentials: { key?: string; secret?: string; privateKey?: string; walletAddress?: string }
   ): Promise<void> {
     const exchangeProfile: ExchangeProfile = {
       exchange,
-      key,
-      secret,
+      authType,
+      ...credentials
     };
 
     let currentProfile: Profile;
@@ -100,9 +107,10 @@ export class ConfigManager {
       throw new AppError(ErrorType.DELETE_PROFILE_FAILED);
     }
   }
+
   async getExchangeCredentials(
     exchange: string
-  ): Promise<{ key: string; secret: string }> {
+  ): Promise<{ key?: string; secret?: string; privateKey?: string; walletAddress?: string; authType: ExchangeAuthType }> {
     if (await this.hasProfile()) {
       const profile = await this.getProfile();
       const savedExchange = profile.exchanges.find(
@@ -114,6 +122,9 @@ export class ConfigManager {
         return {
           key: savedExchange.key,
           secret: savedExchange.secret,
+          privateKey: savedExchange.privateKey,
+          walletAddress: savedExchange.walletAddress,
+          authType: savedExchange.authType
         };
       } else {
         throw new AppError(ErrorType.EXCHANGE_NOT_FOUND);

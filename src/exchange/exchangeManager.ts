@@ -46,10 +46,17 @@ export class ExchangeManager {
       supportedExchanges
     );
 
-    const key = await this.userInterface.addExchangeCredentials('key');
-    const secret = await this.userInterface.addExchangeCredentials('secret');
+    // Check if the selected exchange is Hyperliquid
+    if (selectedExchange.toLowerCase() === 'hyperliquid') {
+      const privateKey = await this.userInterface.addExchangeCredentials('privateKey', selectedExchange);
+      const walletAddress = await this.userInterface.addExchangeCredentials('walletAddress', selectedExchange);
+      await this.configManager.addExchange(selectedExchange, 'privateKey', { privateKey, walletAddress });
+    } else {
+      const key = await this.userInterface.addExchangeCredentials('key', selectedExchange);
+      const secret = await this.userInterface.addExchangeCredentials('secret', selectedExchange);
+      await this.configManager.addExchange(selectedExchange, 'apiKey', { key, secret });
+    }
 
-    await this.configManager.addExchange(selectedExchange, key, secret);
     console.log(`${selectedExchange} added successfully.`);
   }
 
