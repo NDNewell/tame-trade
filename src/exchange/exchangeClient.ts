@@ -597,10 +597,24 @@ export class ExchangeClient {
 
   async cancelAllLimitOrders(symbol: string): Promise<void> {
     try {
-      // Fetch open orders for the given symbol/market
-      const openOrders = await this.exchange!.fetchOpenOrders(symbol);
+      // Get public wallet address from exchange config for Hyperliquid
+      const walletAddress = this.exchange?.id === 'hyperliquid' ?
+        (this.exchange as any).publicAddress || (this.exchange as any).walletAddress : undefined;
+
+      // Fetch open orders with wallet address for Hyperliquid
+      const openOrders = await this.exchange!.fetchOpenOrders(symbol, undefined, undefined,
+        walletAddress ? { 'user': walletAddress } : undefined);
+
       // Filter orders to obtain only limit orders
-      const limitOrders = openOrders.filter((order) => order.type === 'limit');
+      const limitOrders = openOrders.filter((order) => {
+        // For Hyperliquid, check both standard limit orders and Hyperliquid's specific limit order types
+        if (this.exchange!.id === 'hyperliquid') {
+          return order.type === 'limit' ||
+                 (order.info && order.info.orderType === 'Limit') ||
+                 (order.info && order.info.orderType === 'LimitOrder');
+        }
+        return order.type === 'limit';
+      });
 
       // If there are no limit orders, simply return without doing anything further
       if (limitOrders.length === 0) {
@@ -615,35 +629,52 @@ export class ExchangeClient {
       // Wait for all cancellations to complete
       await Promise.all(cancelPromises);
     } catch (error) {
-      // Log the error instead of throwing it
       console.error('Error cancelling limit orders:', error);
     }
   }
 
   async cancelAllStopOrders(symbol: string): Promise<void> {
     try {
-        let stopOrders = [];
-        const openOrders = await this.exchange!.fetchOpenOrders(symbol);
+      // Get public wallet address from exchange config for Hyperliquid
+      const walletAddress = this.exchange?.id === 'hyperliquid' ?
+        (this.exchange as any).publicAddress || (this.exchange as any).walletAddress : undefined;
+
+      // For Hyperliquid, we need to use the public wallet address to fetch orders
+      const params = walletAddress ? { 'user': walletAddress } : undefined;
+
+      // Fetch open orders with wallet address for Hyperliquid
+      const openOrders = await this.exchange!.fetchOpenOrders(symbol, undefined, undefined, params);
+
+      let stopOrders = [];
+
+      // For Hyperliquid, check for both standard stop orders and Hyperliquid's specific stop order types
+      if (this.exchange!.id === 'hyperliquid') {
         stopOrders = openOrders.filter(
-            (order) => order.info?.order_type === 'stop_market'
+          (order) => {
+            return order.type === 'stop' ||
+                   order.info?.orderType === 'Stop Limit' ||
+                   order.info?.orderType === 'Trigger' ||
+                   order.info?.orderType === 'StopMarket' ||
+                   (order.info?.isTrigger === true);
+          }
         );
-        if (stopOrders.length === 0) {
-            stopOrders = openOrders.filter(
-                (order) => order.type && order.type.toLowerCase() === 'stop'
-            );
-        }
-        if (stopOrders.length > 0) {
-            const cancelPromises = stopOrders.map((order) =>
-                this.exchange!.cancelOrder(order.id, symbol)
-            );
-            await Promise.all(cancelPromises);
-        } else {
-            console.log('No open stop orders to cancel.');
-            return;  // Use return to gracefully exit without throwing an error.
-        }
+      } else {
+        // For other exchanges, use standard stop order detection
+        stopOrders = openOrders.filter(
+          (order) =>
+            order.type === 'stop' ||
+            order.info?.order_type === 'stop_market'
+        );
+      }
+
+      if (stopOrders.length > 0) {
+        const cancelPromises = stopOrders.map((order) =>
+          this.exchange!.cancelOrder(order.id, symbol, params)
+        );
+        await Promise.all(cancelPromises);
+      }
     } catch (error) {
-        // Instead of throwing an error, log it and handle it gracefully.
-        console.error('Error cancelling stop orders:', error);
+      console.error('Error cancelling stop orders:', error);
     }
   }
 
