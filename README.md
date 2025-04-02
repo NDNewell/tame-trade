@@ -10,6 +10,26 @@ Run `yarn build` to compile the TypeScript code.
 Usage
 Run `yarn start` to start the application. Follow the prompts to enter your API keys with trading, futures, and read permissions enabled. The API keys and configuration data will be stored locally in the `.tame/config.json` file located in your home directory.
 
+### Development Mode
+
+For development with hot-reload capability, use:
+
+`yarn dev`
+
+This starts the application in development mode with file watching. The app will automatically restart whenever you make changes to any `.ts`, `.js`, or `.json` files in the source directory. The watcher includes a 1-second debounce to prevent multiple rapid restarts when saving multiple files.
+
+For faster development without password authentication:
+
+`yarn dev:np`
+
+This runs the app in development mode while skipping the password verification step.
+
+Development mode features:
+- Automatic restart when files change, with debounce to prevent rapid restarts
+- State preservation between restarts (preserves current exchange and market)
+- Password authentication can be skipped with the `-np` flag
+- Clear indication when running in development mode
+
 ### Fatfinger
 
 Set a fatfinger value (maximum individual order size) by typing fatfinger followed by the amount. For example:

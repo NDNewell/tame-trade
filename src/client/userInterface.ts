@@ -8,6 +8,7 @@ import clear from 'console-clear';
 import { formatOutput as fo } from '../utils/formatOutput.js';
 import { ExchangeProfile } from '../config/configManager.js';
 import { ExchangeCommand, OrderType } from '../commands/exchangeCommand.js';
+import { StateManager } from '../config/stateManager.js';
 
 export class UserInterface {
   private currentMarket: string;
@@ -16,21 +17,38 @@ export class UserInterface {
   private chaseOrderId: string | undefined;
   private lastPositionSize: number | null = null;
   private entryPrice: number | null = null;
+  private stateManager: StateManager;
+  private isDevMode: boolean;
 
   constructor() {
     this.exchangeCommand = new ExchangeCommand();
     this.currentMarket = '';
     this.availableMarkets = [];
     this.chaseOrderId = '';
+    this.stateManager = StateManager.getInstance();
+    this.isDevMode = process.env.NODE_ENV === 'development';
     inquirer.registerPrompt('autocomplete', autocomplete);
-    inquirer.registerPrompt('inquirer-expanded', InquirerExpanded);
+    inquirer.registerPrompt('inquirer-expanded', InquirerExpanded as any);
+  }
+
+  // Save current application state for dev mode
+  private async saveDevState(): Promise<void> {
+    if (this.isDevMode) {
+      const currentExchange = this.exchangeCommand.getExchangeClient().getSelectedExchangeName();
+      await this.stateManager.saveState({
+        currentExchange: currentExchange || undefined,
+        currentMarket: this.currentMarket || undefined,
+        isDevMode: true,
+        isReload: true // Mark that next start will be a reload
+      });
+    }
   }
 
   async displayWelcomeScreen(): Promise<void> {
     console.log(`${fo('Welcome to Tame!', 'yellow', 'bold')}`);
     console.log(
       `${fo(
-        "In trading, speed, execution, and emotional control are crucial to success. With Tame, you'll be able to access powerful trading commands and custom shortcuts that will allow you to execute trades faster and more efficiently.\n\nOur emotions can often get in the way of rational decision-making, which is why Tame has guardrails to help you stay on track and avoid impulsive trades. Tame will hopefully teach you how to recognize and regulate your emotions, so you can make sound trading decisions while also maximizing your gains.\n\nNow, go be a ruthless predator, and trade with speed, precision, and confidence!",
+        "Tame helps you trade faster and more efficiently with powerful commands and shortcuts. The built-in guardrails prevent impulsive trades and help you stay focused.\n\nTrade with speed, precision, and confidence!",
         'yellow'
       )}`
     );
@@ -158,6 +176,22 @@ export class UserInterface {
   async startTradingInterface(): Promise<void> {
     this.availableMarkets =
       (await this.exchangeCommand.getExchangeClient().getMarketSymbols()) || [];
+
+    // Load saved state if in dev mode and this is a reload
+    if (this.isDevMode) {
+      const state = await this.stateManager.loadState();
+      if (state.isDevMode && state.isReload && state.currentMarket &&
+          this.availableMarkets.includes(state.currentMarket)) {
+        this.currentMarket = state.currentMarket;
+        console.log(`[Dev] Restored previous market: ${this.currentMarket}`);
+
+        // Reset the reload flag for next time
+        await this.stateManager.saveState({
+          ...state,
+          isReload: false
+        });
+      }
+    }
 
     this.promptForCommand();
   }
@@ -299,6 +333,9 @@ export class UserInterface {
       if (this.availableMarkets.includes(market)) {
         this.currentMarket = market;
         console.log(`Switched to market: ${market}`);
+
+        // Save state for dev mode
+        await this.saveDevState();
       } else {
         console.log(`Invalid market: ${market}`);
       }
@@ -325,6 +362,11 @@ export class UserInterface {
     } else if (command === 'list markets') {
       const marketType = await this.selectMarketType();
       this.currentMarket = await this.selectMarketByType(marketType);
+
+      // Save state for dev mode
+      if (this.currentMarket && this.currentMarket !== 'back') {
+        await this.saveDevState();
+      }
     } else if (command === 'get market structure') {
       if (this.currentMarket.length > 0) {
         this.exchangeCommand
@@ -333,8 +375,6 @@ export class UserInterface {
       } else {
         console.log('No market selected. Please select a market first.');
       }
-    } else if (command === 'quit' || command === 'q') {
-      this.quit();
     } else if (command === 'cancel all') {
       if (this.currentMarket) {
         try {
@@ -684,40 +724,47 @@ export class UserInterface {
       } catch (error: unknown) {
           console.log((error as Error).message);
       }
-  } else {
-      if (this.currentMarket) {
-        try {
-          const commandParams = await OrderType.parseCommand(command);
-          if (commandParams !== null) {
-            const { type, quantity, price } = commandParams;
+    } else if (this.currentMarket) {
+      try {
+        const commandParams = await OrderType.parseCommand(command);
+        if (commandParams !== null) {
+          const { type, quantity, price } = commandParams;
 
-            if (
-              type === OrderType.MARKET_BUY ||
-              type === OrderType.MARKET_SELL
-            ) {
-              await this.exchangeCommand.execute(type, this.currentMarket, {
-                quantity: Number(quantity),
-              });
-            } else if (
-              type === OrderType.STOP ||
-              type === OrderType.LIMIT_BUY ||
-              type === OrderType.LIMIT_SELL
-            ) {
-              await this.exchangeCommand.execute(type, this.currentMarket, {
-                price: Number(price),
-                ...(quantity !== undefined
-                  ? { quantity: Number(quantity) }
-                  : {}),
-              });
-            }
+          if (
+            type === OrderType.MARKET_BUY ||
+            type === OrderType.MARKET_SELL
+          ) {
+            await this.exchangeCommand.execute(type, this.currentMarket, {
+              quantity: Number(quantity),
+            });
+          } else if (
+            type === OrderType.STOP ||
+            type === OrderType.LIMIT_BUY ||
+            type === OrderType.LIMIT_SELL
+          ) {
+            await this.exchangeCommand.execute(type, this.currentMarket, {
+              price: Number(price),
+              ...(quantity !== undefined
+                ? { quantity: Number(quantity) }
+                : {}),
+            });
           }
-        } catch (error: unknown) {
-          console.log((error as Error).message);
         }
-      } else {
-        console.log('No market selected. Please select a market first.');
+      } catch (error: unknown) {
+        console.log((error as Error).message);
       }
+    } else {
+      console.log('No market selected. Please select a market first.');
     }
+
+    if (command === 'quit' || command === 'q') {
+      // Clear dev state before quitting
+      if (this.isDevMode) {
+        await this.stateManager.clearState();
+      }
+      this.quit();
+    }
+
     this.promptForCommand();
   }
 
@@ -801,6 +848,9 @@ export class UserInterface {
 
   quit() {
     console.log('Exiting...');
-    process.exit(0);
+    // Give time for readline to clean up
+    setTimeout(() => {
+      process.exit(0);
+    }, 50);
   }
 }

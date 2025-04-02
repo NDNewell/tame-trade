@@ -1,17 +1,25 @@
 // src/auth/index.ts
 
-import { ConfigManager } from "../config/configManager";
+import { ConfigManager } from "../config/configManager.js";
 import * as bcrypt from "bcrypt";
 import inquirer from "inquirer";
 
 export class AuthManager {
   private configManager: ConfigManager;
+  private skipPasswordAuth: boolean;
 
   constructor() {
     this.configManager = new ConfigManager();
+    this.skipPasswordAuth = process.env.SKIP_PASSWORD_AUTH === 'true';
   }
 
   async verifyPassword(): Promise<boolean> {
+    // Skip password verification in development mode if flag is set
+    if (this.skipPasswordAuth) {
+      // Don't log anything here - already logged in startup
+      return true;
+    }
+
     const storedPasswordHash = await this.configManager.getPasswordHash();
     let attempts = 0;
     let passwordCorrect = false;
@@ -44,6 +52,18 @@ export class AuthManager {
   }
 
   async createPassword(): Promise<void> {
+    // In development mode with skip flag, create a simple placeholder password
+    if (this.skipPasswordAuth) {
+      // Don't log anything here - already logged in verifyPassword
+      const passwordHash = await bcrypt.hash("devpassword", 10);
+
+      const currentProfile = await this.configManager.getProfile();
+      currentProfile.passwordHash = passwordHash;
+
+      await this.configManager.updateProfile(currentProfile);
+      return;
+    }
+
     const { password } = await inquirer.prompt([
       {
         type: "password",

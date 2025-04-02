@@ -5,7 +5,9 @@
   "main": "src/index.ts",
   "type": "module",
   "scripts": {
-    "start": "tsx src/index.ts"
+    "start": "tsx src/index.ts",
+    "dev": "node reload.cjs",
+    "dev:np": "node reload.cjs -np"
   },
   "author": "Nicholas Newell",
   "license": "ISC",

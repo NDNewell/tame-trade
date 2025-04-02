@@ -5,6 +5,7 @@ import { AuthManager } from '../auth/authManager.js';
 import { UserInterface } from './userInterface.js';
 import { ExchangeManager } from '../exchange/exchangeManager.js';
 import { ExchangeClient } from '../exchange/exchangeClient.js';
+import { StateManager } from '../config/stateManager.js';
 
 export class Client {
   private configManager: ConfigManager;
@@ -12,6 +13,8 @@ export class Client {
   private userInterface: UserInterface;
   private exchangeManager: ExchangeManager;
   private exchangeClient: ExchangeClient;
+  private stateManager: StateManager;
+  private isDevMode: boolean;
 
   constructor() {
     this.configManager = new ConfigManager();
@@ -19,11 +22,30 @@ export class Client {
     this.authManager = new AuthManager();
     this.userInterface = new UserInterface();
     this.exchangeClient = ExchangeClient.getInstance();
+    this.stateManager = StateManager.getInstance();
+    this.isDevMode = process.env.NODE_ENV === 'development';
   }
 
   async start() {
     console.log('Client initialized');
     this.exchangeClient.init();
+
+    // In dev mode, check if we have a saved state from a previous session that was reloaded
+    if (this.isDevMode) {
+      const state = await this.stateManager.loadState();
+      // Check for reload flag - simpler check to ensure it works
+      if (state.isReload === true) {
+        console.log(`Resuming previous session...`);
+
+        // Skip the menu and go directly to trading interface
+        if (state.currentExchange) {
+          await this.exchangeClient.setExchange(state.currentExchange);
+          await this.userInterface.startTradingInterface();
+          return;
+        }
+      }
+    }
+
     if (await this.configManager.hasProfile()) {
       const passwordCorrect = await this.authManager.verifyPassword();
       if (!passwordCorrect) {
@@ -84,17 +106,30 @@ export class Client {
   async startSession(): Promise<void> {
     console.log('Starting trading session...');
 
-    let addedExchanges = await this.exchangeManager.getAddedExchanges();
     let selectedExchange = '';
 
-    if (addedExchanges.length === 0) {
-      console.log('No exchanges available. Please add an exchange first.');
-      await this.exchangeManager.addExchange();
-      selectedExchange = addedExchanges[0];
-    } else if (addedExchanges.length === 1) {
-      selectedExchange = addedExchanges[0];
-    } else {
-      selectedExchange = await this.exchangeManager.selectSavedExchange();
+    // In dev mode, check for saved exchange in state
+    if (this.isDevMode) {
+      const state = await this.stateManager.loadState();
+      if (state.isReload === true && state.currentExchange) {
+        selectedExchange = state.currentExchange;
+        console.log(`Restoring exchange: ${selectedExchange}`);
+      }
+    }
+
+    // If no saved exchange in dev mode, proceed with normal selection
+    if (!selectedExchange) {
+      let addedExchanges = await this.exchangeManager.getAddedExchanges();
+
+      if (addedExchanges.length === 0) {
+        console.log('No exchanges available. Please add an exchange first.');
+        await this.exchangeManager.addExchange();
+        selectedExchange = addedExchanges[0];
+      } else if (addedExchanges.length === 1) {
+        selectedExchange = addedExchanges[0];
+      } else {
+        selectedExchange = await this.exchangeManager.selectSavedExchange();
+      }
     }
 
     if (!selectedExchange) {
@@ -105,6 +140,4 @@ export class Client {
 
     this.userInterface.startTradingInterface();
   }
-
-  async addExchange(): Promise<void> {}
 }
