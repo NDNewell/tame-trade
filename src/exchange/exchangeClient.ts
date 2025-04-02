@@ -864,12 +864,30 @@ export class ExchangeClient {
       }
 
       if (quantity > 0) {
-        await this.executeOrder(
-          'createMarketOrder',
-          market,
-          side,
-          await this.getQuantityPrecision(market, quantity)
-        );
+        // Special handling for Hyperliquid market orders
+        if (this.exchange.id === 'hyperliquid') {
+          // Get current market price
+          const ticker = await this.exchange.fetchTicker(market);
+          const currentPrice = ticker.last || 0;
+
+          // Add a buffer to ensure the order executes immediately
+          const adjustedPrice = side === 'buy' ? currentPrice * 1.05 : currentPrice * 0.95;
+
+          // Create a limit order that behaves like a market order
+          await this.executeOrder(
+            side === 'buy' ? 'createLimitBuyOrder' : 'createLimitSellOrder',
+            market,
+            await this.getQuantityPrecision(market, quantity),
+            adjustedPrice
+          );
+        } else {
+          await this.executeOrder(
+            'createMarketOrder',
+            market,
+            side,
+            await this.getQuantityPrecision(market, quantity)
+          );
+        }
       } else {
         console.error(`[ExchangeClient] No positions found for ${market}.`);
       }
