@@ -50,7 +50,12 @@ export class ExchangeManager {
     if (selectedExchange.toLowerCase() === 'hyperliquid') {
       const privateKey = await this.userInterface.addExchangeCredentials('privateKey', selectedExchange);
       const walletAddress = await this.userInterface.addExchangeCredentials('walletAddress', selectedExchange);
-      await this.configManager.addExchange(selectedExchange, 'privateKey', { privateKey, walletAddress });
+      const publicAddress = await this.userInterface.addExchangeCredentials('publicAddress', selectedExchange);
+      await this.configManager.addExchange(selectedExchange, 'privateKey', {
+        privateKey,
+        walletAddress,
+        publicAddress
+      });
     } else {
       const key = await this.userInterface.addExchangeCredentials('key', selectedExchange);
       const secret = await this.userInterface.addExchangeCredentials('secret', selectedExchange);

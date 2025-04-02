@@ -17,6 +17,7 @@ export interface ExchangeProfile {
   // For private key based exchanges (like Hyperliquid)
   privateKey?: string;
   walletAddress?: string;
+  publicAddress?: string;
 }
 
 export interface Profile {
@@ -110,7 +111,7 @@ export class ConfigManager {
 
   async getExchangeCredentials(
     exchange: string
-  ): Promise<{ key?: string; secret?: string; privateKey?: string; walletAddress?: string; authType: ExchangeAuthType }> {
+  ): Promise<{ key?: string; secret?: string; privateKey?: string; walletAddress?: string; publicAddress?: string; authType: ExchangeAuthType }> {
     if (await this.hasProfile()) {
       const profile = await this.getProfile();
       const savedExchange = profile.exchanges.find(
@@ -124,6 +125,7 @@ export class ConfigManager {
           secret: savedExchange.secret,
           privateKey: savedExchange.privateKey,
           walletAddress: savedExchange.walletAddress,
+          publicAddress: savedExchange.publicAddress,
           authType: savedExchange.authType
         };
       } else {

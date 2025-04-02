@@ -10,11 +10,12 @@ import { exchangeParams } from './exchangeParams.js';
 import { parse } from 'path';
 import readline from 'readline';
 
+// Define a more flexible Position interface to handle ccxt's types
 interface Position {
   symbol: string;
   contracts?: number | undefined;
   notional?: number | undefined;
-  side: string;
+  side: string | any; // Use any to accommodate ccxt's Str type
   entryPrice?: number;
 }
 
@@ -122,7 +123,7 @@ export class ExchangeClient {
 
   getMarketStructure(market: string): void {
     const marketStructure = Object.values(this.availableMarkets!).filter(
-      (marketObj) => marketObj.symbol === market
+      (marketObj) => marketObj?.symbol === market
     )[0];
     console.log(marketStructure);
   }
@@ -160,6 +161,7 @@ export class ExchangeClient {
       }
       exchangeConfig.privateKey = credentials.privateKey;
       exchangeConfig.walletAddress = credentials.walletAddress;
+      exchangeConfig.publicAddress = credentials.publicAddress || credentials.walletAddress;
       exchangeConfig.options.defaultSlippage = 0.05;
     } else {
       if (!credentials.key || !credentials.secret) {
@@ -183,7 +185,7 @@ export class ExchangeClient {
     const availableTypes = new Set<string>();
     if (this.availableMarkets !== null) {
       Object.values(this.availableMarkets).forEach((market) => {
-        if (market.type) {
+        if (market?.type) {
           availableTypes.add(market.type);
         }
       });
@@ -206,7 +208,7 @@ export class ExchangeClient {
   }
 
   getSelectedExchangeName(): string | null {
-    return this.exchange ? this.exchange.name : null;
+    return this.exchange ? String(this.exchange.name ?? '') : null;
   }
 
   async getMarketSymbols(): Promise<Array<string>> {
@@ -237,7 +239,7 @@ export class ExchangeClient {
 
     if (this.availableMarkets !== null) {
       return Object.keys(this.availableMarkets).filter(
-        (symbol) => this.availableMarkets![symbol].type === type
+        (symbol) => this.availableMarkets![symbol]?.type === type
       );
     } else {
       console.error(
@@ -279,9 +281,12 @@ export class ExchangeClient {
     quantity: number
   ): Promise<number> {
     const marketInfo = this.availableMarkets![market];
-    const minTradeAmount = marketInfo.precision.amount;
+    if (!marketInfo) {
+      throw new Error(`Market ${market} not found.`);
+    }
+    const minTradeAmount = marketInfo.precision?.amount ?? 0;
 
-    if (quantity < minTradeAmount!) {
+    if (quantity < minTradeAmount) {
       throw new Error(`Minimum order size for ${market} is ${minTradeAmount}`);
     } else {
       return quantity;
@@ -386,6 +391,124 @@ export class ExchangeClient {
     }
 
     try {
+      // Special handling for Hyperliquid
+      if (this.exchange.id === 'hyperliquid') {
+        // Get the public wallet address from the exchange configuration for queries
+        const walletAddress = (this.exchange as any).publicAddress || (this.exchange as any).walletAddress;
+
+        if (!walletAddress) {
+          console.error(`[ExchangeClient] Wallet address not found in exchange configuration`);
+          return positionStructure;
+        }
+
+        // Generate different symbol formats to try - for Hyperliquid the format is different
+        const baseSymbol = symbol.split('/')[0]; // Get the base, e.g. "SOL" from "SOL/USDC:USDC"
+        const symbolVariations = [
+          baseSymbol,           // Just the base: SOL
+          symbol,               // Original format: SOL/USDC:USDC
+          `${baseSymbol}-USD`,  // SOL-USD
+          `${baseSymbol}/USD`,  // SOL/USD
+          `${baseSymbol}USD`,   // SOLUSD
+        ];
+
+        // Helper function to check if position has real data
+        const isValidPosition = (pos: any): boolean => {
+          if (!pos) return false;
+
+          // Check if it's an empty object
+          if (Object.keys(pos).length === 0) return false;
+
+          // Check if it has essential position properties
+          if (!pos.symbol) return false;
+
+          // If we have contracts, side, or entryPrice, it's likely valid
+          if (pos.contracts !== undefined && pos.contracts !== 0) return true;
+          if (pos.side && pos.side !== '') return true;
+          if (pos.entryPrice) return true;
+
+          return false;
+        };
+
+        try {
+          // Try to fetch account balance for this user which might include position info
+          try {
+            const balanceParams = { 'user': walletAddress };
+            const balance = await this.exchange.fetchBalance(balanceParams);
+
+            // Check if there's position info in the balance
+            if (balance && balance.info && balance.info.positions) {
+              const positions = balance.info.positions;
+              for (const pos of positions) {
+                const posCoin = String(pos.coin || '').toLowerCase();
+                const baseSymbolLower = baseSymbol.toLowerCase();
+
+                if (posCoin === baseSymbolLower) {
+                  // Convert to our Position structure
+                  positionStructure = {
+                    symbol: baseSymbol,
+                    contracts: Number(pos.szi || 0),
+                    notional: Number(pos.notional || 0),
+                    side: Number(pos.szi || 0) > 0 ? 'long' : (Number(pos.szi || 0) < 0 ? 'short' : ''),
+                    entryPrice: Number(pos.entryPx || 0)
+                  };
+
+                  return positionStructure;
+                }
+              }
+            }
+          } catch (error) {
+            console.error(`[ExchangeClient] Error fetching balance:`, (error as Error).message);
+          }
+
+          // First try the direct fetchPosition method with each symbol variation
+          for (const symVar of symbolVariations) {
+            try {
+              const params = { 'user': walletAddress };
+              const position = await this.exchange.fetchPosition(symVar, params);
+
+              if (position && isValidPosition(position)) {
+                return position;
+              }
+            } catch (error) {
+              // Suppress individual symbol errors
+            }
+          }
+
+          // If direct fetching fails, try fetchPositions which gets all positions
+          try {
+            const params = { 'user': walletAddress };
+            const positions = await this.exchange.fetchPositions(undefined, params);
+
+            if (positions && positions.length > 0) {
+              // Try to match by symbol
+              const baseSymbolLower = baseSymbol.toLowerCase();
+              for (const position of positions) {
+                const posSymbol = String(position.symbol || '').toLowerCase();
+
+                if (posSymbol.includes(baseSymbolLower) && isValidPosition(position)) {
+                  return position;
+                }
+              }
+
+              // If we got here but have positions, check if any are valid to return as fallback
+              for (const position of positions) {
+                if (isValidPosition(position)) {
+                  return position;
+                }
+              }
+            }
+          } catch (error) {
+            console.error(`[ExchangeClient] Error fetching positions:`, (error as Error).message);
+          }
+        } catch (error) {
+          console.error(`[ExchangeClient] Error with wallet address ${walletAddress}:`, (error as Error).message);
+        }
+
+        console.log(`[ExchangeClient] No valid positions found for ${symbol}`);
+        return positionStructure;
+      }
+
+      // Standard handling for other exchanges
       positionStructure = await this.exchange.fetchPosition(symbol);
       return positionStructure;
     } catch (error) {
@@ -443,7 +566,7 @@ export class ExchangeClient {
 
     // Filter out stop orders
     const filteredOrders = orders.filter(
-      (order) => order.type.toLowerCase() !== 'stop'
+      (order) => order.type?.toLowerCase() !== 'stop'
     );
 
     // Sort orders by price depending on the direction
@@ -502,11 +625,11 @@ export class ExchangeClient {
         let stopOrders = [];
         const openOrders = await this.exchange!.fetchOpenOrders(symbol);
         stopOrders = openOrders.filter(
-            (order) => order.info.order_type === 'stop_market'
+            (order) => order.info?.order_type === 'stop_market'
         );
         if (stopOrders.length === 0) {
             stopOrders = openOrders.filter(
-                (order) => order.type!.toLowerCase() === 'stop'
+                (order) => order.type && order.type.toLowerCase() === 'stop'
             );
         }
         if (stopOrders.length > 0) {
@@ -663,7 +786,7 @@ export class ExchangeClient {
         order.id,
         symbol,
         orderType,
-        order.side,
+        String(order.side ?? ''),
         quantity,
         price
       );
@@ -680,7 +803,7 @@ export class ExchangeClient {
 
       if (openOrders.length > 0) {
         for (const order of openOrders) {
-          const orderType = order.type.toLowerCase();
+          const orderType = order.type?.toLowerCase() ?? '';
           let params;
           let newPrice;
 
@@ -700,7 +823,7 @@ export class ExchangeClient {
             order.id,
             symbol,
             orderType,
-            order.side,
+            String(order.side ?? ''),
             order.amount,
             newPrice,
             params ? params : {}
@@ -730,7 +853,9 @@ export class ExchangeClient {
         console.error('Position is not defined');
         return;
       }
-      const side = position.side === 'long' ? 'sell' : 'buy';
+      // Safely check position side - convert to string and compare
+      const positionSide = String(position.side || '');
+      const side = positionSide === 'long' ? 'sell' : 'buy';
 
       if (typeof position.contracts === 'number') {
         quantity = Math.abs(position.contracts);
@@ -1012,7 +1137,7 @@ export class ExchangeClient {
             stopOrder.id,
             symbol,
             'stop',
-            stopOrder.side,
+            String(stopOrder.side ?? ''),
             stopOrder.amount,
             newStopPrice,
             params ? params : {}
@@ -1031,13 +1156,34 @@ export class ExchangeClient {
   ): Promise<void> {
     try {
       let side;
-      const openOrders = await this.exchange!.fetchOpenOrders(market);
-      const limitOrders = openOrders.filter((order) => order.type === 'limit');
+
+      // Get public wallet address from exchange config for Hyperliquid
+      const walletAddress = this.exchange?.id === 'hyperliquid' ?
+        (this.exchange as any).publicAddress || (this.exchange as any).walletAddress : undefined;
+
+      // Fetch open orders
+      const openOrders = await this.exchange!.fetchOpenOrders(market, undefined, undefined,
+        walletAddress ? { 'user': walletAddress } : undefined);
+
+      // Filter to only include limit orders, excluding stop/market orders
+      const limitOrders = openOrders?.filter((order) => {
+        // Check if it's a limit order (not market, stop, etc.)
+        const isLimit = order.type === 'limit' || (order.info && order.info.orderType === 'Limit');
+
+        // For Hyperliquid, also check that it's not a stop order (which might be market type)
+        const isNotStop = !(order.type === 'market' ||
+                          (order.info &&
+                          (order.info.orderType === 'Trigger' ||
+                           order.info.orderType === 'StopMarket')));
+
+        return isLimit && isNotStop;
+      });
 
       // If no quantity is provided, calculate the quantity based on open orders and position size
       if (!quantity) {
         // Get the position size for the given market
-        quantity = await this.getPositionSize(market);
+        const position = await this.getPositionStructure(market);
+        const positionSize = position?.contracts ?? 0;
 
         // Calculate the total quantity of open limit orders
         const openOrdersQuantity = limitOrders.reduce((acc, order) => {
@@ -1045,6 +1191,7 @@ export class ExchangeClient {
         }, 0);
 
         // Add the open limit orders quantity to the calculated position size
+        quantity = positionSize;
         if (openOrdersQuantity > 0) {
           quantity += openOrdersQuantity;
         }
@@ -1095,6 +1242,11 @@ export class ExchangeClient {
         if (this.exchange!.id === 'hyperliquid') {
           // Add any specific parameters needed for Hyperliquid stop orders
           params.trigger = 'ByLastPrice'; // Assuming this is the default trigger type for Hyperliquid
+
+          // Add the wallet address parameter for Hyperliquid if available
+          if (walletAddress) {
+            params.user = walletAddress;
+          }
         }
 
         // If the reduce-only feature is supported by the exchange, add the corresponding property to the parameters object
@@ -1115,6 +1267,8 @@ export class ExchangeClient {
           price,
           params
         );
+
+        console.log(`Stop order placed at ${price} for ${quantity} ${market}`);
       } else {
         // If there's no position found, log an error message and return
         console.error(
@@ -1130,7 +1284,7 @@ export class ExchangeClient {
   async updateStopOrder(market: string, newAmount?: number): Promise<void> {
     try {
         const openOrders = await this.exchange?.fetchOpenOrders(market);
-        const stopOrders = openOrders?.filter(order => order.type.toLowerCase().includes('stop'));
+        const stopOrders = openOrders?.filter(order => order.type?.toLowerCase()?.includes('stop'));
         if (stopOrders?.length === 0) {
           throw new Error('No active stop orders found.');
         } else if ((stopOrders?.length ?? 0) > 1) {
@@ -1186,7 +1340,7 @@ export class ExchangeClient {
     }
 
     try {
-      const serverTime = await this.exchange.fetchTime();
+      const serverTime = await this.exchange.fetchTime() ?? 0;
       const localTime = Date.now();
       const timeDifference = serverTime - localTime;
 

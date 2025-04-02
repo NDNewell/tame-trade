@@ -126,7 +126,9 @@ export class UserInterface {
       if (credential === 'privateKey') {
         message = 'Enter your Private Key:';
       } else if (credential === 'walletAddress') {
-        message = 'Enter your Wallet Address:';
+        message = 'Enter your API Wallet Address:';
+      } else if (credential === 'publicAddress') {
+        message = 'Enter your Public Wallet Address for queries (needed to view your positions):';
       } else {
         // Skip other credential types for Hyperliquid
         return '';
