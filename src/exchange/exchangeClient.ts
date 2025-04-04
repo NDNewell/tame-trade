@@ -1160,7 +1160,24 @@ export class ExchangeClient {
         );
         return;
     }
+
+    // --- Hyperliquid Handling ---
+    if (this.getExchangeId() === 'hyperliquid') {
+        try {
+            // For Hyperliquid, use the cancel/replace strategy via updateStopOrder
+            // Capture and return the new order ID from updateStopOrder
+            const newOrderId = await this.updateStopOrder(symbol, undefined, newStopPrice);
+            return newOrderId;
+        } catch (error) {
+            console.error(`[ExchangeClient] Failed to update stop order for Hyperliquid via editCurrentStopOrder:`, error);
+            // Re-throw or return undefined based on desired error handling
+            throw error;
+        }
+    }
+
+    // --- Original Logic for Other Exchanges ---
     try {
+        // Original fetch without params - might need adjustment if other exchanges require user context here too
         const openOrders = await this.exchange.fetchOpenOrders(symbol);
         const stopOrder = openOrders.find(
             (order) => (order as any).type.toLowerCase() === 'stop'
@@ -1241,7 +1258,7 @@ export class ExchangeClient {
     price: number,
     quantity?: number,
     suppressLog?: boolean
-  ): Promise<void> {
+  ): Promise<Order | undefined> {
     try {
       let side;
 
@@ -1329,8 +1346,8 @@ export class ExchangeClient {
         // Adjust the quantity to match the exchange's precision requirements
         quantity = await this.getQuantityPrecision(market, quantity);
 
-        // Execute the stop order with the provided details
-        await this.executeOrder(
+        // Execute the stop order and get the created order object
+        const createdOrder = await this.executeOrder(
           'createOrder',
           market,
           orderType,
@@ -1344,16 +1361,20 @@ export class ExchangeClient {
         if (!suppressLog) {
             console.log(`Stop order placed at ${price} for ${quantity} ${market}`);
         }
+
+        // Return the created order object
+        return createdOrder;
       } else {
-        // If there's no position found, log an error message and return
+        // If there's no position found, log an error message and return undefined
         console.error(
-          `[ExchangeClient] No positions found for ${market}. Please open a position before placing a stop order.`
+          `[ExchangeClient] No positions or open orders found to determine quantity/side for market ${market}. Cannot create stop order.`
         );
-        return;
+        return undefined; // Return undefined if order not created
       }
     } catch (error) {
       // If any errors occur during the process, log the error message
       console.error(`[ExchangeClient] Failed to place order:`, error);
+      return undefined; // Return undefined on error
     }
   }
 
@@ -1361,10 +1382,11 @@ export class ExchangeClient {
     market: string,
     newAmount?: number,
     newStopPrice?: number
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     if (!this.exchange) {
       throw new Error('Exchange not initialized');
     }
+    let newOrderId: string | undefined = undefined;
 
     try {
       let params: Record<string, any> = {};
@@ -1453,9 +1475,9 @@ export class ExchangeClient {
           // 1. Cancel the existing order
           await this.exchange.cancelOrder(stopOrder.id, market, cancelReplaceParams);
 
-          // 2. Create a new stop order with the new amount and correct price
-          // Pass suppressLog = true to prevent duplicate logging
-          await this.createStopOrder(market, finalStopPrice, finalAmount, true);
+          // 2. Create a new stop order and capture the result
+          const newOrder = await this.createStopOrder(market, finalStopPrice, finalAmount, true);
+          newOrderId = newOrder?.id; // Store the new order ID
 
       } catch (replaceError) {
           console.error(`[ExchangeClient] Error during cancel/replace:`, replaceError);
@@ -1472,6 +1494,7 @@ export class ExchangeClient {
              throw error;
         }
     }
+    return newOrderId; // Return the ID of the new order (or undefined)
   }
 
   async synchronizeTimeWithExchange() {
@@ -1506,5 +1529,10 @@ export class ExchangeClient {
     } catch (error) {
       console.error(`[ExchangeClient] Failed to synchronize time with exchange:`, error);
     }
+  }
+
+  // Getter for the current exchange ID
+  public getExchangeId(): string | undefined {
+    return this.exchange?.id;
   }
 }

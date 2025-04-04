@@ -671,23 +671,23 @@ export class UserInterface {
     } else if (command.startsWith('move stop')) {
       const parts = command.split(' ');
       if (parts.length === 3 && this.currentMarket) {
-          const newStopPrice = parseFloat(parts[2]);
-          if (!isNaN(newStopPrice)) {
-              try {
-                  const currentStopOrderId = await this.exchangeCommand.getExchangeClient().editCurrentStopOrder(this.currentMarket, newStopPrice);
-                  if (currentStopOrderId) {
-                      console.log(`Stop moved to new price: ${newStopPrice}`);
-                  } else {
-                      console.log('No active stop order found for the current market.');
-                  }
-              } catch (error: unknown) {
-                  console.log((error as Error).message);
+        const newStopPrice = parseFloat(parts[2]);
+        if (!isNaN(newStopPrice)) {
+          try {
+              const currentStopOrderId = await this.exchangeCommand.getExchangeClient().editCurrentStopOrder(this.currentMarket, newStopPrice);
+              if (currentStopOrderId) {
+                  console.log(`Stop order moved to ${newStopPrice}.`);
+              } else {
+                  console.log(`Stop order update processed for ${this.currentMarket}.`);
               }
-          } else {
-              console.log('Invalid stop price.');
+          } catch (error) {
+              console.error(`Error processing 'move stop' command:`, error);
           }
+        } else {
+          console.log('Invalid price format.');
+        }
       } else {
-          console.log('Usage: move stop <new stop price>');
+        console.log('Usage: move stop <new stop price>');
       }
     } else if (command.startsWith('update stop')) {
       const parts = command.split(' ');
