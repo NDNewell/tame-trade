@@ -800,10 +800,12 @@ export class ExchangeClient {
     symbol: string,
     orderType: string,
     price: number,
-    quantity?: number
+    quantity?: number,
+    params?: Record<string, any>
   ): Promise<void> {
     try {
-      const orders = await this.exchange!.fetchOrders(symbol);
+      // Pass params to fetchOrders for exchanges like Hyperliquid that require user context
+      const orders = await this.exchange!.fetchOrders(symbol, undefined, undefined, params);
       let order = orders.find((order) => order.id === orderId);
 
       if (!order) {
@@ -819,7 +821,8 @@ export class ExchangeClient {
         orderType,
         String(order.side ?? ''),
         quantity,
-        price
+        price,
+        params
       );
     } catch (error) {
       // console.error('Error editing order:', error);
@@ -948,14 +951,7 @@ export class ExchangeClient {
     stopPrice: number,
     takeProfitPrice: number
   ): number {
-    const potentialProfit = Math.abs(entryPrice - takeProfitPrice);
-    const potentialLoss = Math.abs(entryPrice - stopPrice);
-    if (potentialLoss === 0) {
-      throw new Error(
-        'Potential loss cannot be zero. Entry price and stop price cannot be the same.'
-      );
-    }
-    return potentialProfit / potentialLoss;
+    return Math.abs(takeProfitPrice - entryPrice) / Math.abs(entryPrice - stopPrice);
   }
 
   async createBracketLimitOrder(
@@ -1198,10 +1194,53 @@ export class ExchangeClient {
     }
   }
 
+  // Helper method to calculate default stop amount
+  private async _calculateDefaultStopAmount(market: string): Promise<number> {
+    // Get public wallet address from exchange config for Hyperliquid
+    const publicAddress = this.exchange?.id === 'hyperliquid' ?
+      (this.exchange as any).publicAddress || (this.exchange as any).walletAddress : undefined;
+
+    // Fetch open orders, potentially with user filter for Hyperliquid
+    const openOrders = await this.exchange!.fetchOpenOrders(market, undefined, undefined,
+        publicAddress ? { 'user': publicAddress } : undefined);
+
+    // Filter to only include limit orders, excluding stop/market orders
+    // This logic might need refinement based on exact CCXT/Hyperliquid behavior
+    const limitOrders = openOrders?.filter((order) => {
+        const isLimit = order.type === 'limit' || (order.info && order.info.orderType === 'Limit');
+        // Refined check to explicitly exclude known stop/trigger types
+        const isNotStopTrigger = !(order.type?.toLowerCase().includes('stop') ||
+                                 order.info?.type === 'trigger' ||
+                                 order.info?.orderType === 'StopMarket' ||
+                                 order.info?.orderType === 'Stop Limit' ||
+                                 order.info?.isTrigger === true);
+        return isLimit && isNotStopTrigger;
+    });
+
+    // Get the position size for the given market
+    const position = await this.getPositionStructure(market);
+    // Ensure positionSize is non-negative
+    const positionSize = Math.abs(position?.contracts ?? 0);
+
+    // Calculate the total quantity of open limit orders
+    const openOrdersQuantity = limitOrders?.reduce((acc, order) => {
+        // Ensure order.remaining is treated as a number
+        return acc + (order.remaining ?? 0);
+    }, 0) ?? 0;
+
+    // Total quantity is position size plus open limit orders quantity
+    let quantity = positionSize;
+    if (openOrdersQuantity > 0) {
+        quantity += openOrdersQuantity;
+    }
+    return quantity;
+  }
+
   async createStopOrder(
     market: string,
     price: number,
-    quantity?: number
+    quantity?: number,
+    suppressLog?: boolean
   ): Promise<void> {
     try {
       let side;
@@ -1210,40 +1249,24 @@ export class ExchangeClient {
       const walletAddress = this.exchange?.id === 'hyperliquid' ?
         (this.exchange as any).publicAddress || (this.exchange as any).walletAddress : undefined;
 
-      // Fetch open orders
+      // Fetch open orders needed for side determination if quantity is calculated
       const openOrders = await this.exchange!.fetchOpenOrders(market, undefined, undefined,
         walletAddress ? { 'user': walletAddress } : undefined);
 
-      // Filter to only include limit orders, excluding stop/market orders
+       // Filter to only include limit orders, excluding stop/market orders (needed for side calculation)
       const limitOrders = openOrders?.filter((order) => {
-        // Check if it's a limit order (not market, stop, etc.)
-        const isLimit = order.type === 'limit' || (order.info && order.info.orderType === 'Limit');
-
-        // For Hyperliquid, also check that it's not a stop order (which might be market type)
-        const isNotStop = !(order.type === 'market' ||
-                          (order.info &&
-                          (order.info.orderType === 'Trigger' ||
-                           order.info.orderType === 'StopMarket')));
-
-        return isLimit && isNotStop;
+          const isLimit = order.type === 'limit' || (order.info && order.info.orderType === 'Limit');
+          const isNotStopTrigger = !(order.type?.toLowerCase().includes('stop') ||
+                                   order.info?.type === 'trigger' ||
+                                   order.info?.orderType === 'StopMarket' ||
+                                   order.info?.orderType === 'Stop Limit' ||
+                                   order.info?.isTrigger === true);
+          return isLimit && isNotStopTrigger;
       });
 
-      // If no quantity is provided, calculate the quantity based on open orders and position size
-      if (!quantity) {
-        // Get the position size for the given market
-        const position = await this.getPositionStructure(market);
-        const positionSize = position?.contracts ?? 0;
-
-        // Calculate the total quantity of open limit orders
-        const openOrdersQuantity = limitOrders.reduce((acc, order) => {
-          return acc + order.remaining;
-        }, 0);
-
-        // Add the open limit orders quantity to the calculated position size
-        quantity = positionSize;
-        if (openOrdersQuantity > 0) {
-          quantity += openOrdersQuantity;
-        }
+      // If no quantity is provided, calculate it using the helper method
+      if (quantity === undefined) {
+         quantity = await this._calculateDefaultStopAmount(market);
       }
 
       // If there's a non-zero quantity, proceed with creating the stop order
@@ -1317,7 +1340,10 @@ export class ExchangeClient {
           params
         );
 
-        console.log(`Stop order placed at ${price} for ${quantity} ${market}`);
+        // Only log if suppressLog is not true
+        if (!suppressLog) {
+            console.log(`Stop order placed at ${price} for ${quantity} ${market}`);
+        }
       } else {
         // If there's no position found, log an error message and return
         console.error(
@@ -1330,47 +1356,121 @@ export class ExchangeClient {
       console.error(`[ExchangeClient] Failed to place order:`, error);
     }
   }
-  async updateStopOrder(market: string, newAmount?: number): Promise<void> {
+
+  async updateStopOrder(
+    market: string,
+    newAmount?: number,
+    newStopPrice?: number
+  ): Promise<void> {
+    if (!this.exchange) {
+      throw new Error('Exchange not initialized');
+    }
+
     try {
-        const openOrders = await this.exchange?.fetchOpenOrders(market);
-        const stopOrders = openOrders?.filter(order => order.type?.toLowerCase()?.includes('stop'));
-        if (stopOrders?.length === 0) {
-          throw new Error('No active stop orders found.');
-        } else if ((stopOrders?.length ?? 0) > 1) {
-          throw new Error('Multiple stop orders found. Cannot update multiple stops.');
+      let params: Record<string, any> = {};
+      let publicAddress: string | undefined;
+
+      // Hyperliquid specific logic: requires publicAddress
+      if (this.exchange.id === 'hyperliquid') {
+        publicAddress = (this.exchange as any).publicAddress || (this.exchange as any).walletAddress;
+        if (!publicAddress) {
+          throw new Error('[ExchangeClient] Hyperliquid requires publicAddress (or walletAddress) for fetching/editing orders.');
         }
-        let order = stopOrders?.[0] as StopOrder
-        let amountToUpdate = newAmount;
+        // Use 'user' as the key for Hyperliquid params, matching other methods
+        params = { 'user': publicAddress };
+      }
 
-        if (!newAmount) {
-          // Calculate quantity to be used for the stop order
-          let positionSize = 0;
-          const position = await this.getPositionStructure(market);
-          if (position) {
-            positionSize += position.contracts ?? 0;
-          }
+      const openOrders = await this.exchange.fetchOpenOrders(market, undefined, undefined, params);
 
-          const limitOrders = openOrders?.filter(order => order.type === 'limit') ?? [];
-          const openOrdersQuantity = limitOrders.reduce((acc, order) => acc + order.remaining, 0);
-
-          amountToUpdate = positionSize + openOrdersQuantity;
+      // Find the stop order (using Hyperliquid-specific checks if necessary)
+      const stopOrder = openOrders.find(order => {
+        const isStop = order.type?.toLowerCase().includes('stop');
+        if (this.exchange?.id === 'hyperliquid') {
+          return isStop ||
+                 order.info?.type === 'trigger' ||
+                 order.info?.orderType === 'StopMarket' ||
+                 order.info?.orderType === 'Stop Limit' || // Added 'Stop Limit'
+                 order.info?.isTrigger === true;
+        } else {
+          return isStop;
         }
+      });
 
-        // check if amountToUpdate is defined and greater than zero
-        if (!amountToUpdate || amountToUpdate <= 0) {
-          throw new Error('Calculated quantity for stop order is zero or negative.');
-        }
+      if (!stopOrder) {
+        console.warn(`[ExchangeClient] No open stop order found for ${market} to update.`);
+        return;
+      }
 
-        try {
-          await this.cancelAllStopOrders(market);
-          await this.createStopOrder(market, order.stopPrice, amountToUpdate);
-        } catch (error) {
-          console.error(`[ExchangeClient] Failed to update stop order: ${error}`);
-          throw error;
+      // Ensure the found stop order has a stop price defined before proceeding
+      if (stopOrder.stopPrice === undefined) {
+        console.error(`[ExchangeClient] Found stop order ${stopOrder.id} for ${market}, but its stopPrice is undefined. Cannot update.`);
+        return;
+      }
+
+      // Determine the final amount
+      let finalAmount: number;
+      if (newAmount !== undefined) {
+        finalAmount = await this.getQuantityPrecision(market, newAmount);
+      } else {
+        // If newAmount is not provided, calculate the default amount using the helper
+        finalAmount = await this._calculateDefaultStopAmount(market);
+        finalAmount = await this.getQuantityPrecision(market, finalAmount); // Apply precision
+      }
+
+      // Determine the final stop price
+      // Use existing stop price if newStopPrice is not provided
+      const finalStopPrice: number = newStopPrice !== undefined ? newStopPrice : stopOrder.stopPrice;
+
+      // Validate the calculated/provided final amount
+      if (finalAmount <= 0) {
+        console.warn(`[ExchangeClient] Calculated/Provided amount (${finalAmount}) is zero or negative. Cannot update stop order ${stopOrder.id}.`);
+        // If only price was provided, maybe allow price-only update?
+        // Current logic requires a valid amount to proceed.
+        // Consider if a price-only update makes sense when amount becomes invalid.
+        if (newAmount === undefined && newStopPrice !== undefined && stopOrder.amount > 0) {
+             // Attempt price-only update if original amount was valid and new amount calculation failed
+             this.logAndReplace(`Calculated amount is invalid (${finalAmount}), attempting to update price only for stop order ${stopOrder.id} to ${finalStopPrice}`);
+              await this.editOrder(
+                 stopOrder.id,
+                 market,
+                 stopOrder.type ?? 'limit',
+                 finalStopPrice,
+                 stopOrder.amount, // Use original amount
+                 params
+              );
+              this.logAndReplace(`Updated stop order ${stopOrder.id} price to ${finalStopPrice}`);
+        } else {
+             console.warn(`[ExchangeClient] Invalid amount (${finalAmount}) prevents update for stop order ${stopOrder.id}.`);
         }
-    } catch (error) {
-        console.error(`[ExchangeClient] Failed to update stop order: ${error}`);
-        throw error;
+        return; // Exit if amount is invalid
+      }
+
+       // Parameters for cancel/create (mainly the user ID for Hyperliquid)
+      let cancelReplaceParams: Record<string, any> = { ...params }; // Copy base params (like user)
+
+      // --- Always use Cancel/Replace Logic ---
+      try {
+          // 1. Cancel the existing order
+          await this.exchange.cancelOrder(stopOrder.id, market, cancelReplaceParams);
+
+          // 2. Create a new stop order with the new amount and correct price
+          // Pass suppressLog = true to prevent duplicate logging
+          await this.createStopOrder(market, finalStopPrice, finalAmount, true);
+
+      } catch (replaceError) {
+          console.error(`[ExchangeClient] Error during cancel/replace:`, replaceError);
+          // Rethrow or handle - potentially the cancel succeeded but create failed, leaving no stop.
+          throw replaceError;
+      }
+
+    } catch (error: any) {
+        if (error.message && error.message.includes('Order not found')) {
+            console.warn(`[ExchangeClient] Attempted to update stop order ${market}, but it might have been filled or cancelled.`);
+        } else {
+            console.error(`[ExchangeClient] Failed to update stop order for ${market}:`, error);
+            // Potentially re-throw or handle specific errors differently
+             throw error;
+        }
     }
   }
 
