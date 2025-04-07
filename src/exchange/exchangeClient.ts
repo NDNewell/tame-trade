@@ -1259,6 +1259,10 @@ export class ExchangeClient {
     quantity?: number,
     suppressLog?: boolean
   ): Promise<Order | undefined> {
+    if (!this.exchange) {
+        console.error('[ExchangeClient/createStopOrder] Exchange not initialized.');
+        return undefined;
+    }
     try {
       let side;
 
@@ -1346,15 +1350,31 @@ export class ExchangeClient {
         // Adjust the quantity to match the exchange's precision requirements
         quantity = await this.getQuantityPrecision(market, quantity);
 
+        // --- Adjust parameters for Hyperliquid Stop Market ---
+        let finalOrderType = orderType;
+        let finalPriceArg = price;
+        let finalParams = { ...params };
+
+        if (this.exchange.id === 'hyperliquid') {
+            finalOrderType = 'market'; // Use market type for stop-market
+            // Pass the trigger price as the main price argument for slippage calculation
+            finalPriceArg = price;
+            // Ensure triggerPrice is set correctly in params (redundant check, but safe)
+            if (!finalParams.triggerPrice) finalParams.triggerPrice = price;
+            // Ensure reduceOnly is set
+            finalParams.reduceOnly = true;
+        }
+        // --- End Hyperliquid Adjustment ---
+
         // Execute the stop order and get the created order object
         const createdOrder = await this.executeOrder(
           'createOrder',
           market,
-          orderType,
+          finalOrderType, // Use adjusted type
           side,
           quantity,
-          price,
-          params
+          finalPriceArg, // Use adjusted price arg
+          finalParams // Use adjusted params
         );
 
         // Only log if suppressLog is not true
