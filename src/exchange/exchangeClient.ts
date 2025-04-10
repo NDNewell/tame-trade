@@ -305,24 +305,37 @@ export class ExchangeClient {
       return;
     }
 
+    // Extract potential postOnly flag and params from the end of args
+    let finalParams: Record<string, any> = {};
+    let postOnly = false;
+    let originalArgs = [...args]; // Copy original args
+
+    // Check if the last arg is a params object
+    if (originalArgs.length > 0 && typeof originalArgs[originalArgs.length - 1] === 'object' && originalArgs[originalArgs.length - 1] !== null) {
+        finalParams = { ...originalArgs.pop() }; // Pop and copy params object
+    }
+
+    // Check if the (new) last arg is the postOnly boolean
+    if (originalArgs.length > 0 && typeof originalArgs[originalArgs.length - 1] === 'boolean') {
+        postOnly = originalArgs.pop(); // Pop boolean
+    }
+
+    if (postOnly) {
+        finalParams['postOnly'] = true;
+    }
+
     try {
-      // Special handling for Hyperliquid market orders
+      // Special handling for Hyperliquid market orders (shouldn't apply to limit chase)
       if (this.exchange.id === 'hyperliquid' && method.includes('Market')) {
-        // Get current market price
         const ticker = await this.exchange.fetchTicker(market);
-        const currentPrice = ticker.last || 0; // Add default value to avoid undefined
-
-        // For Hyperliquid, we need to pass the price as a parameter object
-        const params = {
-          price: currentPrice,
-          slippage: 0.05 // 5% slippage
-        };
-
-        // Add params as the last argument
-        args.push(params);
+        const currentPrice = ticker.last || 0;
+        finalParams.price = currentPrice;
+        finalParams.slippage = 0.05;
       }
 
-      const order = await (this.exchange as any)[method](market, ...args);
+      // Call the underlying exchange method with market, remaining original args, and the final combined params
+      const order = await (this.exchange as any)[method](market, ...originalArgs, finalParams);
+
       const orderType = order.info.order_type;
 
       if (orderType === 'market') {
@@ -682,9 +695,9 @@ export class ExchangeClient {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  async cancelChaseOrder(orderId: string, market: string): Promise<void> {
+  async cancelChaseOrder(orderId: string, market: string, params?: Record<string, any>): Promise<void> {
     try {
-      await this.exchange!.cancelOrder(orderId, market);
+      await this.exchange!.cancelOrder(orderId, market, params);
       this.chaseLimitOrderActive = false;
     } catch (error) {
       console.error('Error cancelling chase order:', error);
@@ -702,13 +715,37 @@ export class ExchangeClient {
     amount: number,
     decay?: string
   ): Promise<string | undefined | void> {
+    if (!this.exchange) { throw new Error('Exchange not initialized'); }
     this.chaseLimitOrderActive = true;
+
+    // --- Hyperliquid Params ---
+    let params: Record<string, any> | undefined = undefined;
+    if (this.getExchangeId() === 'hyperliquid') {
+        const publicAddress = (this.exchange as any).publicAddress || (this.exchange as any).walletAddress;
+        if (!publicAddress) {
+          throw new Error('[ExchangeClient/chaseLimitOrder] Hyperliquid requires publicAddress.');
+        }
+        params = { 'user': publicAddress };
+        // Use Add Liquidity Only TIF for initial placement instead of postOnly flag
+        params.timeInForce = 'Alo';
+    }
+    // --- End Hyperliquid Params ---
+
     const orderBook = await this.exchange!.fetchL2OrderBook(market);
-    const bestPrice =
-      side === 'buy' ? orderBook.bids[0][0] : orderBook.asks[0][0];
+    const bestBid = orderBook.bids.length > 0 ? orderBook.bids[0][0] : 0;
+    const bestAsk = orderBook.asks.length > 0 ? orderBook.asks[0][0] : Infinity;
+
+    // Use best bid/ask directly, rely on TIF: Alo in params
+    const initialPrice = side === 'buy' ? bestBid : bestAsk;
+    if (!isFinite(initialPrice) || initialPrice <= 0) {
+        // Basic validation, might need refinement
+        throw new Error(`Invalid initial best price calculated: ${initialPrice}`);
+    }
+
+    // Pass params (containing TIF: Alo for Hyperliquid) AND postOnly: true flag
     const order = await (side === 'buy'
-      ? await this.createLimitBuyOrder(market, bestPrice, amount)
-      : await this.createLimitSellOrder(market, bestPrice, amount));
+      ? await this.createLimitBuyOrder(market, initialPrice, amount, params, true)
+      : await this.createLimitSellOrder(market, initialPrice, amount, params, true));
 
     if (!order) {
       console.log('Order filled immediately');
@@ -716,11 +753,13 @@ export class ExchangeClient {
       return;
     }
 
-    const orderId = order.id;
+    // Use let instead of const to allow potential reassignment after edits
+    let orderId = order.id;
     let remainingAmount = amount;
 
     const executeChaseOrder = async () => {
-      const openOrders = await this.exchange!.fetchOpenOrders(market);
+      // Pass params to fetchOpenOrders
+      const openOrders = await this.exchange!.fetchOpenOrders(market, undefined, undefined, params);
       const order = openOrders.find((o) => o.id === orderId);
 
       if (!order) {
@@ -744,13 +783,20 @@ export class ExchangeClient {
           (side === 'buy' && updatedBestPrice > order.price) ||
           (side === 'sell' && updatedBestPrice < order.price)
         ) {
-          await this.editOrder(
+          // Pass params to editOrder
+          const editResult = await this.editOrder(
             orderId,
             market,
             'limit',
             updatedBestPrice,
-            order.remaining
+            order.remaining,
+            params // Pass Hyperliquid params here
           );
+
+          // Check if the order ID changed after edit (esp. for cancel/replace exchanges)
+          if (editResult && editResult.id !== orderId) {
+            orderId = editResult.id; // Update orderId for subsequent checks
+          }
         }
       } catch (error) {
         // Suppress the error output
@@ -760,7 +806,9 @@ export class ExchangeClient {
       remainingAmount = order.remaining;
 
       if (remainingAmount > 0) {
-        setTimeout(executeChaseOrder, 100); // Adjust the delay interval as needed
+        // Use a longer interval for Hyperliquid due to higher latency
+        const chaseInterval = this.getExchangeId() === 'hyperliquid' ? 1500 : 100;
+        setTimeout(executeChaseOrder, chaseInterval);
       }
     };
 
@@ -787,7 +835,8 @@ export class ExchangeClient {
       const decayTime = parseDecayTime(decay);
       setTimeout(() => {
         if (this.chaseLimitOrderActive) {
-          this.cancelChaseOrder(orderId, market);
+          // Pass params to cancelChaseOrder
+          this.cancelChaseOrder(orderId, market, params);
         }
       }, decayTime);
     }
@@ -802,7 +851,7 @@ export class ExchangeClient {
     price: number,
     quantity?: number,
     params?: Record<string, any>
-  ): Promise<void> {
+  ): Promise<Order | undefined> {
     try {
       // Pass params to fetchOrders for exchanges like Hyperliquid that require user context
       const orders = await this.exchange!.fetchOrders(symbol, undefined, undefined, params);
@@ -815,7 +864,7 @@ export class ExchangeClient {
       // If quantity is not provided, use the order's amount
       quantity = quantity !== undefined ? quantity : order.amount;
 
-      await this.exchange!.editOrder(
+      const editedOrder = await this.exchange!.editOrder(
         order.id,
         symbol,
         orderType,
@@ -824,6 +873,8 @@ export class ExchangeClient {
         price,
         params
       );
+      // Return the result of the exchange edit call
+      return editedOrder;
     } catch (error) {
       // console.error('Error editing order:', error);
       // This has been disabled for now since it keeps throwing an error and polluting the console
@@ -1128,13 +1179,17 @@ export class ExchangeClient {
   async createLimitBuyOrder(
     market: string,
     price: number,
-    quantity: number
+    quantity: number,
+    params?: Record<string, any>,
+    postOnly?: boolean
   ): Promise<any> {
     const order = await this.executeOrder(
       'createLimitBuyOrder',
       market,
       await this.getQuantityPrecision(market, quantity),
-      price
+      price,
+      postOnly,
+      params
     );
     return order;
   }
@@ -1142,13 +1197,17 @@ export class ExchangeClient {
   async createLimitSellOrder(
     market: string,
     price: number,
-    quantity: number
+    quantity: number,
+    params?: Record<string, any>,
+    postOnly?: boolean
   ): Promise<any> {
     const order = await this.executeOrder(
       'createLimitSellOrder',
       market,
       await this.getQuantityPrecision(market, quantity),
-      price
+      price,
+      postOnly,
+      params
     );
     return order;
   }
@@ -1555,4 +1614,29 @@ export class ExchangeClient {
   public getExchangeId(): string | undefined {
     return this.exchange?.id;
   }
+
+  // Helper to get market price tick size
+  private getMarketPriceTickSize(marketSymbol: string): number {
+    if (!this.availableMarkets) {
+        console.warn('[ExchangeClient] Markets not loaded, cannot get tick size. Defaulting to small value.');
+        // Return a reasonably small default if markets aren't loaded
+        // This might need adjustment based on typical market values
+        return 0.01;
+    }
+    const marketInfo = this.availableMarkets[marketSymbol];
+    if (!marketInfo || !marketInfo.precision || marketInfo.precision.price === undefined) {
+        console.warn(`[ExchangeClient] Precision info not found for ${marketSymbol}. Defaulting to small value.`);
+        return 0.01;
+    }
+    // ccxt stores precision as 1 / tickSize (e.g., 0.01 precision means tick size of 100 is wrong) -> needs tickSize directly if available, or calculate
+    // Let's assume marketInfo.precision.price IS the tick size for now, which is common.
+    // If errors persist, investigate if ccxt provides tickSize differently for this exchange.
+    return marketInfo.precision.price;
+  }
+
+  // --- REMOVE Temporary Latency Ping Method --- START
+  /*
+  async pingExchangeLatency(numPings: number = 10): Promise<number> { ... }
+  */
+  // --- REMOVE Temporary Latency Ping Method --- END
 }
