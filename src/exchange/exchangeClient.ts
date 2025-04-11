@@ -696,12 +696,25 @@ export class ExchangeClient {
   }
 
   async cancelChaseOrder(orderId: string, market: string, params?: Record<string, any>): Promise<void> {
+    // Always set the active flag to false when cancellation is attempted
+    this.chaseLimitOrderActive = false;
     try {
       await this.exchange!.cancelOrder(orderId, market, params);
-      this.chaseLimitOrderActive = false;
-    } catch (error) {
-      console.error('Error cancelling chase order:', error);
-      throw error;
+    } catch (error: any) {
+        // Check if it's a benign OrderNotFound error
+        const errorMessage = String(error.message || '');
+        const isOrderNotFound = errorMessage.includes('OrderNotFound') ||
+                                errorMessage.includes('Order was never placed, already canceled, or filled');
+
+        if (isOrderNotFound) {
+            // Log simplified warning or omit if preferred
+            // console.warn(`[cancelChaseOrder] Attempted to cancel chase order ${orderId}, but it was likely already finalized.`);
+        } else {
+            // Log other errors as actual problems
+            console.error('Error cancelling chase order:', error);
+            // Optionally re-throw if needed downstream
+            // throw error;
+        }
     }
   }
 
