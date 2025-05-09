@@ -1336,6 +1336,14 @@ export class ExchangeClient {
         return undefined;
     }
     try {
+      // Format price according to market precision
+      const marketInfo = this.availableMarkets![market];
+      if (!marketInfo || !marketInfo.precision || marketInfo.precision.price === undefined) {
+        throw new Error(`Market ${market} precision info not found`);
+      }
+      // Format price to required decimal places
+      price = Number(price.toFixed(Math.abs(Math.log10(marketInfo.precision.price))));
+
       let side;
 
       // Get public wallet address from exchange config for Hyperliquid
@@ -1371,19 +1379,14 @@ export class ExchangeClient {
           side = position?.side === 'long' ? 'sell' : 'buy';
         } else if (limitOrders.length > 0) {
           side = limitOrders[0].side === 'buy' ? 'sell' : 'buy';
-        } else if (this.exchange!.id === 'hyperliquid') {
-          // For Hyperliquid, we need to fetch the current price
-          // and determine the side based on the stop price
-          const ticker = await this.exchange!.fetchTicker(market);
-          const currentPrice = ticker.last || 0; // Add default value to avoid undefined
-
-          // If stop price is below current price, it's a sell stop (for long positions)
-          // If stop price is above current price, it's a buy stop (for short positions)
-          side = price < currentPrice ? 'sell' : 'buy';
         } else {
-          throw new Error(
-            `Unable to determine side of stop order for market ${market}.`
-          );
+          // Get current market price to determine side
+          const ticker = await this.exchange!.fetchTicker(market);
+          const currentPrice = ticker.last || 0;
+
+          // If stop price is below current price, it's a sell stop
+          // If stop price is above current price, it's a buy stop
+          side = price < currentPrice ? 'sell' : 'buy';
         }
 
         // Get the appropriate exchange parameters based on the current exchange
@@ -1414,6 +1417,14 @@ export class ExchangeClient {
           }
         }
 
+        // Add triggerDirection for Phemex stop orders
+        if (this.exchange!.id === 'phemex') {
+          // For sell stops, trigger when price goes down (2)
+          // For buy stops, trigger when price goes up (1)
+          params.triggerDirection = side === 'sell' ? 2 : 1; // Phemex requires 1 (up) or 2 (down)
+          params.trigger = 'ByLastPrice'; // Explicitly set trigger type for Phemex
+        }
+
         // If the reduce-only feature is supported by the exchange, add the corresponding property to the parameters object
         if (reduceOnlySupported) {
           params[reduceOnlyProp] = true;
@@ -1424,17 +1435,19 @@ export class ExchangeClient {
 
         // --- Adjust parameters for Hyperliquid Stop Market ---
         let finalOrderType = orderType;
-        let finalPriceArg = price;
+        let finalPriceArg: number | undefined = price; // Initialize with the stop price
         let finalParams = { ...params };
 
         if (this.exchange.id === 'hyperliquid') {
             finalOrderType = 'market'; // Use market type for stop-market
-            // Pass the trigger price as the main price argument for slippage calculation
-            finalPriceArg = price;
-            // Ensure triggerPrice is set correctly in params (redundant check, but safe)
+            finalPriceArg = price; // Pass the trigger price as the main price argument for slippage calculation
             if (!finalParams.triggerPrice) finalParams.triggerPrice = price;
-            // Ensure reduceOnly is set
             finalParams.reduceOnly = true;
+        } else if (finalOrderType.toLowerCase() === 'stop') {
+            // For Phemex (and potentially other exchanges where 'Stop' means stop-market),
+            // the main price argument for createOrder should be undefined.
+            // The trigger price is already in finalParams.stopPx (or equivalent).
+            finalPriceArg = undefined;
         }
         // --- End Hyperliquid Adjustment ---
 
@@ -1445,17 +1458,20 @@ export class ExchangeClient {
           finalOrderType, // Use adjusted type
           side,
           quantity,
-          finalPriceArg, // Use adjusted price arg
+          finalPriceArg, // Use adjusted price arg (potentially undefined for Phemex stop-market)
           finalParams // Use adjusted params
         );
 
-        // Only log if suppressLog is not true
-        if (!suppressLog) {
-            console.log(`Stop order placed at ${price} for ${quantity} ${market}`);
+        // Only log and return if the order was successfully created
+        if (createdOrder) {
+          if (!suppressLog) {
+              console.log(`Stop order placed at ${price} for ${quantity} ${market}`);
+          }
+          return createdOrder;
+        } else {
+          // executeOrder already logs specific errors, so we just return undefined
+          return undefined;
         }
-
-        // Return the created order object
-        return createdOrder;
       } else {
         // If there's no position found, log an error message and return undefined
         console.error(
