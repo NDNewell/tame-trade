@@ -490,24 +490,37 @@ export class ExchangeClient {
           // If direct fetching fails, try fetchPositions which gets all positions
           try {
             const params = { 'user': walletAddress };
-            const positions = await this.exchange.fetchPositions(undefined, params);
+            const allPositions = await this.exchange.fetchPositions(undefined, params);
 
-            if (positions && positions.length > 0) {
-              // Try to match by symbol
-              const baseSymbolLower = baseSymbol.toLowerCase();
-              for (const position of positions) {
-                const posSymbol = String(position.symbol || '').toLowerCase();
+            if (allPositions && allPositions.length > 0) {
+              // Try to match by symbol, preferring an exact match with the input symbol or base symbol
+              const targetSymbols = [
+                symbol, // Original symbol first (e.g., SOL/USDC:USDC)
+                baseSymbol, // Base symbol (e.g., SOL)
+                // Add other common variations if necessary, but be specific
+              ];
 
-                if (posSymbol.includes(baseSymbolLower) && isValidPosition(position)) {
-                  return position;
+              for (const tSymbol of targetSymbols) {
+                const foundPosition = allPositions.find(p => p.symbol && p.symbol.toLowerCase() === tSymbol.toLowerCase() && isValidPosition(p));
+                if (foundPosition) {
+                  return foundPosition; // Return the first exact match found
                 }
               }
 
-              // If we got here but have positions, check if any are valid to return as fallback
-              for (const position of positions) {
-                if (isValidPosition(position)) {
-                  return position;
+              // Stricter fallback: only if a position explicitly contains the baseSymbol AND has contracts
+              // This avoids returning an unrelated active position if the target market has no position.
+              const fallbackPosition = allPositions.find(p =>
+                p.symbol && p.symbol.toLowerCase().includes(baseSymbol.toLowerCase()) &&
+                isValidPosition(p) &&
+                (p.contracts !== undefined && p.contracts !== 0) // Ensure it's an actual position
+              );
+              if (fallbackPosition) {
+                // Before returning a fallback, log a warning if its symbol isn't an exact match
+                if (!targetSymbols.some(ts => ts.toLowerCase() === fallbackPosition.symbol.toLowerCase())) {
+                    console.warn(`[ExchangeClient/getPositionStructure] Hyperliquid: No exact symbol match for ${symbol}. ` +
+                                 `Returning fallback position for ${fallbackPosition.symbol} as it includes base ${baseSymbol} and has contracts.`);
                 }
+                return fallbackPosition;
               }
             }
           } catch (error) {
