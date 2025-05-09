@@ -897,35 +897,87 @@ export class ExchangeClient {
 
   async bumpOrders(symbol: string, priceChange: number): Promise<void> {
     try {
-      const openOrders = await this.exchange!.fetchOpenOrders(symbol);
+      let hyperliquidParams: { user?: string } = {};
+      let isHyperliquid = this.exchange?.id === 'hyperliquid';
+
+      if (isHyperliquid) {
+        const publicAddress = (this.exchange as any).publicAddress || (this.exchange as any).walletAddress;
+        if (!publicAddress) {
+          throw new Error('[ExchangeClient/bumpOrders] Hyperliquid requires publicAddress for bumping orders.');
+        }
+        hyperliquidParams = { 'user': publicAddress };
+      }
+
+      const openOrders = await this.exchange!.fetchOpenOrders(symbol, undefined, undefined, isHyperliquid ? hyperliquidParams : undefined);
 
       if (openOrders.length > 0) {
         for (const order of openOrders) {
           const orderType = order.type?.toLowerCase() ?? '';
-          let params;
-          let newPrice;
+          let newPrice: number | undefined;
 
-          if (orderType.toLowerCase() === 'stop') {
-            const stopOrder = order as StopOrder;
-            newPrice = stopOrder.stopPrice + priceChange;
-            params = {
-              // stopLossPrice: price, // only available on Deribit so far
-              stopPrice: newPrice, // Phemex's property name for a stop order
-              // reduce_only: true, // only available on Deribit so far
-            };
-          } else if (orderType.toLowerCase() === 'limit') {
-            newPrice = order.price + priceChange;
+          if (isHyperliquid) {
+            // Hyperliquid-specific logic
+            if (orderType.includes('stop') || order.info?.isTrigger === true || order.info?.orderType?.toLowerCase().includes('stop')) {
+              const currentStopPrice = order.stopPrice ?? order.price;
+              if (currentStopPrice === undefined) {
+                continue;
+              }
+              newPrice = currentStopPrice + priceChange;
+              await this.updateStopOrder(symbol, order.amount, newPrice);
+            } else if (orderType === 'limit') {
+              newPrice = order.price + priceChange;
+              await this.exchange!.editOrder(
+                order.id,
+                symbol,
+                orderType, // 'limit'
+                String(order.side ?? ''),
+                order.amount,
+                newPrice,
+                hyperliquidParams
+              );
+            } else {
+              // console.warn(`[ExchangeClient/bumpOrders] Hyperliquid: Skipping unsupported order type '${orderType}' for order ${order.id}`); // Removed log
+            }
+          } else {
+            // Original logic for other exchanges (restored)
+            let paramsForEdit: Record<string, any> | undefined = undefined; // Keep it undefined initially
+            let originalNewPrice: number | undefined = undefined;
+
+            if (orderType === 'stop') {
+              const stopOrder = order as StopOrder;
+              if (typeof stopOrder.stopPrice === 'number') {
+                originalNewPrice = stopOrder.stopPrice + priceChange;
+                // For non-Hyperliquid stop orders, params for editOrder might be needed by CCXT implicitly or explicitly by exchange
+                // The original code example for Phemex used params = { stopPrice: newPrice }
+                // A generic approach might be to ensure the trigger price field is in params if needed.
+                // For ccxt unified editOrder, it often expects the new stop price as the main price argument for stop orders,
+                // or within params if the exchange requires it differently. We'll pass it as main price for now.
+                paramsForEdit = { [exchangeParams[this.exchange!.id]?.orders.stopLoss.STOP_LOSS_PROP || 'stopPrice']: originalNewPrice };
+              } else {
+                 console.warn(`[ExchangeClient/bumpOrders] Non-Hyperliquid: Order ${order.id} is type 'stop' but has no valid stopPrice. Skipping.`);
+                 continue;
+              }
+            } else if (orderType === 'limit') {
+              originalNewPrice = order.price + priceChange;
+              // No special params typically needed for limit order price changes beyond the price itself.
+            } else {
+                console.warn(`[ExchangeClient/bumpOrders] Non-Hyperliquid: Skipping unsupported order type '${orderType}' for order ${order.id}`);
+                continue;
+            }
+
+            if (originalNewPrice !== undefined) {
+                console.log(`[ExchangeClient/bumpOrders] Non-Hyperliquid: Bumping ${orderType} order ${order.id} to ${originalNewPrice}`);
+                await this.exchange!.editOrder(
+                    order.id,
+                    symbol,
+                    orderType,
+                    String(order.side ?? ''),
+                    order.amount,
+                    originalNewPrice, // Pass the new price directly
+                    paramsForEdit // Pass specific params if any (like for stop orders)
+                );
+            }
           }
-
-          await this.exchange!.editOrder(
-            order.id,
-            symbol,
-            orderType,
-            String(order.side ?? ''),
-            order.amount,
-            newPrice,
-            params ? params : {}
-          );
         }
       } else {
         throw new Error('No open orders to bump');
