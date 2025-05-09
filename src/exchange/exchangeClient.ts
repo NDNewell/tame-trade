@@ -574,33 +574,59 @@ export class ExchangeClient {
     rangeStart?: number,
     rangeEnd?: number
   ): Promise<void> {
-    // Fetch the orders from the market symbol
-    const orders = await this.exchange!.fetchOpenOrders(market);
+    let hyperliquidParams: { user?: string } = {};
+    const isHyperliquid = this.exchange?.id === 'hyperliquid';
 
-    // Filter out stop orders
-    const filteredOrders = orders.filter(
-      (order) => order.type?.toLowerCase() !== 'stop'
-    );
+    if (isHyperliquid) {
+      const publicAddress = (this.exchange as any).publicAddress || (this.exchange as any).walletAddress;
+      if (!publicAddress) {
+        throw new Error('[ExchangeClient/cancelOrdersByDirection] Hyperliquid requires publicAddress.');
+      }
+      hyperliquidParams = { 'user': publicAddress };
+    }
+
+    // Fetch the orders from the market symbol, including user param for Hyperliquid
+    const openOrders = await this.exchange!.fetchOpenOrders(market, undefined, undefined, isHyperliquid ? hyperliquidParams : undefined);
+
+    // Filter to get only relevant limit orders
+    const limitOrdersToConsider = openOrders.filter((order) => {
+      if (isHyperliquid) {
+        const isBasicLimit = order.type === 'limit' ||
+                             (order.info && (order.info.orderType === 'Limit' || order.info.orderType === 'LimitOrder'));
+        const isNotTrigger = order.info?.isTrigger !== true &&
+                             order.info?.orderType !== 'Stop Limit' &&
+                             order.info?.orderType !== 'Trigger' &&
+                             order.info?.orderType !== 'StopMarket';
+        return isBasicLimit && isNotTrigger;
+      } else {
+        // Original filter for non-Hyperliquid exchanges: effectively, non-stop orders
+        return order.type?.toLowerCase() !== 'stop';
+      }
+    });
 
     // Sort orders by price depending on the direction
     const sortedOrders =
       direction === 'bottom'
-        ? filteredOrders.sort((a, b) => a.price - b.price)
-        : filteredOrders.sort((a, b) => b.price - a.price);
+        ? limitOrdersToConsider.sort((a, b) => a.price - b.price)
+        : limitOrdersToConsider.sort((a, b) => b.price - a.price);
 
     // Determine the range of orders to be canceled
-    let start = rangeStart ? rangeStart - 1 : 0;
+    let start = rangeStart ? rangeStart - 1 : 0; // rangeStart is 1-indexed from user
     let end = rangeEnd ? rangeEnd : sortedOrders.length;
 
     // Slice the orders array based on the determined range
     const ordersToCancel = sortedOrders.slice(start, end);
 
     // Cancel the orders within the range
-    for (const order of ordersToCancel) {
-      await this.exchange!.cancelOrder(order.id, market);
+    if (ordersToCancel.length > 0) {
+      const cancelPromises = ordersToCancel.map((order) =>
+        this.exchange!.cancelOrder(order.id, market, isHyperliquid ? hyperliquidParams : undefined)
+      );
+      await Promise.all(cancelPromises);
+      console.log(`${ordersToCancel.length} limit orders have been canceled.`);
+    } else {
+      console.log('No matching limit orders found to cancel.');
     }
-
-    console.log(`${ordersToCancel.length} orders have been canceled.`);
   }
 
   async cancelAllOrders(symbol: string): Promise<void> {
