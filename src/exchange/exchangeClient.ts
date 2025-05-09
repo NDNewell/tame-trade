@@ -622,9 +622,14 @@ export class ExchangeClient {
       const limitOrders = openOrders.filter((order) => {
         // For Hyperliquid, check both standard limit orders and Hyperliquid's specific limit order types
         if (this.exchange!.id === 'hyperliquid') {
-          return order.type === 'limit' ||
-                 (order.info && order.info.orderType === 'Limit') ||
-                 (order.info && order.info.orderType === 'LimitOrder');
+          const isBasicLimit = order.type === 'limit' ||
+                               (order.info && (order.info.orderType === 'Limit' || order.info.orderType === 'LimitOrder'));
+          // Ensure it's not a trigger order (like stop-limit)
+          const isNotTrigger = order.info?.isTrigger !== true &&
+                               order.info?.orderType !== 'Stop Limit' &&
+                               order.info?.orderType !== 'Trigger' &&
+                               order.info?.orderType !== 'StopMarket';
+          return isBasicLimit && isNotTrigger;
         }
         return order.type === 'limit';
       });
