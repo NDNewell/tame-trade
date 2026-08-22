@@ -153,7 +153,10 @@ export class Workspace {
                 position.unrealizedPnl !== undefined
                   ? `${signed(position.unrealizedPnl)}${position.currency ? ` ${position.currency}` : ''}`
                   : NO_VALUE,
-              realizedPnl: NO_VALUE,
+              realizedPnl:
+                position.realizedPnl !== undefined
+                  ? `${signed(position.realizedPnl)}${position.currency ? ` ${position.currency}` : ''}`
+                  : NO_VALUE,
               leverage: dash(position.leverage, 'x'),
               liquidation: dash(position.liquidation),
             }

@@ -9,6 +9,7 @@
 
 import { renderPainted, TerminalView, MIN_WIDTH, MIN_HEIGHT } from './frame.js';
 import { ActivityLog } from './activityLog.js';
+import { CommandHistory } from './commandHistory.js';
 
 const ESC = '\x1b';
 const ALT_SCREEN_ON = `${ESC}[?1049h`;
@@ -40,8 +41,7 @@ export class Screen {
   private view: TerminalView;
   private running = false;
   private input = '';
-  private history: string[] = [];
-  private historyIndex = -1;
+  private history = new CommandHistory();
   private pendingConfirm: ConfirmHandler | null = null;
   private repaintQueued = false;
   private activityOffset = 0;
@@ -61,6 +61,8 @@ export class Screen {
   start(): void {
     if (this.running) return;
     this.running = true;
+
+    this.history.load();
 
     const log = ActivityLog.getInstance();
     log.captureConsole();
@@ -173,12 +175,12 @@ export class Screen {
       case '\n': {
         const command = this.input.trim();
         this.input = '';
-        this.historyIndex = -1;
         this.activityOffset = 0;
         if (command.length > 0) {
-          this.history.push(command);
+          this.history.add(command);
           void this.onCommand(command);
         }
+        this.history.reset();
         this.scheduleRepaint();
         return;
       }
@@ -243,18 +245,7 @@ export class Screen {
   }
 
   private recall(direction: number): void {
-    if (this.history.length === 0) return;
-
-    if (this.historyIndex === -1 && direction < 0) {
-      this.historyIndex = this.history.length - 1;
-    } else {
-      this.historyIndex = Math.min(
-        this.history.length - 1,
-        Math.max(0, this.historyIndex + direction)
-      );
-    }
-
-    this.input = this.history[this.historyIndex] ?? '';
+    this.input = this.history.recall(direction);
     this.scheduleRepaint();
   }
 

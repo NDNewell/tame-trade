@@ -324,6 +324,7 @@ export class ExchangeClient {
     size: number;
     entry?: number;
     unrealizedPnl?: number;
+    realizedPnl?: number;
     leverage?: number;
     liquidation?: number;
     currency: string;
@@ -354,10 +355,36 @@ export class ExchangeClient {
       size: contracts,
       entry: Number.isFinite(entry) ? entry : undefined,
       unrealizedPnl,
+      realizedPnl: this.readRealizedPnl(info),
       leverage: Number(info.leverage) || undefined,
       liquidation: Number(info.liquidationPrice) || undefined,
       currency,
     };
+  }
+
+  /**
+   * Realized PnL for the current position, read from the raw payload.
+   *
+   * ccxt's parsed position has no realizedPnl for Phemex -- it only computes
+   * unrealizedPnl -- so taking profit on part of a position showed nothing. The
+   * exchange reports it under curTermRealisedPnl, which is the realized amount
+   * for the position as currently held rather than for all time.
+   *
+   * USDT-settled markets report real values ('Rv'); inverse markets report them
+   * scaled ('Ev'), by the exchange's fixed 1e8 factor.
+   */
+  private readRealizedPnl(info: Record<string, any>): number | undefined {
+    const real = info?.curTermRealisedPnlRv ?? info?.cumClosedPnlRv;
+    if (real !== undefined && real !== null && Number.isFinite(Number(real))) {
+      return Number(real);
+    }
+
+    const scaled = info?.curTermRealisedPnlEv ?? info?.cumClosedPnlEv;
+    if (scaled !== undefined && scaled !== null && Number.isFinite(Number(scaled))) {
+      return Number(scaled) / 1e8;
+    }
+
+    return undefined;
   }
 
   /** Open orders for display. Uses the live view; completeness isn't critical. */
