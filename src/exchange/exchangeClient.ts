@@ -964,6 +964,10 @@ export class ExchangeClient {
     const maxConsecutiveErrors = 5;
     let consecutiveErrors = 0;
 
+    // Smallest price move the market can express; anything under it isn't a
+    // move worth an API call.
+    const tickSize = this.getMarketPriceTickSize(market);
+
     const finishChase = (message: string) => {
       this.chaseLimitOrderActive = false;
       this.logAndReplace(message);
@@ -1037,10 +1041,17 @@ export class ExchangeClient {
 
         const updatedBestPrice = levels[0][0];
 
-        if (
-          (side === 'buy' && updatedBestPrice > order.price) ||
-          (side === 'sell' && updatedBestPrice < order.price)
-        ) {
+        // Only chase a move worth chasing. Sub-tick differences can't be
+        // expressed in an order anyway, and amending on every flicker is what
+        // runs an account into the exchange's order-action rate limit.
+        const improves =
+          side === 'buy'
+            ? updatedBestPrice > order.price
+            : updatedBestPrice < order.price;
+        const movedAtLeastOneTick =
+          Math.abs(updatedBestPrice - order.price) >= tickSize;
+
+        if (improves && movedAtLeastOneTick) {
           try {
             const editResult = await this.editOrder(
               orderId,
@@ -1059,19 +1070,49 @@ export class ExchangeClient {
 
             consecutiveErrors = 0;
           } catch (error) {
-            consecutiveErrors++;
-            this.logAndReplace(
-              `Chase: could not move the order to ${updatedBestPrice} ` +
-                `(${(error as Error).message}) [${consecutiveErrors}/${maxConsecutiveErrors}]`
-            );
+            // Exchanges refuse amends for all sorts of reasons — order-action
+            // rate limits, a partial fill, an order still settling from the last
+            // amend. Cancelling and placing a fresh order achieves the same
+            // thing and doesn't depend on amend being available at all.
+            try {
+              await this.exchange!.cancelOrder(orderId, market, params);
+            } catch (cancelError) {
+              // Couldn't amend and couldn't cancel: leave it alone this cycle
+              // rather than risk ending up with two live orders.
+              consecutiveErrors++;
+              this.logAndReplace(
+                `Chase: could not move the order to ${updatedBestPrice} ` +
+                  `(${(error as Error).message}) [${consecutiveErrors}/${maxConsecutiveErrors}]`
+              );
 
-            if (consecutiveErrors >= maxConsecutiveErrors) {
+              if (consecutiveErrors >= maxConsecutiveErrors) {
+                finishChase(
+                  `Chase stopped after ${maxConsecutiveErrors} failed moves. ` +
+                    `The order is still resting at ${order.price} — cancel it with 'cancel chase'.`
+                );
+                return;
+              }
+
+              scheduleNextCycle();
+              return;
+            }
+
+            // The old order is gone from here on, so a failure to place the
+            // replacement leaves nothing resting and must be said plainly.
+            const replacement = await (side === 'buy'
+              ? this.createLimitBuyOrder(market, updatedBestPrice, order.remaining, params, true)
+              : this.createLimitSellOrder(market, updatedBestPrice, order.remaining, params, true));
+
+            if (!replacement?.id) {
               finishChase(
-                `Chase stopped after ${maxConsecutiveErrors} failed moves. ` +
-                  `The order is still resting at ${order.price} — cancel it with 'cancel chase'.`
+                `Chase stopped: the order was cancelled to move it to ${updatedBestPrice}, ` +
+                  `but the replacement could not be placed. Nothing is resting — you are not in this trade.`
               );
               return;
             }
+
+            orderId = replacement.id;
+            consecutiveErrors = 0;
           }
         } else {
           consecutiveErrors = 0;
