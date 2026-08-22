@@ -2,20 +2,22 @@
 //
 // Renders the trading terminal workspace.
 //
-// Every column position here is taken from the approved ASCII mockup rather than
-// chosen. The frame is a fixed 80x40 grid: the mockup's border rows put the
-// vertical divider at column 40 and the frame edges at 0 and 79.
+// The wireframe in docs/mockups/desktop-default.txt defines the intent: which
+// regions exist, their order, what belongs in each, and the relative prominence
+// of values. Dimensions come from the terminal, not the drawing — columns are
+// derived from content widths and the rest is given to whatever should breathe.
 //
 // Colour is carried as spans over the character grid rather than embedded in the
-// strings, so styling can never move a column.
+// strings, so styling can never shift a column, and every coloured value keeps a
+// textual label so colour is never the only carrier of meaning.
 
 import { formatOutput as fo, Color } from '../utils/formatOutput.js';
 
-export const FRAME_WIDTH = 80;
-export const FRAME_HEIGHT = 40;
-export const DIVIDER_COL = 40;
+/** Below this the desktop composition can't hold together. */
+export const MIN_WIDTH = 72;
+export const MIN_HEIGHT = 24;
 
-/** Shown where a value exists in the layout but the exchange gives us nothing. */
+/** Shown where the layout has a slot but the exchange gives us no value. */
 export const NO_VALUE = '-';
 
 export interface HeaderView {
@@ -86,46 +88,53 @@ export interface TerminalView {
   footerRight: string;
 }
 
+export interface Size {
+  width: number;
+  height: number;
+}
+
 interface Span {
   col: number;
   length: number;
   color: Color;
 }
 
-// A single row of the frame: a character grid plus the colour spans over it.
 class Line {
-  private chars: string[] = new Array(FRAME_WIDTH).fill(' ');
+  private chars: string[];
   private spans: Span[] = [];
 
-  constructor(edges = true) {
+  constructor(private width: number, edges = true) {
+    this.chars = new Array(width).fill(' ');
     if (edges) {
       this.chars[0] = '|';
-      this.chars[FRAME_WIDTH - 1] = '|';
+      this.chars[width - 1] = '|';
     }
   }
 
-  divider(): this {
-    this.chars[DIVIDER_COL] = '|';
+  divider(col: number): this {
+    if (col > 0 && col < this.width - 1) this.chars[col] = '|';
     return this;
   }
 
-  // Writes `text` at `col`, clipped so it can never run past `limit` and break
-  // the frame. Returns this for chaining.
-  put(col: number, text: string, color?: Color, limit = FRAME_WIDTH - 1): this {
+  put(col: number, text: string | undefined, color?: Color, limit?: number): this {
     if (text === undefined || text === null) return this;
 
-    const room = Math.max(0, limit - col);
+    const stop = Math.min(limit ?? this.width - 1, this.width);
+    const room = Math.max(0, stop - col);
     const clipped = String(text).slice(0, room);
 
-    for (let i = 0; i < clipped.length; i++) {
-      this.chars[col + i] = clipped[i];
-    }
-
-    if (color && clipped.length > 0) {
-      this.spans.push({ col, length: clipped.length, color });
-    }
+    for (let i = 0; i < clipped.length; i++) this.chars[col + i] = clipped[i];
+    if (color && clipped.length > 0) this.spans.push({ col, length: clipped.length, color });
 
     return this;
+  }
+
+  /** Right-aligns text so its last character sits at `end - 1`. */
+  putRight(end: number, text: string | undefined, color?: Color, floor = 1): this {
+    if (text === undefined || text === null) return this;
+    const value = String(text);
+    const col = Math.max(floor, end - value.length);
+    return this.put(col, value.slice(0, end - col), color, end);
   }
 
   plain(): string {
@@ -140,7 +149,7 @@ class Line {
     let cursor = 0;
 
     for (const span of ordered) {
-      if (span.col < cursor) continue; // overlapping spans: first one wins
+      if (span.col < cursor) continue;
       out += this.chars.slice(cursor, span.col).join('');
       out += fo(this.chars.slice(span.col, span.col + span.length).join(''), span.color);
       cursor = span.col + span.length;
@@ -150,16 +159,6 @@ class Line {
   }
 }
 
-const border = (withDivider = false): Line => {
-  const line = new Line(false);
-  const chars = '+' + '-'.repeat(FRAME_WIDTH - 2) + '+';
-  line.put(0, chars, undefined, FRAME_WIDTH);
-  if (withDivider) line.put(DIVIDER_COL, '+', undefined, FRAME_WIDTH);
-  return line;
-};
-
-// Semantic colours. Textual labels always remain, so colour is never the only
-// carrier of meaning.
 const sideColor = (side: string): Color | undefined => {
   const value = side.trim().toUpperCase();
   if (value === 'BUY' || value === 'LONG') return 'green';
@@ -170,7 +169,7 @@ const sideColor = (side: string): Color | undefined => {
 const signedColor = (value: string): Color | undefined => {
   const trimmed = value.trim();
   if (trimmed.startsWith('+')) return 'green';
-  if (trimmed.startsWith('-')) return 'red';
+  if (trimmed.startsWith('-') && trimmed !== NO_VALUE) return 'red';
   return undefined;
 };
 
@@ -211,72 +210,110 @@ const categoryColor = (category: string): Color | undefined => {
   }
 };
 
-export function buildFrame(view: TerminalView): Line[] {
+/**
+ * How the vertical space is divided.
+ *
+ * Fixed regions take what they need; the position/orders block and the activity
+ * log share whatever is left, because those are the two that genuinely benefit
+ * from more room.
+ */
+export function planHeight(height: number, hasChase: boolean) {
+  const chaseRows = hasChase ? 4 : 0; // label + three rows
+  const fixed =
+    1 + // top border
+    2 + // header
+    1 + // border
+    3 + // market label + two rows
+    1 + // border
+    1 + // border under the split block
+    (hasChase ? chaseRows + 1 : 0) + // chase + its border
+    1 + // border above command
+    1 + // command entry
+    1 + // border
+    1 + // footer
+    1; // bottom border
+
+  const flexible = Math.max(0, height - fixed);
+
+  // The position panel wants ten rows (label, gap, eight fields). Give it that
+  // when there's room, and let activity take the remainder.
+  const splitRows = Math.max(4, Math.min(10, flexible - 4));
+  const activityRows = Math.max(1, flexible - splitRows - 1); // -1 for its label
+
+  return { splitRows, activityRows };
+}
+
+export function buildFrame(view: TerminalView, size: Size): Line[] {
+  const width = Math.max(MIN_WIDTH, size.width);
+  const inner = width - 1;
+  const divider = Math.floor(width / 2);
   const lines: Line[] = [];
   const { header, market, position, orders, chase, activity } = view;
 
-  // --- header ------------------------------------------------------------
+  const border = (withDivider = false): Line => {
+    const line = new Line(width, false);
+    line.put(0, '+' + '-'.repeat(width - 2) + '+', undefined, width);
+    if (withDivider) line.put(divider, '+', undefined, width);
+    return line;
+  };
+
+  const { splitRows, activityRows } = planHeight(
+    Math.max(MIN_HEIGHT, size.height),
+    chase !== null
+  );
+
+  // --- header: identity on the left, connection state on the right ------
   lines.push(border());
 
+  const connectionText = `${header.environment} | ${header.connection}`;
   lines.push(
-    new Line()
+    new Line(width)
       .put(2, 'TRADING TERMINAL')
-      .put(59, header.environment, 'cyan')
-      .put(64, '|')
-      .put(66, header.connection, header.connection.toUpperCase() === 'CONNECTED' ? 'green' : 'red')
+      .putRight(inner - 1, connectionText, undefined, 20)
+      .put(
+        inner - 1 - header.connection.length,
+        header.connection,
+        header.connection.toUpperCase() === 'CONNECTED' ? 'green' : 'red'
+      )
   );
 
+  const context = [header.exchange, header.symbol, header.instrumentType]
+    .filter((part) => part && part.length > 0)
+    .join(' | ');
   lines.push(
-    new Line()
-      .put(2, header.exchange, undefined, 9)
-      .put(9, '|')
-      .put(11, header.symbol, undefined, 25)
-      .put(25, '|')
-      .put(27, header.instrumentType, undefined, 57)
-      .put(57, 'Account:')
-      .put(66, header.account)
+    new Line(width)
+      .put(2, context, undefined, inner - 20)
+      .putRight(inner - 1, `Account: ${header.account}`, undefined, inner - 20)
   );
 
-  // --- market ------------------------------------------------------------
+  // --- market: symbol and last price lead, the rest supports -------------
   lines.push(border());
-  lines.push(new Line().put(2, 'MARKET', 'gray'));
+  lines.push(new Line(width).put(2, 'MARKET', 'gray'));
 
   lines.push(
-    new Line()
+    new Line(width)
       .put(2, market.symbol, 'white', 20)
       .put(20, market.last, 'white', 34)
-      .put(34, market.change, signedColor(market.change), 47)
-      .put(47, 'Bid')
-      .put(51, market.bid, undefined, 64)
-      .put(64, 'Ask')
-      .put(68, market.ask)
+      .put(34, market.change, signedColor(market.change), 46)
+      .put(46, `Bid ${market.bid}`, undefined, Math.floor(inner * 0.8))
+      .putRight(inner - 1, `Ask ${market.ask}`, undefined, Math.floor(inner * 0.8))
   );
 
   lines.push(
-    new Line()
-      .put(2, 'Mark')
-      .put(7, market.mark, undefined, 20)
-      .put(20, 'Index')
-      .put(26, market.index, undefined, 48)
-      .put(48, 'Funding')
-      .put(56, market.funding, undefined, 66)
-      .put(66, 'Spread')
-      .put(73, market.spread)
+    new Line(width)
+      .put(2, `Mark ${market.mark}`, undefined, 20)
+      .put(20, `Index ${market.index}`, undefined, 46)
+      .put(46, `Funding ${market.funding}`, undefined, Math.floor(inner * 0.82))
+      .putRight(inner - 1, `Spread ${market.spread}`, undefined, Math.floor(inner * 0.82))
   );
 
-  // --- position / active orders -----------------------------------------
+  // --- position | active orders -----------------------------------------
   lines.push(border(true));
-
   lines.push(
-    new Line()
-      .divider()
-      .put(2, 'POSITION', 'gray')
-      .put(42, 'ACTIVE ORDERS', 'gray')
+    new Line(width).divider(divider).put(2, 'POSITION', 'gray').put(divider + 2, 'ACTIVE ORDERS', 'gray')
   );
 
-  lines.push(new Line().divider());
-
-  const positionRows: Array<[string, string, Color | undefined]> = position
+  const positionFields: Array<[string, string, Color | undefined]> = position
     ? [
         ['Side', position.side, sideColor(position.side)],
         ['Size', position.size, undefined],
@@ -289,97 +326,115 @@ export function buildFrame(view: TerminalView): Line[] {
       ]
     : [];
 
-  // The right panel's first row is the column header; orders begin beneath it.
-  const orderHeader = new Line()
-    .put(41, 'ID')
-    .put(50, 'SIDE')
-    .put(57, 'QTY')
-    .put(64, 'PRICE')
-    .put(72, 'STATUS');
+  // Order columns are anchored from the right edge, so status and price — the
+  // values that matter when scanning — keep their room and the order id gives up
+  // width first as the panel narrows.
+  const oStatus = inner - 7;
+  const oPrice = oStatus - 8;
+  const oQty = oPrice - 6;
+  const oSide = oQty - 5;
+  const oId = divider + 2;
 
-  for (let row = 0; row < 8; row++) {
-    const line = row === 0 ? orderHeader : new Line();
-    line.divider();
+  const valueCol = 19;
+  const bodyRows = Math.max(1, splitRows - 1); // first row of the block is a gap
 
-    const field = positionRows[row];
-    if (field) {
-      line.put(2, field[0], undefined, 19).put(19, field[1], field[2], DIVIDER_COL);
-    }
+  for (let row = 0; row < bodyRows; row++) {
+    const line = new Line(width).divider(divider);
 
-    if (row > 0) {
+    if (row === 0) {
+      line
+        .put(oId, 'ID', 'gray', oSide)
+        .put(oSide, 'SIDE', 'gray', oQty)
+        .put(oQty, 'QTY', 'gray', oPrice)
+        .put(oPrice, 'PRICE', 'gray', oStatus)
+        .put(oStatus, 'STATUS', 'gray');
+    } else {
       const order = orders[row - 1];
       if (order) {
         line
-          .put(41, order.id, undefined, 50)
-          .put(50, order.side, sideColor(order.side), 57)
-          .put(57, order.qty, undefined, 64)
-          .put(64, order.price, undefined, 72)
-          .put(72, order.status, statusColor(order.status));
+          .put(oId, order.id, undefined, oSide)
+          .put(oSide, order.side, sideColor(order.side), oQty)
+          .put(oQty, order.qty, undefined, oPrice)
+          .put(oPrice, order.price, undefined, oStatus)
+          .put(oStatus, order.status, statusColor(order.status));
+      } else if (row === 1 && orders.length === 0) {
+        line.put(oId, 'No active orders', 'gray', divider + Math.floor(width / 2) - 2);
       }
+    }
+
+    const field = positionFields[row];
+    if (field) {
+      line.put(2, field[0], undefined, valueCol).put(valueCol, field[1], field[2], divider);
+    } else if (row === 0 && !position) {
+      line.put(2, 'No open position', 'gray', divider);
     }
 
     lines.push(line);
   }
 
-  // --- chase -------------------------------------------------------------
-  lines.push(border(true));
-  lines.push(new Line().put(2, 'CHASE', 'gray'));
-
+  // --- chase: only present while one is running --------------------------
   if (chase) {
+    lines.push(border());
+    lines.push(new Line(width).put(2, 'CHASE', 'gray'));
     lines.push(
-      new Line()
-        .put(2, chase.side, sideColor(chase.side), 7)
-        .put(7, chase.quantity)
+      new Line(width).put(2, chase.side, sideColor(chase.side), 7).put(7, chase.quantity)
+    );
+
+    const q1 = 2;
+    const q2 = Math.floor(inner * 0.34);
+    const q3 = Math.floor(inner * 0.58);
+    const q4 = Math.floor(inner * 0.80);
+    lines.push(
+      new Line(width)
+        .put(q1, 'Target', undefined, q1 + 11)
+        .put(q1 + 12, chase.target, undefined, q2)
+        .put(q2, 'Working', undefined, q2 + 8)
+        .put(q2 + 8, chase.working, undefined, q3)
+        .put(q3, 'Reprices', undefined, q3 + 9)
+        .put(q3 + 9, chase.reprices, undefined, q4)
+        .put(q4, 'Elapsed', undefined, q4 + 8)
+        .put(q4 + 8, chase.elapsed)
     );
     lines.push(
-      new Line()
-        .put(2, 'Target')
-        .put(14, chase.target, undefined, 28)
-        .put(28, 'Working')
-        .put(36, chase.working, undefined, 48)
-        .put(48, 'Reprices')
-        .put(57, chase.reprices, undefined, 65)
-        .put(65, 'Elapsed')
-        .put(73, chase.elapsed)
+      new Line(width).put(2, 'Status').put(14, chase.status, statusColor(chase.status))
     );
-    lines.push(new Line().put(2, 'Status').put(14, chase.status, statusColor(chase.status)));
-  } else {
-    lines.push(new Line());
-    lines.push(new Line());
-    lines.push(new Line());
   }
 
   // --- activity ----------------------------------------------------------
   lines.push(border());
-  lines.push(new Line().put(2, 'ACTIVITY', 'gray'));
+  lines.push(new Line(width).put(2, 'ACTIVITY', 'gray'));
 
-  for (let row = 0; row < 10; row++) {
-    const line = new Line();
-    const event = activity[row];
+  const visible = activity.slice(-activityRows);
+  for (let row = 0; row < activityRows; row++) {
+    const line = new Line(width);
+    const event = visible[row];
 
     if (event) {
       line
-        .put(2, event.time, 'gray', 12)
-        .put(12, event.category, categoryColor(event.category), 21)
-        .put(21, event.message, undefined, FRAME_WIDTH - 1);
+        .put(2, event.time, 'gray', 11)
+        .put(12, event.category, categoryColor(event.category), 20)
+        .put(21, event.message, undefined, inner);
     }
 
     lines.push(line);
   }
 
-  // --- command entry -----------------------------------------------------
+  // --- command entry, kept fixed so activity never moves it --------------
   lines.push(border());
-  lines.push(new Line().put(2, '>', 'cyan').put(4, view.input));
+  lines.push(new Line(width).put(2, '>', 'cyan').put(4, view.input, undefined, inner));
 
   // --- footer ------------------------------------------------------------
   lines.push(border());
 
-  const footerLine = new Line();
-  const footerColumns = [2, 7, 13, 20, 27, 35, 43, 54, 62];
-  view.footer.slice(0, footerColumns.length).forEach((command, index) => {
-    footerLine.put(footerColumns[index], command, 'gray', footerColumns[index + 1] ?? 72);
-  });
-  footerLine.put(72, view.footerRight, 'gray');
+  const footerLine = new Line(width);
+  const right = view.footerRight ?? '';
+  let col = 2;
+  for (const command of view.footer) {
+    if (col + command.length >= inner - right.length - 2) break;
+    footerLine.put(col, command, 'gray');
+    col += command.length + 2;
+  }
+  footerLine.putRight(inner - 1, right, 'gray', col);
   lines.push(footerLine);
 
   lines.push(border());
@@ -387,10 +442,10 @@ export function buildFrame(view: TerminalView): Line[] {
   return lines;
 }
 
-export function renderPlain(view: TerminalView): string[] {
-  return buildFrame(view).map((line) => line.plain());
+export function renderPlain(view: TerminalView, size: Size): string[] {
+  return buildFrame(view, size).map((line) => line.plain());
 }
 
-export function renderPainted(view: TerminalView): string[] {
-  return buildFrame(view).map((line) => line.painted());
+export function renderPainted(view: TerminalView, size: Size): string[] {
+  return buildFrame(view, size).map((line) => line.painted());
 }
