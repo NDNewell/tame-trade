@@ -781,10 +781,14 @@ export class ExchangeClient {
 
       return order;
     } catch (error) {
-      console.error(
-        `[ExchangeClient] Failed to place order:`,
-        (error as Error).message
-      );
+      // Never swallow this. Returning undefined made a rejected order
+      // indistinguishable from a placed one, so callers carried on as though
+      // there were an order resting when there was not — and the chase read the
+      // same undefined as 'filled immediately'.
+      //
+      // Callers decide what a failure means for them; none of them get to miss
+      // that it happened.
+      throw error;
     }
   }
 
@@ -1384,13 +1388,28 @@ export class ExchangeClient {
     }
 
     // Pass params (containing TIF: Alo for Hyperliquid) AND postOnly: true flag
-    const order = await (side === 'buy'
-      ? await this.createLimitBuyOrder(market, initialPrice, amount, params, true)
-      : await this.createLimitSellOrder(market, initialPrice, amount, params, true));
+    // The active flag is already set, so a failure here has to clear it or the
+    // next chase is refused with 'Chase order already active'.
+    let order;
+    try {
+      order = await (side === 'buy'
+        ? await this.createLimitBuyOrder(market, initialPrice, amount, params, true)
+        : await this.createLimitSellOrder(market, initialPrice, amount, params, true));
+    } catch (error) {
+      this.chaseLimitOrderActive = false;
+      this.currentChaseOrderId = undefined;
+      throw error;
+    }
 
     if (!order) {
-      console.log('Order filled immediately');
+      // executeOrder throws on rejection, so nothing here means the client had
+      // no exchange to talk to rather than an order that vanished.
       this.chaseLimitOrderActive = false;
+      this.currentChaseOrderId = undefined;
+      NotificationManager.notify(
+        'Chase not started: no order was placed.',
+        NType.ERROR
+      );
       return;
     }
 
@@ -1871,7 +1890,10 @@ export class ExchangeClient {
         console.error(`[ExchangeClient] No positions found for ${market}.`);
       }
     } catch (error) {
-      console.error(`[ExchangeClient] Failed to close position:`, error);
+      NotificationManager.notify(
+        `Position not closed: ${(error as Error).message}. You are still in this position.`,
+        NType.ERROR
+      );
     }
   }
 
@@ -2425,7 +2447,10 @@ export class ExchangeClient {
       }
     } catch (error) {
       // If any errors occur during the process, log the error message
-      console.error(`[ExchangeClient] Failed to place order:`, error);
+      NotificationManager.notify(
+        `Stop order NOT placed: ${(error as Error).message}. This position is unprotected.`,
+        NType.ERROR
+      );
       return undefined; // Return undefined on error
     }
   }
