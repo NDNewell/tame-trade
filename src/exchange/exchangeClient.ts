@@ -1614,17 +1614,31 @@ export class ExchangeClient {
           return isLimit && isNotStopTrigger;
       });
 
-      // If no quantity is provided, calculate it using the helper method
-      if (quantity === undefined) {
-         quantity = await this._calculateDefaultStopAmount(market);
+      const position = await this.getPositionStructure(market);
+      const hasPosition =
+        position?.contracts !== undefined && position.contracts > 0;
+
+      // Phemex expresses "the whole position" as an order quantity of zero: the
+      // exchange closes whatever the position is at the moment the stop fires,
+      // rather than a size fixed when it was placed. That is what the UI creates
+      // when you set a stop on a position, and it is why an explicitly sized
+      // stop shows up as a standalone conditional order instead.
+      //
+      // Only when the size wasn't given. 'stop <price> <size>' still means that
+      // size, so a partial stop is still possible.
+      const closeWholePosition =
+        !sizeCameFromUser && this.exchange.id === 'phemex' && hasPosition;
+
+      if (closeWholePosition) {
+        quantity = 0;
+      } else if (quantity === undefined) {
+        quantity = await this._calculateDefaultStopAmount(market);
       }
 
       // If there's a non-zero quantity, proceed with creating the stop order
-      if (quantity > 0) {
+      if (quantity > 0 || closeWholePosition) {
         // Get limit orders only and determine their side if there are no open positions from which to determine the side
-        const position = await this.getPositionStructure(market);
-
-        if (position?.contracts !== undefined && position.contracts > 0) {
+        if (hasPosition) {
           side = position?.side === 'long' ? 'sell' : 'buy';
         } else if (limitOrders.length > 0) {
           side = limitOrders[0].side === 'buy' ? 'sell' : 'buy';
@@ -1693,10 +1707,15 @@ export class ExchangeClient {
         }
 
         // Adjust the quantity to match the exchange's precision requirements
-        quantity = await this.getQuantityPrecision(market, quantity, {
-          enforceFatFinger: enforceFatFinger && sizeCameFromUser,
-          price,
-        });
+        // A zero quantity is the "whole position" marker, not a size, so it
+        // skips the size checks -- which would reject it, and which have nothing
+        // to guard against when the exchange caps the fill at the position.
+        if (!closeWholePosition) {
+          quantity = await this.getQuantityPrecision(market, quantity, {
+            enforceFatFinger: enforceFatFinger && sizeCameFromUser,
+            price,
+          });
+        }
 
         // --- Adjust parameters for Hyperliquid Stop Market ---
         let finalOrderType = orderType;
@@ -1733,7 +1752,11 @@ export class ExchangeClient {
         // Only log and return if the order was successfully created
         if (createdOrder) {
           if (!suppressLog) {
-              console.log(`Stop order placed at ${price} for ${quantity} ${market}`);
+              console.log(
+                closeWholePosition
+                  ? `Stop order placed at ${price} for the whole ${market} position`
+                  : `Stop order placed at ${price} for ${quantity} ${market}`
+              );
           }
           return createdOrder;
         } else {
