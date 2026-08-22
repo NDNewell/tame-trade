@@ -43,6 +43,19 @@ export class ExchangeClient {
   // than remember the id the chase started with — otherwise it cancels an order
   // that is already gone and leaves the live one resting.
   private currentChaseOrderId: string | undefined = undefined;
+  private tickerStreams = new Map<
+    string,
+    { price: number | undefined; at: number; running: boolean }
+  >();
+  private orderStreams = new Map<
+    string,
+    {
+      orders: Map<string, Order>;
+      running: boolean;
+      healthy: boolean;
+      syncedAt: number;
+    }
+  >();
 
   private constructor() {
     this.exchangeManager = new ConfigManager();
@@ -182,6 +195,11 @@ export class ExchangeClient {
       exchangeConfig.secret = credentials.secret;
     }
 
+    // Feeds belong to the exchange instance being replaced; leaving them running
+    // would keep sockets open against an exchange no longer in use.
+    this.stopTickerStream();
+    this.stopOrderStream();
+
     this.exchange = new (ccxtpro as any)[exchangeId.toLowerCase()](exchangeConfig);
 
     await this.loadMarkets();
@@ -310,10 +328,187 @@ export class ExchangeClient {
     }
   }
 
+  // How stale a streamed price may be before it is fetched again. Long enough
+  // that a quiet market doesn't force a REST call, short enough that nothing
+  // acts on a price from a different market condition.
+  private static readonly STREAMED_PRICE_MAX_AGE_MS = 5000;
+
+  // Keeps the last traded price for a market current from the exchange's ticker
+  // feed. Every stop and market order needs a reference price, and taking it
+  // from a stream rather than a request removes a round trip from paths that are
+  // typed in a hurry.
+  private startTickerStream(market: string): void {
+    if (!this.exchange?.has['watchTicker']) return;
+    if (this.tickerStreams.get(market)?.running) return;
+
+    const state = { price: undefined as number | undefined, at: 0, running: true };
+    this.tickerStreams.set(market, state);
+
+    void (async () => {
+      while (state.running && this.exchange) {
+        try {
+          const ticker = await this.exchange.watchTicker(market);
+          const last = ticker.last ?? ticker.close ?? undefined;
+
+          if (typeof last === 'number' && Number.isFinite(last) && last > 0) {
+            state.price = last;
+            state.at = Date.now();
+          }
+        } catch (error) {
+          // The feed is a shortcut, not a dependency. Stop the loop and let
+          // callers fall back to fetching, rather than surfacing an error for
+          // something the trader never asked for.
+          state.running = false;
+          return;
+        }
+      }
+    })();
+  }
+
+  // A resynced snapshot older than this is not trusted, on the theory that a
+  // feed which has gone quiet for a minute may have missed something.
+  private static readonly ORDER_CACHE_MAX_AGE_MS = 60000;
+
+  // Keeps a live view of open orders for a market: a REST snapshot to start,
+  // then updates applied from the order feed as they arrive.
+  //
+  // watchOrders reports changes, not the whole set, so this view is only as
+  // complete as the snapshot it started from plus every event since. If the feed
+  // drops, it can silently fall behind — so it is marked unhealthy on any error
+  // and callers that need completeness fetch instead. See getLiveOpenOrders.
+  private startOrderStream(
+    market: string,
+    params?: Record<string, any>,
+    snapshot?: Order[]
+  ): void {
+    if (!this.exchange?.has['watchOrders']) return;
+    if (this.orderStreams.get(market)?.running) return;
+
+    const state = {
+      orders: new Map<string, Order>(),
+      running: true,
+      healthy: false,
+      syncedAt: 0,
+    };
+    this.orderStreams.set(market, state);
+
+    void (async () => {
+      try {
+        // Callers normally have just fetched the orders themselves; seeding from
+        // that avoids asking for the same thing twice.
+        const seed =
+          snapshot ??
+          (await this.exchange!.fetchOpenOrders(market, undefined, undefined, params));
+
+        for (const order of seed) {
+          if (order.id) state.orders.set(order.id, order);
+        }
+
+        state.healthy = true;
+        state.syncedAt = Date.now();
+      } catch {
+        state.running = false;
+        return;
+      }
+
+      while (state.running && this.exchange) {
+        try {
+          const updates = await this.exchange.watchOrders(market);
+
+          for (const update of updates) {
+            if (!update.id) continue;
+
+            const status = String(update.status ?? '');
+            const done =
+              status === 'closed' || status === 'canceled' || status === 'rejected';
+
+            if (done) {
+              state.orders.delete(update.id);
+            } else {
+              state.orders.set(update.id, update);
+            }
+          }
+
+          state.syncedAt = Date.now();
+        } catch {
+          // Fell behind; the view can no longer be trusted to be complete.
+          state.healthy = false;
+          state.running = false;
+          return;
+        }
+      }
+    })();
+  }
+
+  private stopOrderStream(market?: string): void {
+    for (const [symbol, state] of this.orderStreams) {
+      if (market === undefined || symbol === market) {
+        state.running = false;
+        this.orderStreams.delete(symbol);
+      }
+    }
+  }
+
+  // Open orders for a market.
+  //
+  // `mustBeComplete` is for callers whose correctness depends on seeing every
+  // order — cancelling them all, most importantly. Those always fetch: a cache
+  // that has quietly missed an order would report success while leaving one
+  // live, and being told you are flat when you are not is the worst outcome this
+  // code can produce. Sizing and side-determination paths, which run often and
+  // tolerate being a moment behind, take the streamed view.
+  private async getLiveOpenOrders(
+    market: string,
+    params?: Record<string, any>,
+    mustBeComplete = false
+  ): Promise<Order[]> {
+    const state = this.orderStreams.get(market);
+    const fresh =
+      state?.healthy === true &&
+      Date.now() - state.syncedAt <= ExchangeClient.ORDER_CACHE_MAX_AGE_MS;
+
+    if (!mustBeComplete && fresh) {
+      return Array.from(state!.orders.values());
+    }
+
+    const orders = await this.exchange!.fetchOpenOrders(
+      market,
+      undefined,
+      undefined,
+      params
+    );
+
+    // Seed the feed from this snapshot so the next call can be served from it.
+    this.startOrderStream(market, params, orders);
+
+    return orders;
+  }
+
+  private stopTickerStream(market?: string): void {
+    for (const [symbol, state] of this.tickerStreams) {
+      if (market === undefined || symbol === market) {
+        state.running = false;
+        this.tickerStreams.delete(symbol);
+      }
+    }
+  }
+
   // Last traded price, or undefined if one can't be established. Callers decide
   // whether that is fatal — a protective stop should still be placeable when the
   // ticker is briefly unavailable.
   private async getReferencePrice(market: string): Promise<number | undefined> {
+    const streamed = this.tickerStreams.get(market);
+
+    if (
+      streamed?.price !== undefined &&
+      Date.now() - streamed.at <= ExchangeClient.STREAMED_PRICE_MAX_AGE_MS
+    ) {
+      return streamed.price;
+    }
+
+    // Nothing live, or what's live is too old to act on.
+    this.startTickerStream(market);
+
     try {
       const ticker = await this.exchange!.fetchTicker(market);
       const last = ticker.last ?? ticker.close ?? undefined;
@@ -1888,8 +2083,8 @@ export class ExchangeClient {
     const publicAddress = this.exchange?.id === 'hyperliquid' ?
       (this.exchange as any).publicAddress || (this.exchange as any).walletAddress : undefined;
 
-    // Fetch open orders, potentially with user filter for Hyperliquid
-    const openOrders = await this.exchange!.fetchOpenOrders(market, undefined, undefined,
+    // Sizing only; a moment-old view is fine here.
+    const openOrders = await this.getLiveOpenOrders(market,
         publicAddress ? { 'user': publicAddress } : undefined);
 
     // Filter to only include limit orders, excluding stop/market orders
@@ -1970,8 +2165,8 @@ export class ExchangeClient {
       const walletAddress = this.exchange?.id === 'hyperliquid' ?
         (this.exchange as any).publicAddress || (this.exchange as any).walletAddress : undefined;
 
-      // Fetch open orders needed for side determination if quantity is calculated
-      const openOrders = await this.exchange!.fetchOpenOrders(market, undefined, undefined,
+      // Side determination only; a moment-old view is fine here.
+      const openOrders = await this.getLiveOpenOrders(market,
         walletAddress ? { 'user': walletAddress } : undefined);
 
        // Filter to only include limit orders, excluding stop/market orders (needed for side calculation)
