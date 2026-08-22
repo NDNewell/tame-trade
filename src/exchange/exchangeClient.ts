@@ -38,6 +38,11 @@ export class ExchangeClient {
   private eventEmitter: EventEmitter;
   private chaseLimitOrderActive: boolean = false;
   private fatFingerLimit: number | undefined = undefined;
+  // The order the chase is currently working. It changes whenever a move is
+  // done as cancel/replace, so 'cancel chase' has to read it from here rather
+  // than remember the id the chase started with — otherwise it cancels an order
+  // that is already gone and leaves the live one resting.
+  private currentChaseOrderId: string | undefined = undefined;
 
   private constructor() {
     this.exchangeManager = new ConfigManager();
@@ -874,8 +879,12 @@ export class ExchangeClient {
   async cancelChaseOrder(orderId: string, market: string, params?: Record<string, any>): Promise<void> {
     // Always set the active flag to false when cancellation is attempted
     this.chaseLimitOrderActive = false;
+    // Prefer the id the chase is actually working; the caller's copy is from
+    // when the chase started and may name an order that has since been replaced.
+    const targetId = this.currentChaseOrderId ?? orderId;
+    this.currentChaseOrderId = undefined;
     try {
-      await this.exchange!.cancelOrder(orderId, market, params);
+      await this.exchange!.cancelOrder(targetId, market, params);
     } catch (error: any) {
         // Check if it's a benign OrderNotFound error
         const errorMessage = String(error.message || '');
@@ -896,6 +905,167 @@ export class ExchangeClient {
 
   getChaseLimitOrderStatus(): boolean {
     return this.chaseLimitOrderActive;
+  }
+
+  // Chase driven by the exchange's WebSocket feeds instead of polling.
+  //
+  // The book pushes prices as they change, and the order stream reports fills
+  // and cancels as they happen. That removes two REST calls per cycle, so the
+  // only requests left are the ones that actually move an order — which is what
+  // the exchange's order-action rate limit is for. It also means a fill is known
+  // from an event rather than looked up afterwards in an API that lags.
+  //
+  // Phemex has no order placement over WebSocket, so moves stay on REST.
+  private async runStreamingChase(opts: {
+    market: string;
+    side: string;
+    amount: number;
+    orderId: string;
+    orderPrice: number;
+    params?: Record<string, any>;
+  }): Promise<void> {
+    const { market, side, amount, params } = opts;
+    const tickSize = this.getMarketPriceTickSize(market);
+
+    let orderId = opts.orderId;
+    let orderPrice = opts.orderPrice;
+    let remaining = amount;
+    let finished = false;
+    // A move is cancel/replace on some exchanges, which makes the old order
+    // report as cancelled. Without this the order stream would read our own
+    // replacement as the trader's order being cancelled and end the chase.
+    let moveInFlight = false;
+    // The in-flight flag alone isn't enough: the cancellation event for an order
+    // we replaced can arrive after the move has finished. Orders we retired
+    // ourselves are remembered so a late event about one is never mistaken for
+    // the trader cancelling.
+    const retiredOrderIds = new Set<string>();
+
+    this.currentChaseOrderId = orderId;
+
+    const finish = (message: string) => {
+      if (finished) return;
+      finished = true;
+      this.chaseLimitOrderActive = false;
+      this.currentChaseOrderId = undefined;
+      this.logAndReplace(message);
+    };
+
+    const moveTo = async (targetPrice: number) => {
+      if (moveInFlight || finished || !this.chaseLimitOrderActive) return;
+      moveInFlight = true;
+
+      try {
+        try {
+          const edited = await this.editOrder(
+            orderId,
+            market,
+            'limit',
+            targetPrice,
+            remaining,
+            params,
+            // The stream keeps us current on the order, so hand editOrder what
+            // it needs rather than let it fetch order history — that lookup is
+            // the REST call streaming exists to avoid.
+            { id: orderId, side, amount: remaining } as unknown as Order
+          );
+
+          if (edited?.id && edited.id !== orderId) {
+            orderId = edited.id;
+          }
+        } catch (editError) {
+          // Amend refused: cancel and replace instead.
+          retiredOrderIds.add(orderId);
+          await this.exchange!.cancelOrder(orderId, market, params);
+
+          const replacement = await (side === 'buy'
+            ? this.createLimitBuyOrder(market, targetPrice, remaining, params, true)
+            : this.createLimitSellOrder(market, targetPrice, remaining, params, true));
+
+          if (!replacement?.id) {
+            finish(
+              `Chase stopped: the order was cancelled to move it to ${targetPrice}, ` +
+                `but the replacement could not be placed. Nothing is resting — you are not in this trade.`
+            );
+            return;
+          }
+
+          orderId = replacement.id;
+          // An exchange that reuses the id must not leave the live order marked
+          // as retired.
+          retiredOrderIds.delete(orderId);
+        }
+
+        orderPrice = targetPrice;
+        this.currentChaseOrderId = orderId;
+      } catch (error) {
+        this.logAndReplace(
+          `Chase: could not move the order to ${targetPrice} (${(error as Error).message})`
+        );
+      } finally {
+        moveInFlight = false;
+      }
+    };
+
+    const followBook = async () => {
+      while (!finished && this.chaseLimitOrderActive) {
+        const book = await this.exchange!.watchOrderBook(market);
+        if (finished || !this.chaseLimitOrderActive) return;
+
+        const levels = side === 'buy' ? book.bids : book.asks;
+        if (!levels || levels.length === 0) continue;
+
+        const best = levels[0][0];
+        const improves = side === 'buy' ? best > orderPrice : best < orderPrice;
+
+        if (improves && Math.abs(best - orderPrice) >= tickSize) {
+          await moveTo(best);
+        }
+      }
+    };
+
+    const followOrder = async () => {
+      while (!finished && this.chaseLimitOrderActive) {
+        const orders = await this.exchange!.watchOrders(market);
+        if (finished || !this.chaseLimitOrderActive) return;
+
+        for (const update of orders) {
+          // Anything we retired ourselves is our own doing, however late the
+          // event arrives.
+          if (update.id !== undefined && retiredOrderIds.has(update.id)) continue;
+
+          // Only the order being worked; events for orders we have already
+          // replaced are stale by definition.
+          if (update.id !== orderId) continue;
+
+          if (update.remaining !== undefined) {
+            remaining = update.remaining;
+          }
+
+          const status = String(update.status ?? '');
+
+          if (status === 'closed') {
+            finish(
+              `Chase ${side} order filled for ${update.filled ?? amount} ${market}`
+            );
+            return;
+          }
+
+          if (status === 'canceled' || status === 'rejected') {
+            // Our own cancel/replace produces this too; only the trader's
+            // cancellation should end the chase.
+            if (!moveInFlight) {
+              finish(`Chase ${side} order ${status} ${market}`);
+              return;
+            }
+          }
+        }
+      }
+    };
+
+    // Whichever finishes first ends the chase; the other loop sees `finished`
+    // on its next event and exits.
+    await Promise.race([followBook(), followOrder()]);
   }
 
   async chaseLimitOrder(
@@ -970,6 +1140,7 @@ export class ExchangeClient {
 
     const finishChase = (message: string) => {
       this.chaseLimitOrderActive = false;
+      this.currentChaseOrderId = undefined;
       this.logAndReplace(message);
     };
 
@@ -1086,6 +1257,7 @@ export class ExchangeClient {
             // Check if the order ID changed after edit (esp. for cancel/replace exchanges)
             if (editResult && editResult.id !== orderId) {
               orderId = editResult.id; // Update orderId for subsequent checks
+              this.currentChaseOrderId = orderId;
             }
 
             consecutiveErrors = 0;
@@ -1132,6 +1304,7 @@ export class ExchangeClient {
             }
 
             orderId = replacement.id;
+            this.currentChaseOrderId = orderId;
             consecutiveErrors = 0;
           }
         } else {
@@ -1162,7 +1335,35 @@ export class ExchangeClient {
       }
     };
 
-    runCycle();
+    this.currentChaseOrderId = orderId;
+
+    // Prefer the live feeds when the exchange has them; fall back to polling if
+    // they aren't supported or the socket refuses to start (bad key, blocked
+    // port). A chase that polls is worse than one that streams, but far better
+    // than one that doesn't run.
+    const canStream =
+      Boolean(this.exchange.has['watchOrderBook']) &&
+      Boolean(this.exchange.has['watchOrders']);
+
+    if (canStream) {
+      this.runStreamingChase({
+        market,
+        side,
+        amount,
+        orderId,
+        orderPrice: initialPrice,
+        params,
+      }).catch((error) => {
+        if (!this.chaseLimitOrderActive) return;
+
+        this.logAndReplace(
+          `Chase: live feed unavailable (${(error as Error).message}); using polling instead.`
+        );
+        runCycle();
+      });
+    } else {
+      runCycle();
+    }
 
     // let's parse the decay time. 'decay' that takes a time argument in seconds e.g. `5s` or minutes e.g. `1m`
     const parseDecayTime = (decay: string): number => {
