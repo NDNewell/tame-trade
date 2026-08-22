@@ -305,6 +305,27 @@ export class ExchangeClient {
     }
   }
 
+  // Last traded price, or undefined if one can't be established. Callers decide
+  // whether that is fatal — a protective stop should still be placeable when the
+  // ticker is briefly unavailable.
+  private async getReferencePrice(market: string): Promise<number | undefined> {
+    try {
+      const ticker = await this.exchange!.fetchTicker(market);
+      const last = ticker.last ?? ticker.close ?? undefined;
+
+      return typeof last === 'number' && Number.isFinite(last) && last > 0
+        ? last
+        : undefined;
+    } catch (error) {
+      console.warn(
+        `[ExchangeClient] Could not fetch a reference price for ${market}: ${
+          (error as Error).message
+        }`
+      );
+      return undefined;
+    }
+  }
+
   // Notional value of an order, in the market's quote currency.
   //
   // On inverse contracts (Phemex's BTC/USD:BTC and friends) each contract is
@@ -333,8 +354,7 @@ export class ExchangeClient {
       !Number.isFinite(referencePrice) ||
       referencePrice <= 0
     ) {
-      const ticker = await this.exchange!.fetchTicker(market);
-      referencePrice = ticker.last ?? ticker.close ?? undefined;
+      referencePrice = await this.getReferencePrice(market);
     }
 
     if (
@@ -1556,6 +1576,23 @@ export class ExchangeClient {
       // Format price to required decimal places
       price = Number(price.toFixed(Math.abs(Math.log10(marketInfo.precision.price))));
 
+      // A stop is only meaningful near the market, so a price nowhere near it is
+      // almost always transposed arguments -- 'stop 0.5 15000' in the old
+      // size-first order, which now reads as a stop at 0.5. Refuse it rather than
+      // resting an order that can never behave as intended.
+      const marketPrice = await this.getReferencePrice(market);
+
+      if (marketPrice !== undefined) {
+        const ratio = price / marketPrice;
+
+        if (ratio > 10 || ratio < 0.1) {
+          throw new Error(
+            `Stop price ${price} is far from the market price of ${marketPrice} for ${market}. ` +
+              `No order was placed. The stop price comes first: 'stop <price> [size]'.`
+          );
+        }
+      }
+
       let side;
 
       // Get public wallet address from exchange config for Hyperliquid
@@ -1592,9 +1629,8 @@ export class ExchangeClient {
         } else if (limitOrders.length > 0) {
           side = limitOrders[0].side === 'buy' ? 'sell' : 'buy';
         } else {
-          // Get current market price to determine side
-          const ticker = await this.exchange!.fetchTicker(market);
-          const currentPrice = ticker.last || 0;
+          // Reuse the price already fetched for the sanity check above.
+          const currentPrice = marketPrice ?? 0;
 
           // If stop price is below current price, it's a sell stop
           // If stop price is above current price, it's a buy stop
