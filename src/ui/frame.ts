@@ -243,7 +243,162 @@ export function planHeight(height: number, hasChase: boolean) {
   return { splitRows, activityRows };
 }
 
+/**
+ * Below this the side-by-side composition stops working and the stacked one
+ * takes over: regions run full width, and the values that matter least are
+ * dropped rather than squeezed.
+ */
+export const STACK_BELOW_WIDTH = 80;
+
+function buildStackedFrame(view: TerminalView, size: Size): Line[] {
+  const width = Math.max(MIN_WIDTH, size.width);
+  const inner = width - 1;
+  const lines: Line[] = [];
+  const { header, market, position, orders, chase, activity } = view;
+
+  const border = (): Line => {
+    const line = new Line(width, false);
+    line.put(0, '+' + '-'.repeat(width - 2) + '+', undefined, width);
+    return line;
+  };
+
+  // Narrow keeps the values you trade on and drops the reference ones.
+  const positionFields: Array<[string, string, Color | undefined]> = position
+    ? [
+        ['Side', position.side, sideColor(position.side)],
+        ['Size', position.size, undefined],
+        ['Entry', position.entry, undefined],
+        ['Mark', position.mark, undefined],
+        ['Unrealized PnL', position.unrealizedPnl, signedColor(position.unrealizedPnl)],
+      ]
+    : [];
+
+  const orderRows = Math.min(orders.length, 3);
+  const chaseRows = chase ? 4 : 0;
+  const fixed =
+    1 + 2 + 1 + 3 + 1 + // header + market
+    (1 + Math.max(1, positionFields.length)) + 1 + // position
+    (2 + Math.max(1, orderRows)) + 1 + // orders
+    chaseRows +
+    1 + 1 + 1 + 1 + 1; // activity label, command, borders, footer
+  const activityRows = Math.max(1, Math.max(MIN_HEIGHT, size.height) - fixed - 1);
+
+  lines.push(border());
+  lines.push(
+    new Line(width)
+      .put(2, 'TRADING TERMINAL', undefined, inner - 22)
+      .putRight(inner - 1, `${header.environment} | ${header.connection}`, undefined, 20)
+      .put(
+        inner - 1 - header.connection.length,
+        header.connection,
+        header.connection.toUpperCase() === 'CONNECTED' ? 'green' : 'red'
+      )
+  );
+  lines.push(new Line(width).put(2, `${header.exchange} | ${header.symbol}`, undefined, inner));
+
+  lines.push(border());
+  lines.push(new Line(width).put(2, 'MARKET', 'gray'));
+  lines.push(
+    new Line(width)
+      .put(2, market.symbol, 'white', 16)
+      .put(16, market.last, 'white', 26)
+      .put(26, market.change, signedColor(market.change), inner)
+  );
+  lines.push(
+    new Line(width)
+      .put(2, `Bid ${market.bid}`, undefined, 16)
+      .put(16, `Ask ${market.ask}`, undefined, 30)
+      .put(30, `Mark ${market.mark}`, undefined, 45)
+      .put(45, `Spread ${market.spread}`, undefined, inner)
+  );
+
+  lines.push(border());
+  lines.push(new Line(width).put(2, 'POSITION', 'gray'));
+  if (positionFields.length === 0) {
+    lines.push(new Line(width).put(2, 'No open position', 'gray', inner));
+  } else {
+    for (const [label, value, color] of positionFields) {
+      lines.push(new Line(width).put(2, label, undefined, 19).put(19, value, color, inner));
+    }
+  }
+
+  lines.push(border());
+  lines.push(new Line(width).put(2, 'ACTIVE ORDERS', 'gray'));
+  const c1 = 2, c2 = 10, c3 = 17, c4 = 24, c5 = 33;
+  lines.push(
+    new Line(width)
+      .put(c1, 'ID', 'gray', c2)
+      .put(c2, 'SIDE', 'gray', c3)
+      .put(c3, 'QTY', 'gray', c4)
+      .put(c4, 'PRICE', 'gray', c5)
+      .put(c5, 'STATUS', 'gray', inner)
+  );
+  if (orderRows === 0) {
+    lines.push(new Line(width).put(2, 'No active orders', 'gray', inner));
+  } else {
+    for (const order of orders.slice(0, orderRows)) {
+      lines.push(
+        new Line(width)
+          .put(c1, order.id, undefined, c2)
+          .put(c2, order.side, sideColor(order.side), c3)
+          .put(c3, order.qty, undefined, c4)
+          .put(c4, order.price, undefined, c5)
+          .put(c5, order.status, statusColor(order.status), inner)
+      );
+    }
+  }
+
+  if (chase) {
+    lines.push(border());
+    lines.push(new Line(width).put(2, 'CHASE', 'gray'));
+    lines.push(new Line(width).put(2, chase.side, sideColor(chase.side), 7).put(7, chase.quantity, undefined, inner));
+    const summary = `Working ${chase.working} | Reprices ${chase.reprices} | ${chase.elapsed} | `;
+    lines.push(
+      new Line(width)
+        .put(2, summary, undefined, inner)
+        .put(Math.min(2 + summary.length, inner - 1), chase.status, statusColor(chase.status), inner)
+    );
+  }
+
+  lines.push(border());
+  lines.push(new Line(width).put(2, 'ACTIVITY', 'gray'));
+  const visible = activity.slice(-activityRows);
+  for (let row = 0; row < activityRows; row++) {
+    const line = new Line(width);
+    const event = visible[row];
+    if (event) {
+      line
+        .put(2, event.time, 'gray', 11)
+        .put(11, event.category, categoryColor(event.category), 18)
+        .put(18, event.message, undefined, inner);
+    }
+    lines.push(line);
+  }
+
+  lines.push(border());
+  lines.push(new Line(width).put(2, '>', 'cyan').put(4, view.input, undefined, inner));
+
+  lines.push(border());
+  const footerLine = new Line(width);
+  let col = 2;
+  for (const command of view.footer) {
+    if (col + command.length >= inner - 1) break;
+    footerLine.put(col, command, 'gray');
+    col += command.length + 1;
+  }
+  if (col + view.footerRight.length < inner) footerLine.put(col, view.footerRight, 'gray');
+  lines.push(footerLine);
+
+  lines.push(border());
+  return lines;
+}
+
 export function buildFrame(view: TerminalView, size: Size): Line[] {
+  if (size.width < STACK_BELOW_WIDTH) return buildStackedFrame(view, size);
+  return buildWideFrame(view, size);
+}
+
+function buildWideFrame(view: TerminalView, size: Size): Line[] {
   const width = Math.max(MIN_WIDTH, size.width);
   const inner = width - 1;
   const divider = Math.floor(width / 2);
