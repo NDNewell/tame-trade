@@ -1004,27 +1004,47 @@ export class ExchangeClient {
 
         if (!order) {
           // Gone from the open orders isn't the same as filled — it may have
-          // been cancelled or rejected. Ask the exchange rather than assuming
-          // the outcome the trader would rather hear.
-          let outcome = `closed (status unknown)`;
+          // been cancelled or rejected.
+          //
+          // Phemex resolves a finished order through its historical data API,
+          // which lags the live book by a second or so, and answers in the
+          // meantime with an empty record. An empty record is 'not yet known',
+          // never 'did not fill', so only a record that actually says something
+          // is allowed to decide the outcome.
+          let outcome: string | undefined;
 
-          try {
-            const finalOrder = await this.exchange!.fetchOrder(orderId, market, params);
-            const filled = Number(finalOrder?.filled ?? 0);
-            const status = String(finalOrder?.status ?? '');
-
-            if (status === 'closed' || filled >= amount) {
-              outcome = `filled for ${filled || amount}`;
-            } else if (filled > 0) {
-              outcome = `${status || 'ended'} after filling ${filled} of ${amount}`;
-            } else {
-              outcome = `${status || 'ended'} without filling`;
+          for (let attempt = 0; attempt < 3 && outcome === undefined; attempt++) {
+            if (attempt > 0) {
+              await this.sleep(750);
             }
-          } catch {
-            // Leave the neutral wording rather than claim a fill we can't confirm.
+
+            try {
+              const finalOrder = await this.exchange!.fetchOrder(orderId, market, params);
+              const filled = Number(finalOrder?.filled ?? 0);
+              const status = String(finalOrder?.status ?? '');
+
+              if (status === 'closed' || filled >= amount) {
+                outcome = `filled for ${filled || amount}`;
+              } else if (status === 'canceled' || status === 'rejected') {
+                outcome =
+                  filled > 0
+                    ? `${status} after filling ${filled} of ${amount}`
+                    : `${status} without filling`;
+              } else if (filled > 0) {
+                outcome = `ended with ${filled} of ${amount} filled`;
+              }
+              // Anything else is an unpopulated record: try again.
+            } catch {
+              // Not visible to the history API yet either; try again.
+            }
           }
 
-          finishChase(`Chase ${side} order ${outcome} ${market}`);
+          finishChase(
+            outcome !== undefined
+              ? `Chase ${side} order ${outcome} ${market}`
+              : `Chase ${side} order is no longer open for ${market}. ` +
+                  `The exchange hasn't reported the outcome yet — check your position.`
+          );
           return;
         }
 
