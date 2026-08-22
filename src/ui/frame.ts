@@ -475,9 +475,9 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
     const event = visible[row];
     if (event) {
       line
-        .put(2, event.time, 'gray', 11)
-        .put(11, event.category, categoryColor(event.category), 18)
-        .put(18, event.message, undefined, inner);
+        .put(2, event.time.slice(0, 11), 'gray', 14)
+        .put(14, event.category, categoryColor(event.category), 21)
+        .put(21, event.message, undefined, inner);
     }
     lines.push(line);
   }
@@ -698,9 +698,9 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
 
     if (event) {
       line
-        .put(2, event.time, 'gray', 11)
-        .put(12, event.category, categoryColor(event.category), 20)
-        .put(21, event.message, undefined, inner);
+        .put(2, event.time, 'gray', 17)
+        .put(17, event.category, categoryColor(event.category), 26)
+        .put(26, event.message, undefined, inner);
     }
 
     lines.push(line);

@@ -64,7 +64,13 @@ export class ActivityLog {
    */
   add(category: ActivityCategory, message: string, debug = false, at?: number): void {
     const when = at !== undefined && Number.isFinite(at) ? at : Date.now();
-    const time = new Date(when).toTimeString().slice(0, 8);
+    // Date as well as time: the feed replays events from earlier sessions, so a
+    // bare clock time is ambiguous about which day it belongs to.
+    const moment = new Date(when);
+    const date = `${String(moment.getMonth() + 1).padStart(2, '0')}-${String(
+      moment.getDate()
+    ).padStart(2, '0')}`;
+    const time = `${date} ${moment.toTimeString().slice(0, 8)}`;
     // Colour arrives embedded in captured output. Those bytes take no columns on
     // screen but count as characters, so leaving them in makes every layout
     // measurement wrong and the frame ends short of its border.
