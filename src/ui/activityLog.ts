@@ -8,6 +8,7 @@
 // interface brief, keeps low-level client output out of the primary view.
 
 import { ActivityRowView } from './frame.js';
+import { NotificationManager, NType } from '../utils/notificationManager.js';
 
 export type ActivityCategory =
   | 'SYSTEM'
@@ -26,6 +27,9 @@ export interface ActivityEvent {
 }
 
 const MAX_EVENTS = 500;
+
+const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g');
+const stripAnsi = (value: string): string => value.replace(ANSI, '');
 
 /** Output that is about the machinery rather than the trading. */
 const DIAGNOSTIC = [
@@ -53,7 +57,10 @@ export class ActivityLog {
 
   add(category: ActivityCategory, message: string, debug = false): void {
     const time = new Date().toTimeString().slice(0, 8);
-    const text = String(message).replace(/\s+/g, ' ').trim();
+    // Colour arrives embedded in captured output. Those bytes take no columns on
+    // screen but count as characters, so leaving them in makes every layout
+    // measurement wrong and the frame ends short of its border.
+    const text = stripAnsi(String(message)).replace(/\s+/g, ' ').trim();
     if (text.length === 0) return;
 
     this.events.push({ time, category, message: text, debug });
@@ -81,6 +88,15 @@ export class ActivityLog {
    */
   captureConsole(): void {
     if (this.restoreConsole) return;
+
+    // Notifications carry their own category, so a fill reads as a FILL rather
+    // than as generic output.
+    NotificationManager.setSink((message, type, category) => {
+      const resolved: ActivityCategory =
+        (category as ActivityCategory) ??
+        (type === NType.ERROR ? 'ERROR' : type === NType.SUCCESS ? 'ORDER' : 'SYSTEM');
+      this.add(resolved, message);
+    });
 
     const original = {
       log: console.log,
@@ -117,6 +133,7 @@ export class ActivityLog {
   }
 
   releaseConsole(): void {
+    NotificationManager.setSink(null);
     this.restoreConsole?.();
     this.restoreConsole = null;
   }

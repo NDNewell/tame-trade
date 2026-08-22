@@ -92,9 +92,7 @@ export class ExchangeClient {
   }
 
   logAndReplace(msg: string) {
-    readline.clearLine(process.stdout, 0);
-    readline.cursorTo(process.stdout, 0);
-    console.log(msg);
+    NotificationManager.notify(msg, NType.INFO, 'ORDER');
   }
 
   async watchOrderBook(symbol: string): Promise<void> {
@@ -313,6 +311,53 @@ export class ExchangeClient {
 
   getFatFingerLimit(): number | undefined {
     return this.fatFingerLimit;
+  }
+
+  /**
+   * Position values ready for display, with unrealized PnL computed here rather
+   * than read from the exchange payload. getPositionStructure has several
+   * fallback paths that return differently shaped objects, so the field is not
+   * dependable; entry, mark and size are, and the arithmetic is not in doubt.
+   */
+  async getPositionView(market: string): Promise<{
+    side: string;
+    size: number;
+    entry?: number;
+    unrealizedPnl?: number;
+    leverage?: number;
+    liquidation?: number;
+    currency: string;
+  } | null> {
+    const position = await this.getPositionStructure(market);
+    const contracts = Math.abs(Number(position?.contracts ?? 0));
+    if (!position || contracts === 0) return null;
+
+    const info = position as any;
+    const marketInfo = this.availableMarkets?.[market];
+    const contractSize = Number(marketInfo?.contractSize ?? 1);
+    const currency = String(marketInfo?.settle ?? marketInfo?.quote ?? '');
+
+    const entry = Number(position.entryPrice ?? info.entryPrice ?? NaN);
+    const mark = await this.getReferencePrice(market);
+    const isLong = String(position.side ?? '').toLowerCase() === 'long';
+
+    let unrealizedPnl: number | undefined;
+    if (Number.isFinite(entry) && mark !== undefined && entry > 0) {
+      const direction = isLong ? 1 : -1;
+      unrealizedPnl = marketInfo?.inverse
+        ? contracts * contractSize * (1 / entry - 1 / mark) * direction
+        : contracts * contractSize * (mark - entry) * direction;
+    }
+
+    return {
+      side: String(position.side ?? '').toUpperCase(),
+      size: contracts,
+      entry: Number.isFinite(entry) ? entry : undefined,
+      unrealizedPnl,
+      leverage: Number(info.leverage) || undefined,
+      liquidation: Number(info.liquidationPrice) || undefined,
+      currency,
+    };
   }
 
   /** Open orders for display. Uses the live view; completeness isn't critical. */
@@ -549,7 +594,9 @@ export class ExchangeClient {
     const symbol = market.split(':')[0];
     const filled = Number(update.filled ?? 0);
     const previouslyFilled = state.filledSoFar.get(id) ?? 0;
-    const price = update.average ?? update.price;
+    const rawPrice = update.average ?? update.price;
+    const price =
+      rawPrice !== undefined ? this.formatPriceForDisplay(market, Number(rawPrice)) : undefined;
     const at = price !== undefined ? ` @${price}` : '';
 
     if (filled > previouslyFilled) {
@@ -562,26 +609,34 @@ export class ExchangeClient {
 
       NotificationManager.notify(
         complete
-          ? `${this.capitalise(side)} filled ${filled}${at} — ${symbol}`
-          : `${this.capitalise(side)} partially filled ${filled}${
-              total ? ` of ${total}` : ''
-            }${at} — ${symbol}`,
-        NType.SUCCESS
+          ? `${this.capitalise(side)} filled ${filled}${at}`
+          : `${this.capitalise(side)} partially filled ${filled}${total ? ` of ${total}` : ''}${at}`,
+        NType.SUCCESS,
+        'FILL'
       );
     }
 
     if (status === 'canceled' && filled === 0) {
-      NotificationManager.notify(
-        `${this.capitalise(side)} order canceled — ${symbol}`,
-        NType.INFO
-      );
+      NotificationManager.notify(`${this.capitalise(side)} order canceled`, NType.INFO, 'ORDER');
     }
 
     if (status === 'rejected') {
       NotificationManager.notify(
-        `${this.capitalise(side)} order REJECTED by the exchange — ${symbol}. Nothing is resting.`,
-        NType.ERROR
+        `${this.capitalise(side)} order REJECTED by the exchange. Nothing is resting.`,
+        NType.ERROR,
+        'ERROR'
       );
+    }
+  }
+
+  /** Rounds a price to the market's own tick, so fills don't show raw floats. */
+  formatPriceForDisplay(market: string, price: number): string {
+    if (!Number.isFinite(price)) return String(price);
+
+    try {
+      return this.exchange!.priceToPrecision(market, price);
+    } catch {
+      return String(Math.round(price * 10000) / 10000);
     }
   }
 
@@ -847,9 +902,11 @@ export class ExchangeClient {
             ? ` @${order.price}`
             : '';
 
-        console.log(
+        NotificationManager.notify(
           `${side}order accepted${amount ? ` for ${amount}` : ''}${at}` +
-            `${order?.id ? ` (id ${order.id})` : ''}`
+            `${order?.id ? ` (id ${String(order.id).slice(0, 8)})` : ''}`,
+          NType.INFO,
+          'ORDER'
         );
       } catch {
         console.log(`Order accepted${order?.id ? ` (id ${order.id})` : ''}`);

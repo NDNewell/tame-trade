@@ -8,8 +8,22 @@ export enum NType {
   INFO,
 }
 
+type Sink = (message: string, type: NType, category?: string) => void;
+
 export class NotificationManager {
-  static notify(message: string, type: NType): void {
+  private static sink: Sink | null = null;
+
+  /** Routes notifications somewhere other than the console (the activity log). */
+  static setSink(sink: Sink | null): void {
+    this.sink = sink;
+  }
+
+  static notify(message: string, type: NType, category?: string): void {
+    if (this.sink) {
+      this.sink(message, type, category);
+      return;
+    }
+
     let color: Color = "white";
 
     switch (type) {

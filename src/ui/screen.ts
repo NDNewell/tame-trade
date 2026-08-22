@@ -110,8 +110,10 @@ export class Screen {
   }
 
   private size() {
+    // One column short of the terminal: writing into the final column makes most
+    // terminals wrap to the next line, which breaks the frame's right edge.
     return {
-      width: Math.max(MIN_WIDTH, process.stdout.columns || 80),
+      width: Math.max(MIN_WIDTH, (process.stdout.columns || 80) - 1),
       height: Math.max(MIN_HEIGHT, process.stdout.rows || 40),
     };
   }

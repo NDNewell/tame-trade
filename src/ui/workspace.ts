@@ -85,7 +85,9 @@ export class Workspace {
     this.screen.start();
 
     ActivityLog.getInstance().add('SYSTEM', `Connected to ${view.header.exchange}`);
-    ActivityLog.getInstance().add('MARKET', `${market.split(':')[0]} selected`);
+    if (market) {
+      ActivityLog.getInstance().add('MARKET', `${market.split(':')[0]} selected`);
+    }
 
     // The feeds push prices and order events; this refresh covers what only REST
     // can tell us, chiefly the position.
@@ -123,7 +125,7 @@ export class Workspace {
 
     try {
       const [position, orders] = await Promise.all([
-        this.client.getPositionStructure(this.market).catch(() => undefined),
+        this.client.getPositionView(this.market).catch(() => null),
         this.client.getOpenOrdersForDisplay(this.market).catch(() => []),
       ]);
 
@@ -141,26 +143,37 @@ export class Workspace {
           funding: dash(price.funding),
           spread: dash(price.spread),
         },
-        position:
-          position && Number(position.contracts ?? 0) !== 0
-            ? {
-                side: String(position.side ?? '').toUpperCase() || NO_VALUE,
-                size: `${position.contracts}`,
-                entry: dash(position.entryPrice),
-                mark: dash(price.last),
-                unrealizedPnl: signed((position as any).unrealizedPnl),
-                realizedPnl: signed((position as any).realizedPnl),
-                leverage: dash((position as any).leverage, 'x'),
-                liquidation: dash((position as any).liquidationPrice),
-              }
-            : null,
-        orders: orders.map((order) => ({
-          id: String(order.id ?? '').slice(0, 8),
-          side: String(order.side ?? '').toUpperCase(),
-          qty: String(order.remaining ?? order.amount ?? ''),
-          price: String(order.triggerPrice ?? order.price ?? ''),
-          status: String(order.status ?? 'WORKING').toUpperCase(),
-        })),
+        position: position
+          ? {
+              side: position.side || NO_VALUE,
+              size: `${position.size}`,
+              entry: position.entry !== undefined ? position.entry.toFixed(4).replace(/0+$/, '').replace(/\.$/, '') : NO_VALUE,
+              mark: dash(price.last),
+              unrealizedPnl:
+                position.unrealizedPnl !== undefined
+                  ? `${signed(position.unrealizedPnl)}${position.currency ? ` ${position.currency}` : ''}`
+                  : NO_VALUE,
+              realizedPnl: NO_VALUE,
+              leverage: dash(position.leverage, 'x'),
+              liquidation: dash(position.liquidation),
+            }
+          : null,
+        orders: orders.map((order) => {
+          const info = (order as any).info ?? {};
+          const trigger = (order as any).triggerPrice ?? info.stopPxRp ?? info.stopPxEp;
+          const size = Number(order.remaining ?? order.amount ?? 0);
+          const isTrigger = trigger !== undefined && Number(trigger) > 0;
+
+          return {
+            id: String(order.id ?? '').slice(0, 8),
+            side: String(order.side ?? '').toUpperCase(),
+            // A conditional order sized to the whole position carries a
+            // quantity of zero; showing '0' reads as an empty order.
+            qty: size > 0 ? String(size) : isTrigger ? 'POSITION' : NO_VALUE,
+            price: isTrigger ? String(trigger) : String(order.price ?? NO_VALUE),
+            status: isTrigger && !size ? 'STOP' : String(order.status ?? 'WORKING').toUpperCase(),
+          };
+        }),
       });
     } catch (error) {
       ActivityLog.getInstance().add('WARNING', `Could not refresh: ${(error as Error).message}`);
