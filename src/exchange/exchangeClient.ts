@@ -619,7 +619,7 @@ export class ExchangeClient {
     const status = String(update.status ?? '');
     const side = String(update.side ?? 'order');
     const symbol = market.split(':')[0];
-    const at = this.orderEventTime(update);
+    const eventTime = this.orderEventTime(update);
     const filled = Number(update.filled ?? 0);
     const previouslyFilled = state.filledSoFar.get(id) ?? 0;
     const rawPrice = update.average ?? update.price;
@@ -641,7 +641,7 @@ export class ExchangeClient {
           : `${this.capitalise(side)} partially filled ${filled}${total ? ` of ${total}` : ''}${at}`,
         NType.SUCCESS,
         'FILL',
-        at
+        eventTime
       );
     }
 
@@ -650,7 +650,7 @@ export class ExchangeClient {
         `${this.capitalise(side)} order canceled`,
         NType.INFO,
         'ORDER',
-        at
+        eventTime
       );
     }
 
@@ -659,7 +659,7 @@ export class ExchangeClient {
         `${this.capitalise(side)} order REJECTED by the exchange. Nothing is resting.`,
         NType.ERROR,
         'ERROR',
-        at
+        eventTime
       );
     }
   }
@@ -813,7 +813,13 @@ export class ExchangeClient {
     quantity: number,
     price?: number
   ): Promise<{ notional: number; currency: string }> {
-    const marketInfo = this.availableMarkets![market];
+    const marketInfo = this.availableMarkets?.[market];
+    if (!marketInfo) {
+      throw new Error(
+        `Cannot value an order for ${market}: the market is not loaded. No order was placed.`
+      );
+    }
+
     const contractSize = (marketInfo as any).contractSize ?? 1;
     const currency = String(marketInfo.quote ?? '');
 
@@ -1496,7 +1502,9 @@ export class ExchangeClient {
         const levels = side === 'buy' ? book.bids : book.asks;
         if (!levels || levels.length === 0) continue;
 
-        const best = levels[0][0];
+        const best = Number(levels[0]?.[0]);
+        if (!Number.isFinite(best) || best <= 0) continue;
+
         const improves = side === 'buy' ? best > orderPrice : best < orderPrice;
 
         if (improves && Math.abs(best - orderPrice) >= tickSize) {

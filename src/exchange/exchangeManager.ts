@@ -1,10 +1,10 @@
 // src/exchange/exchangeManager.ts
 
-import { UserInterface } from '../client/userInterface';
-import { ConfigManager } from '../config/configManager';
-import { AppError } from '../errors/appError';
-import { ErrorType } from '../errors/errorType';
-import { ExchangeClient } from './exchangeClient';
+import { UserInterface } from '../client/userInterface.js';
+import { ConfigManager, ExchangeProfile } from '../config/configManager.js';
+import { AppError } from '../errors/appError.js';
+import { ErrorType } from '../errors/errorType.js';
+import { ExchangeClient } from './exchangeClient.js';
 
 export class ExchangeManager {
   private configManager: ConfigManager;
@@ -75,7 +75,7 @@ export class ExchangeManager {
         );
 
         const updatedExchanges = profile.exchanges.filter(
-          (exchangeProfile) => exchangeProfile.exchange !== exchangeToRemove
+          (exchangeProfile: ExchangeProfile) => exchangeProfile.exchange !== exchangeToRemove
         );
 
         await this.configManager.updateProfile({
@@ -95,7 +95,7 @@ export class ExchangeManager {
     if (await this.configManager.hasProfile()) {
       const profile = await this.configManager.getProfile();
       return profile.exchanges.map(
-        (exchangeProfile) => exchangeProfile.exchange
+        (exchangeProfile: ExchangeProfile) => exchangeProfile.exchange
       );
     } else {
       return [];
@@ -120,11 +120,11 @@ export class ExchangeManager {
 
   async getExchangeCredentials(
     exchange: string
-  ): Promise<{ key: string; secret: string }> {
+  ): Promise<{ key?: string; secret?: string }> {
     if (await this.configManager.hasProfile()) {
       const profile = await this.configManager.getProfile();
       const savedExchange = profile.exchanges.find(
-        (exchangeProfile) => exchangeProfile.exchange === exchange
+        (exchangeProfile: ExchangeProfile) => exchangeProfile.exchange === exchange
       );
 
       if (savedExchange) {

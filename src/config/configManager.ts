@@ -122,7 +122,17 @@ export class ConfigManager {
   async addExchange(
     exchange: string,
     authType: ExchangeAuthType,
-    credentials: { key?: string; secret?: string; privateKey?: string; walletAddress?: string }
+    credentials: {
+      key?: string;
+      secret?: string;
+      privateKey?: string;
+      walletAddress?: string;
+      // Hyperliquid queries positions by a public address separate from the
+      // signing wallet. It was already being passed and stored via the spread,
+      // but was absent from this type, so a typo in the caller would have gone
+      // unnoticed and silently saved nothing.
+      publicAddress?: string;
+    }
   ): Promise<void> {
     const exchangeProfile: ExchangeProfile = {
       exchange,

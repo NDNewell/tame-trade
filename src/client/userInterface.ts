@@ -1,7 +1,6 @@
 // src/client/userInterface.ts
 
 import inquirer from 'inquirer';
-import InquirerExpanded from '../../plugins/inquirer-expanded.js';
 
 import autocomplete from 'inquirer-autocomplete-prompt';
 import clear from 'console-clear';
@@ -32,7 +31,6 @@ export class UserInterface {
     this.stateManager = StateManager.getInstance();
     this.isDevMode = process.env.NODE_ENV === 'development';
     inquirer.registerPrompt('autocomplete', autocomplete);
-    inquirer.registerPrompt('inquirer-expanded', InquirerExpanded as any);
   }
 
   // Save current application state for dev mode
@@ -228,38 +226,6 @@ export class UserInterface {
     }
   }
 
-  private async promptForCommand() {
-    // Superseded by the workspace while it is running; kept for the pre-trading
-    // flows that still use prompts.
-    if (this.workspace?.isRunning) return;
-    const exchangeClient = this.exchangeCommand.getExchangeClient();
-    const exchangeName = exchangeClient.getSelectedExchangeName();
-    const tameDisplay = `[${fo('Tame', 'yellow')}]`;
-    // remove market string after ':' if it exists
-    const currentMarket = this.currentMarket
-      ? this.currentMarket.split(':')[0]
-      : '';
-    const marketDisplay = `[${fo(`${currentMarket}`, 'green')}]`;
-    const exchangeDisplay = exchangeName
-      ? `[${fo(exchangeName, 'orange')}]`
-      : '';
-
-    const promptMessage = this.currentMarket
-      ? `${marketDisplay} `
-      : `${tameDisplay}${exchangeDisplay} `;
-
-    const { command } = await inquirer.prompt<{ command: string }>([
-      {
-        type: 'inquirer-expanded' as any, // Update the type to use the new plugin and bypass type checking
-        name: 'command',
-        message: promptMessage,
-        prefix: '',
-      },
-    ]);
-
-    this.handleCommand(command.trim());
-  }
-
   private async formatPriceToMarketPrecision(price: number, market: string): Promise<number> {
       try {
           const precision = await this.exchangeCommand.getExchangeClient().getMarketPrecision(market);
@@ -358,7 +324,6 @@ export class UserInterface {
         console.log(precision);
       }
 
-      this.promptForCommand();
       return;
     }
 
@@ -371,7 +336,6 @@ export class UserInterface {
 
       if (this.lastPositionSize === 0) {
         console.log('Error: Cannot execute an order with a position size of zero.');
-        this.promptForCommand();
         return;
       }
 
@@ -386,7 +350,6 @@ export class UserInterface {
 
       if (this.entryPrice === null) {
         console.log('Error: Cannot execute an order with an entry price of null.');
-        this.promptForCommand();
         return;
       }
 
@@ -394,7 +357,6 @@ export class UserInterface {
 
       if (this.entryPrice === 0) {
         console.log('Error: Cannot execute an order with an entry price of zero.');
-        this.promptForCommand();
         return;
       }
 
@@ -778,13 +740,11 @@ export class UserInterface {
       let amount: number | undefined;
       if (parts.length > 3 || parts.length < 2) {
           console.log('Usage: update stop <amount>');
-          this.promptForCommand();
           return;
       }
 
       if (parts[1] !== 'stop') {
           console.log('Invalid command. Only stop order can be updated.');
-          this.promptForCommand();
           return;
       }
 
@@ -792,7 +752,6 @@ export class UserInterface {
           amount = parseFloat(parts[2]);
           if (isNaN(amount)) {
               console.log('Invalid amount. Amount should be a number.');
-              this.promptForCommand();
               return;
           }
       }
@@ -849,7 +808,6 @@ export class UserInterface {
       this.quit();
     }
 
-    this.promptForCommand();
   }
 
   private async selectMarketType(): Promise<string | undefined> {
