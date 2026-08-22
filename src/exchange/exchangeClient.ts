@@ -40,6 +40,7 @@ export class ExchangeClient {
   private eventEmitter: EventEmitter;
   private chaseLimitOrderActive: boolean = false;
   private fatFingerLimit: number | undefined = undefined;
+  private confirmThreshold: number | undefined = undefined;
   // The order the chase is currently working. It changes whenever a move is
   // done as cancel/replace, so 'cancel chase' has to read it from here rather
   // than remember the id the chase started with — otherwise it cancels an order
@@ -208,6 +209,7 @@ export class ExchangeClient {
     await this.loadMarkets();
     await this.loadExchanges();
     await this.loadFatFingerLimit();
+    await this.loadConfirmThreshold();
     this.setEventListeners();
 
     // Call the time synchronization method here
@@ -311,6 +313,44 @@ export class ExchangeClient {
 
   getFatFingerLimit(): number | undefined {
     return this.fatFingerLimit;
+  }
+
+  getConfirmThreshold(): number | undefined {
+    return this.confirmThreshold;
+  }
+
+  async setConfirmThreshold(threshold: number | undefined): Promise<void> {
+    await this.exchangeManager.setConfirmAbove(threshold);
+    this.confirmThreshold = threshold;
+  }
+
+  async loadConfirmThreshold(): Promise<void> {
+    try {
+      this.confirmThreshold = await this.exchangeManager.getConfirmAbove();
+    } catch {
+      this.confirmThreshold = undefined;
+    }
+  }
+
+  /**
+   * What an order is worth, for showing before it is sent and for deciding
+   * whether it needs confirming. Confirmation is threshold-based rather than
+   * universal: a prompt on every order would make a tool built for speed
+   * unusable, and would train the reflex of confirming without reading.
+   */
+  async describeOrder(
+    market: string,
+    quantity: number,
+    price?: number
+  ): Promise<{ notional: number; currency: string; needsConfirmation: boolean }> {
+    const { notional, currency } = await this.calculateNotional(market, quantity, price);
+
+    return {
+      notional,
+      currency,
+      needsConfirmation:
+        this.confirmThreshold !== undefined && notional >= this.confirmThreshold,
+    };
   }
 
   async setFatFingerLimit(limit: number | undefined): Promise<void> {

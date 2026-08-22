@@ -76,6 +76,16 @@ export interface ActivityRowView {
   message: string;
 }
 
+export interface ConfirmationView {
+  /** e.g. 'SELL MARKET' */
+  action: string;
+  size: string;
+  estimatedValue: string;
+  estimatedFee: string;
+  warning: string;
+  prompt: string;
+}
+
 export interface TerminalView {
   header: HeaderView;
   market: MarketView;
@@ -83,6 +93,13 @@ export interface TerminalView {
   orders: OrderRowView[];
   chase: ChaseView | null;
   activity: ActivityRowView[];
+  /**
+   * When set, the confirmation panel takes the place of the position/orders
+   * block. The header and market region stay visible: the price and the
+   * position you already hold are exactly what you want in front of you while
+   * deciding whether to send something large.
+   */
+  confirmation: ConfirmationView | null;
   input: string;
   footer: string[];
   footerRight: string;
@@ -241,6 +258,67 @@ export function planHeight(height: number, hasChase: boolean) {
   const activityRows = Math.max(1, flexible - splitRows - 1); // -1 for its label
 
   return { splitRows, activityRows };
+}
+
+/**
+ * The confirmation panel, sized to fill the block it replaces.
+ *
+ * Labels sit left, values at a common column so the numbers line up and the size
+ * can be compared against the value at a glance.
+ */
+function confirmationBlock(
+  confirmation: ConfirmationView,
+  width: number,
+  rows: number
+): Line[] {
+  const inner = width - 1;
+  const lines: Line[] = [];
+  const valueCol = 20;
+
+  const border = (): Line => {
+    const line = new Line(width, false);
+    line.put(0, '+' + '-'.repeat(width - 2) + '+', undefined, width);
+    return line;
+  };
+
+  const body: Line[] = [
+    new Line(width).put(2, 'CONFIRM ORDER', 'yellow'),
+    new Line(width).put(2, confirmation.action, sideColor(confirmation.action.split(' ')[0])),
+    new Line(width),
+    new Line(width).put(2, 'Size', undefined, valueCol).put(valueCol, confirmation.size, undefined, inner),
+    new Line(width)
+      .put(2, 'Est. Value', undefined, valueCol)
+      .put(valueCol, confirmation.estimatedValue, undefined, inner),
+    new Line(width)
+      .put(2, 'Est. Fee', undefined, valueCol)
+      .put(valueCol, confirmation.estimatedFee, undefined, inner),
+    new Line(width),
+    new Line(width).put(2, confirmation.warning, 'yellow', inner),
+    new Line(width).put(2, confirmation.prompt, 'yellow', inner),
+  ];
+
+  lines.push(border());
+  for (let row = 0; row < Math.max(rows, body.length); row++) {
+    if (body[row]) lines.push(body[row]);
+    else if (row < rows) lines.push(new Line(width));
+  }
+
+  return lines;
+}
+
+function footerRow(view: TerminalView, width: number, inner: number): Line {
+  const line = new Line(width);
+  const right = view.footerRight ?? '';
+  let col = 2;
+
+  for (const command of view.footer) {
+    if (col + command.length >= inner - right.length - 2) break;
+    line.put(col, command, 'gray');
+    col += command.length + 2;
+  }
+
+  line.putRight(inner - 1, right, 'gray', col);
+  return line;
 }
 
 /**
@@ -461,6 +539,31 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
       .put(46, `Funding ${market.funding}`, undefined, Math.floor(inner * 0.82))
       .putRight(inner - 1, `Spread ${market.spread}`, undefined, Math.floor(inner * 0.82))
   );
+
+  // --- confirmation takes the place of position/orders when pending --------
+  if (view.confirmation) {
+    lines.push(...confirmationBlock(view.confirmation, width, splitRows + 1));
+    lines.push(border());
+    lines.push(new Line(width).put(2, 'ACTIVITY', 'gray'));
+    const pending = activity.slice(-activityRows);
+    for (let row = 0; row < activityRows; row++) {
+      const line = new Line(width);
+      const event = pending[row];
+      if (event) {
+        line
+          .put(2, event.time, 'gray', 11)
+          .put(12, event.category, categoryColor(event.category), 20)
+          .put(21, event.message, undefined, inner);
+      }
+      lines.push(line);
+    }
+    lines.push(border());
+    lines.push(new Line(width).put(2, '>', 'cyan').put(4, view.input, undefined, inner));
+    lines.push(border());
+    lines.push(footerRow(view, width, inner));
+    lines.push(border());
+    return lines;
+  }
 
   // --- position | active orders -----------------------------------------
   lines.push(border(true));

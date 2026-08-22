@@ -25,6 +25,9 @@ export interface Profile {
   passwordHash: string;
   // Maximum size for a single order. Undefined means no limit is set.
   fatFinger?: number;
+  // Orders worth at least this much ask for confirmation before being sent.
+  // Undefined means no order is ever held for confirmation.
+  confirmAbove?: number;
 }
 
 export class ConfigManager {
@@ -86,6 +89,31 @@ export class ConfigManager {
       delete profile.fatFinger;
     } else {
       profile.fatFinger = limit;
+    }
+
+    await this.updateProfile(profile);
+  }
+
+  async getConfirmAbove(): Promise<number | undefined> {
+    if (!(await this.hasProfile())) return undefined;
+
+    const profile = await this.getProfile();
+    const threshold = profile.confirmAbove;
+
+    return typeof threshold === 'number' &&
+      Number.isFinite(threshold) &&
+      threshold > 0
+      ? threshold
+      : undefined;
+  }
+
+  async setConfirmAbove(threshold: number | undefined): Promise<void> {
+    const profile = await this.getProfile();
+
+    if (threshold === undefined) {
+      delete profile.confirmAbove;
+    } else {
+      profile.confirmAbove = threshold;
     }
 
     await this.updateProfile(profile);
