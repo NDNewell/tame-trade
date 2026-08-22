@@ -37,6 +37,7 @@ export class ExchangeClient {
   private ws: WebSocket | null = null;
   private eventEmitter: EventEmitter;
   private chaseLimitOrderActive: boolean = false;
+  private fatFingerLimit: number | undefined = undefined;
 
   private constructor() {
     this.exchangeManager = new ConfigManager();
@@ -180,6 +181,7 @@ export class ExchangeClient {
 
     await this.loadMarkets();
     await this.loadExchanges();
+    await this.loadFatFingerLimit();
     this.setEventListeners();
 
     // Call the time synchronization method here
@@ -281,21 +283,126 @@ export class ExchangeClient {
     });
   }
 
+  getFatFingerLimit(): number | undefined {
+    return this.fatFingerLimit;
+  }
+
+  async setFatFingerLimit(limit: number | undefined): Promise<void> {
+    await this.exchangeManager.setFatFinger(limit);
+    this.fatFingerLimit = limit;
+  }
+
+  async loadFatFingerLimit(): Promise<void> {
+    try {
+      this.fatFingerLimit = await this.exchangeManager.getFatFinger();
+    } catch (error) {
+      // A profile that can't be read must not leave the guard silently off.
+      this.fatFingerLimit = undefined;
+      console.error(
+        `[ExchangeClient] Could not read the fatfinger limit; no size limit is active.`,
+        (error as Error).message
+      );
+    }
+  }
+
+  // Notional value of an order, in the market's quote currency.
+  //
+  // On inverse contracts (Phemex's BTC/USD:BTC and friends) each contract is
+  // already denominated in the quote currency, so the size IS the notional and no
+  // price is needed. On linear contracts and spot, size is in the base currency,
+  // so it has to be multiplied by a price.
+  private async calculateNotional(
+    market: string,
+    quantity: number,
+    price?: number
+  ): Promise<{ notional: number; currency: string }> {
+    const marketInfo = this.availableMarkets![market];
+    const contractSize = (marketInfo as any).contractSize ?? 1;
+    const currency = String(marketInfo.quote ?? '');
+
+    if ((marketInfo as any).inverse) {
+      return { notional: quantity * contractSize, currency };
+    }
+
+    let referencePrice = price;
+
+    // Fall back to the last traded price only when the caller has no price of its
+    // own — a market order, for instance.
+    if (
+      referencePrice === undefined ||
+      !Number.isFinite(referencePrice) ||
+      referencePrice <= 0
+    ) {
+      const ticker = await this.exchange!.fetchTicker(market);
+      referencePrice = ticker.last ?? ticker.close ?? undefined;
+    }
+
+    if (
+      referencePrice === undefined ||
+      !Number.isFinite(referencePrice) ||
+      referencePrice <= 0
+    ) {
+      // Refuse rather than wave the order through unchecked.
+      throw new Error(
+        `Cannot check the fatfinger limit for ${market}: no price available. No order was placed.`
+      );
+    }
+
+    return { notional: quantity * contractSize * referencePrice, currency };
+  }
+
+  // Every path that sends a size to the exchange passes through here, so this is
+  // where sizes are checked. `enforceFatFinger` is false for sizes derived from
+  // the position itself (closing out, or a stop sized from an existing position):
+  // those can't be a typo, and refusing them would strand a position or leave it
+  // without a stop. `price` is the order's own price when it has one, so the
+  // notional check doesn't need to fetch a ticker.
   async getQuantityPrecision(
     market: string,
-    quantity: number
+    quantity: number,
+    options: { enforceFatFinger?: boolean; price?: number } = {}
   ): Promise<number> {
+    const { enforceFatFinger = true, price } = options;
     const marketInfo = this.availableMarkets![market];
     if (!marketInfo) {
       throw new Error(`Market ${market} not found.`);
     }
+
+    if (typeof quantity !== 'number' || !Number.isFinite(quantity)) {
+      throw new Error(
+        `Invalid order size '${quantity}' for ${market}. Size must be a number.`
+      );
+    }
+
+    if (quantity <= 0) {
+      throw new Error(
+        `Invalid order size ${quantity} for ${market}. Size must be greater than 0.`
+      );
+    }
+
     const minTradeAmount = marketInfo.precision?.amount ?? 0;
 
     if (quantity < minTradeAmount) {
       throw new Error(`Minimum order size for ${market} is ${minTradeAmount}`);
-    } else {
-      return quantity;
     }
+
+    if (enforceFatFinger && this.fatFingerLimit !== undefined) {
+      const { notional, currency } = await this.calculateNotional(
+        market,
+        quantity,
+        price
+      );
+
+      if (notional > this.fatFingerLimit) {
+        throw new Error(
+          `Fatfinger guard: this order is worth ${notional.toFixed(2)} ${currency}, ` +
+            `over your limit of ${this.fatFingerLimit} ${currency} per order. No order was placed. ` +
+            `Raise the limit with 'fatfinger <amount>' if this was intended.`
+        );
+      }
+    }
+
+    return quantity;
   }
 
   async executeOrder(
@@ -1076,7 +1183,7 @@ export class ExchangeClient {
           await this.executeOrder(
             side === 'buy' ? 'createLimitBuyOrder' : 'createLimitSellOrder',
             market,
-            await this.getQuantityPrecision(market, quantity),
+            await this.getQuantityPrecision(market, quantity, { enforceFatFinger: false }),
             adjustedPrice
           );
         } else {
@@ -1084,7 +1191,7 @@ export class ExchangeClient {
             'createMarketOrder',
             market,
             side,
-            await this.getQuantityPrecision(market, quantity)
+            await this.getQuantityPrecision(market, quantity, { enforceFatFinger: false })
           );
         }
       } else {
@@ -1255,7 +1362,7 @@ export class ExchangeClient {
       await this.createLimitBuyOrder(
         market,
         adjustedPrice,
-        await this.getQuantityPrecision(market, quantity)
+        await this.getQuantityPrecision(market, quantity, { price: currentPrice })
       );
     } else {
       await this.executeOrder(
@@ -1279,7 +1386,7 @@ export class ExchangeClient {
       await this.createLimitSellOrder(
         market,
         adjustedPrice,
-        await this.getQuantityPrecision(market, quantity)
+        await this.getQuantityPrecision(market, quantity, { price: currentPrice })
       );
     } else {
       await this.executeOrder(
@@ -1300,7 +1407,7 @@ export class ExchangeClient {
     const order = await this.executeOrder(
       'createLimitBuyOrder',
       market,
-      await this.getQuantityPrecision(market, quantity),
+      await this.getQuantityPrecision(market, quantity, { price }),
       price,
       postOnly,
       params
@@ -1318,7 +1425,7 @@ export class ExchangeClient {
     const order = await this.executeOrder(
       'createLimitSellOrder',
       market,
-      await this.getQuantityPrecision(market, quantity),
+      await this.getQuantityPrecision(market, quantity, { price }),
       price,
       postOnly,
       params
@@ -1430,8 +1537,12 @@ export class ExchangeClient {
     market: string,
     price: number,
     quantity?: number,
-    suppressLog?: boolean
+    suppressLog?: boolean,
+    enforceFatFinger: boolean = true
   ): Promise<Order | undefined> {
+    // A size we work out from the position isn't something the user typed, so it
+    // isn't subject to the fatfinger limit — a stop must always be placeable.
+    const sizeCameFromUser = quantity !== undefined;
     if (!this.exchange) {
         console.error('[ExchangeClient/createStopOrder] Exchange not initialized.');
         return undefined;
@@ -1532,7 +1643,10 @@ export class ExchangeClient {
         }
 
         // Adjust the quantity to match the exchange's precision requirements
-        quantity = await this.getQuantityPrecision(market, quantity);
+        quantity = await this.getQuantityPrecision(market, quantity, {
+          enforceFatFinger: enforceFatFinger && sizeCameFromUser,
+          price,
+        });
 
         // --- Adjust parameters for Hyperliquid Stop Market ---
         let finalOrderType = orderType;
@@ -1641,11 +1755,16 @@ export class ExchangeClient {
       // Determine the final amount
       let finalAmount: number;
       if (newAmount !== undefined) {
-        finalAmount = await this.getQuantityPrecision(market, newAmount);
+        // Typed by the user, so the fatfinger limit applies.
+        finalAmount = await this.getQuantityPrecision(market, newAmount, {
+          price: newStopPrice ?? stopOrder.stopPrice,
+        });
       } else {
         // If newAmount is not provided, calculate the default amount using the helper
         finalAmount = await this._calculateDefaultStopAmount(market);
-        finalAmount = await this.getQuantityPrecision(market, finalAmount); // Apply precision
+        finalAmount = await this.getQuantityPrecision(market, finalAmount, {
+          enforceFatFinger: false,
+        }); // Apply precision
       }
 
       // Determine the final stop price
@@ -1684,8 +1803,10 @@ export class ExchangeClient {
           // 1. Cancel the existing order
           await this.exchange.cancelOrder(stopOrder.id, market, cancelReplaceParams);
 
-          // 2. Create a new stop order and capture the result
-          const newOrder = await this.createStopOrder(market, finalStopPrice, finalAmount, true);
+          // 2. Create a new stop order and capture the result. finalAmount was
+          // already checked above, and the old stop is now cancelled — a second
+          // check here could only fail and leave the position with no stop.
+          const newOrder = await this.createStopOrder(market, finalStopPrice, finalAmount, true, false);
           newOrderId = newOrder?.id; // Store the new order ID
 
       } catch (replaceError) {
