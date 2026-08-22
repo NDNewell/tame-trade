@@ -13,7 +13,7 @@
   "license": "ISC",
   "dependencies": {
     "@types/node": "^20.11.0",
-    "bcrypt": "^5.1.0",
+    "bcrypt": "^6.0.0",
     "ccxt": "^4.4.71",
     "console-clear": "^1.1.1",
     "decimal.js": "^10.4.3",

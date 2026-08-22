@@ -9,6 +9,7 @@ import { EventEmitter } from 'events';
 import { exchangeParams } from './exchangeParams.js';
 import { parse } from 'path';
 import readline from 'readline';
+import https from 'https';
 
 // Define a more flexible Position interface to handle ccxt's types
 interface Position {
@@ -149,6 +150,10 @@ export class ExchangeClient {
 
     const exchangeConfig: any = {
       enableRateLimit: true,
+      // Force IPv4. On networks without IPv6 (most VPNs drop it), the AAAA
+      // lookup for api.phemex.com goes unanswered and stalls ~12s, blowing
+      // ccxt's 10s timeout before the request is even sent.
+      agent: new https.Agent({ family: 4 }),
       options: {
         defaultType: 'future',
         adjustForTimeDifference: true,
