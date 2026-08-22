@@ -946,62 +946,162 @@ export class ExchangeClient {
     let orderId = order.id;
     let remainingAmount = amount;
 
-    const executeChaseOrder = async () => {
-      // Pass params to fetchOpenOrders
-      const openOrders = await this.exchange!.fetchOpenOrders(market, undefined, undefined, params);
-      const order = openOrders.find((o) => o.id === orderId);
+    // A cycle costs several API calls (open orders, order book, and an edit),
+    // and ccxt's rate limiter spaces every call out. Polling faster than the
+    // limiter allows doesn't chase harder, it just queues work and falls behind,
+    // so the floor is derived from the exchange's own rate limit.
+    const callsPerCycle = 3;
+    const rateLimitFloor = Math.ceil(
+      (this.exchange.rateLimit ?? 100) * callsPerCycle
+    );
+    const chaseInterval = Math.max(
+      this.getExchangeId() === 'hyperliquid' ? 1500 : 100,
+      rateLimitFloor
+    );
 
-      if (!order) {
-        if (this.chaseLimitOrderActive) {
-          this.logAndReplace(`Chase ${side} order filled for ${amount} ${market}`);
-          this.chaseLimitOrderActive = false;
-        } else {
-          this.logAndReplace(`Chase ${side} order cancelled for ${amount} ${market}`);
-        }
+    // Transient failures are normal against a live exchange. Give up only after
+    // several in a row, and say so, rather than dying on the first one.
+    const maxConsecutiveErrors = 5;
+    let consecutiveErrors = 0;
+
+    const finishChase = (message: string) => {
+      this.chaseLimitOrderActive = false;
+      this.logAndReplace(message);
+    };
+
+    // Single entry point for running a cycle. Nothing else calls
+    // executeChaseOrder directly, so a rejected promise can never escape and end
+    // the chase silently with the active flag still set — which is what left a
+    // stalled chase unrestartable.
+    const runCycle = () => {
+      executeChaseOrder().catch((error) => {
+        finishChase(
+          `Chase stopped unexpectedly: ${(error as Error).message}. ` +
+            `Any resting order is still live.`
+        );
+      });
+    };
+
+    const scheduleNextCycle = () => {
+      setTimeout(runCycle, chaseInterval);
+    };
+
+    const executeChaseOrder = async () => {
+      // 'cancel chase' clears the flag; stop rather than resurrecting the loop.
+      if (!this.chaseLimitOrderActive) {
+        this.logAndReplace(`Chase ${side} order cancelled for ${amount} ${market}`);
         return;
       }
 
-      const updatedOrderBook = await this.exchange!.fetchL2OrderBook(market);
-      const updatedBestPrice =
-        side === 'buy'
-          ? updatedOrderBook.bids[0][0]
-          : updatedOrderBook.asks[0][0];
-
       try {
+        // Pass params to fetchOpenOrders
+        const openOrders = await this.exchange!.fetchOpenOrders(market, undefined, undefined, params);
+        const order = openOrders.find((o) => o.id === orderId);
+
+        if (!order) {
+          // Gone from the open orders isn't the same as filled — it may have
+          // been cancelled or rejected. Ask the exchange rather than assuming
+          // the outcome the trader would rather hear.
+          let outcome = `closed (status unknown)`;
+
+          try {
+            const finalOrder = await this.exchange!.fetchOrder(orderId, market, params);
+            const filled = Number(finalOrder?.filled ?? 0);
+            const status = String(finalOrder?.status ?? '');
+
+            if (status === 'closed' || filled >= amount) {
+              outcome = `filled for ${filled || amount}`;
+            } else if (filled > 0) {
+              outcome = `${status || 'ended'} after filling ${filled} of ${amount}`;
+            } else {
+              outcome = `${status || 'ended'} without filling`;
+            }
+          } catch {
+            // Leave the neutral wording rather than claim a fill we can't confirm.
+          }
+
+          finishChase(`Chase ${side} order ${outcome} ${market}`);
+          return;
+        }
+
+        const updatedOrderBook = await this.exchange!.fetchL2OrderBook(market);
+        const levels =
+          side === 'buy' ? updatedOrderBook.bids : updatedOrderBook.asks;
+
+        // An empty side of the book is momentary; wait for the next cycle rather
+        // than reading past the end of the array and killing the chase.
+        if (!levels || levels.length === 0) {
+          scheduleNextCycle();
+          return;
+        }
+
+        const updatedBestPrice = levels[0][0];
+
         if (
           (side === 'buy' && updatedBestPrice > order.price) ||
           (side === 'sell' && updatedBestPrice < order.price)
         ) {
-          // Pass params to editOrder
-          const editResult = await this.editOrder(
-            orderId,
-            market,
-            'limit',
-            updatedBestPrice,
-            order.remaining,
-            params // Pass Hyperliquid params here
-          );
+          try {
+            const editResult = await this.editOrder(
+              orderId,
+              market,
+              'limit',
+              updatedBestPrice,
+              order.remaining,
+              params, // Pass Hyperliquid params here
+              order // already in hand; saves a fetchOrders call per edit
+            );
 
-          // Check if the order ID changed after edit (esp. for cancel/replace exchanges)
-          if (editResult && editResult.id !== orderId) {
-            orderId = editResult.id; // Update orderId for subsequent checks
+            // Check if the order ID changed after edit (esp. for cancel/replace exchanges)
+            if (editResult && editResult.id !== orderId) {
+              orderId = editResult.id; // Update orderId for subsequent checks
+            }
+
+            consecutiveErrors = 0;
+          } catch (error) {
+            consecutiveErrors++;
+            this.logAndReplace(
+              `Chase: could not move the order to ${updatedBestPrice} ` +
+                `(${(error as Error).message}) [${consecutiveErrors}/${maxConsecutiveErrors}]`
+            );
+
+            if (consecutiveErrors >= maxConsecutiveErrors) {
+              finishChase(
+                `Chase stopped after ${maxConsecutiveErrors} failed moves. ` +
+                  `The order is still resting at ${order.price} — cancel it with 'cancel chase'.`
+              );
+              return;
+            }
           }
+        } else {
+          consecutiveErrors = 0;
+        }
+
+        remainingAmount = order.remaining;
+
+        if (remainingAmount > 0) {
+          scheduleNextCycle();
+        } else {
+          finishChase(`Chase ${side} order filled for ${amount} ${market}`);
         }
       } catch (error) {
-        // Suppress the error output
-        // Optionally, you can log the error to a file or handle it in another way
-      }
+        // Anything unexpected: keep the chase alive across a blip, but never
+        // leave it running silently forever.
+        consecutiveErrors++;
 
-      remainingAmount = order.remaining;
+        if (consecutiveErrors >= maxConsecutiveErrors) {
+          finishChase(
+            `Chase stopped after ${maxConsecutiveErrors} consecutive errors ` +
+              `(${(error as Error).message}). Any resting order is still live — check with 'cancel chase'.`
+          );
+          return;
+        }
 
-      if (remainingAmount > 0) {
-        // Use a longer interval for Hyperliquid due to higher latency
-        const chaseInterval = this.getExchangeId() === 'hyperliquid' ? 1500 : 100;
-        setTimeout(executeChaseOrder, chaseInterval);
+        scheduleNextCycle();
       }
     };
 
-    executeChaseOrder();
+    runCycle();
 
     // let's parse the decay time. 'decay' that takes a time argument in seconds e.g. `5s` or minutes e.g. `1m`
     const parseDecayTime = (decay: string): number => {
@@ -1039,12 +1139,21 @@ export class ExchangeClient {
     orderType: string,
     price: number,
     quantity?: number,
-    params?: Record<string, any>
+    params?: Record<string, any>,
+    knownOrder?: Order
   ): Promise<Order | undefined> {
     try {
-      // Pass params to fetchOrders for exchanges like Hyperliquid that require user context
-      const orders = await this.exchange!.fetchOrders(symbol, undefined, undefined, params);
-      let order = orders.find((order) => order.id === orderId);
+      // A caller that already holds the order passes it in. Re-fetching order
+      // history to find an order we were just looking at costs an extra API call
+      // per edit, and on a chase that is the difference between keeping up with
+      // the book and falling behind it.
+      let order = knownOrder;
+
+      if (!order) {
+        // Pass params to fetchOrders for exchanges like Hyperliquid that require user context
+        const orders = await this.exchange!.fetchOrders(symbol, undefined, undefined, params);
+        order = orders.find((order) => order.id === orderId);
+      }
 
       if (!order) {
         throw new Error(`Order with id ${orderId} not found`);
