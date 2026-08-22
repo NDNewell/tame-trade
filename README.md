@@ -32,11 +32,32 @@ Development mode features:
 
 ### Fatfinger
 
-Set a fatfinger value (maximum individual order size) by typing fatfinger followed by the amount. For example:
+The fatfinger limit caps how much a single order may be **worth**, so one number
+means the same thing on every market. Set it by typing `fatfinger` followed by an
+amount:
 
-`fatfinger 10`
+`fatfinger 5000`
 
-This command sets the maximum individual order size to 10 BTC.
+No single order may exceed 5000 in the market's quote currency. On `BTC/USD:BTC`
+that is 5000 USD; on `BTC/USDT:USDT` it is 5000 USDT, or about 0.065 BTC at a
+price of 77,000.
+
+An order's value is its size multiplied by its price. Limit and stop orders are
+valued at the price you gave; market orders are valued at the last traded price.
+On inverse contracts, where each contract is already worth one unit of the quote
+currency, the size is the value.
+
+- `fatfinger` — show the current limit
+- `fatfinger 5000` — set the limit
+- `fatfinger off` — remove the limit
+
+The limit is saved to your profile and applies across sessions. It is **not** set
+by default; when no limit is set, Tame says so on startup.
+
+Orders are rejected before being sent to the exchange, and the rejection tells you
+what the order was worth. Sizes that Tame works out from your own position —
+closing a position, or a stop sized to cover one — are not subject to the limit,
+so a protective order can always be placed.
 
 ### Aliases
 

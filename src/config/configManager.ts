@@ -23,6 +23,8 @@ export interface ExchangeProfile {
 export interface Profile {
   exchanges: ExchangeProfile[];
   passwordHash: string;
+  // Maximum size for a single order. Undefined means no limit is set.
+  fatFinger?: number;
 }
 
 export class ConfigManager {
@@ -59,6 +61,34 @@ export class ConfigManager {
     } else {
       throw new AppError(ErrorType.PROFILE_NOT_FOUND);
     }
+  }
+
+  // Returns the saved fatfinger limit, or undefined if none is set. Anything
+  // stored that isn't a usable positive number is treated as unset rather than
+  // trusted, so a corrupt config can't silently disable the guard.
+  async getFatFinger(): Promise<number | undefined> {
+    if (!(await this.hasProfile())) {
+      return undefined;
+    }
+
+    const profile = await this.getProfile();
+    const limit = profile.fatFinger;
+
+    return typeof limit === 'number' && Number.isFinite(limit) && limit > 0
+      ? limit
+      : undefined;
+  }
+
+  async setFatFinger(limit: number | undefined): Promise<void> {
+    const profile = await this.getProfile();
+
+    if (limit === undefined) {
+      delete profile.fatFinger;
+    } else {
+      profile.fatFinger = limit;
+    }
+
+    await this.updateProfile(profile);
   }
 
   async addExchange(
