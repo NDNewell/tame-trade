@@ -1665,12 +1665,26 @@ export class ExchangeClient {
           }
         }
 
-        // Add triggerDirection for Phemex stop orders
         if (this.exchange!.id === 'phemex') {
-          // For sell stops, trigger when price goes down (2)
-          // For buy stops, trigger when price goes up (1)
-          params.triggerDirection = side === 'sell' ? 2 : 1; // Phemex requires 1 (up) or 2 (down)
-          params.trigger = 'ByLastPrice'; // Explicitly set trigger type for Phemex
+          // ccxt wants the direction as the string 'up' or 'down' and uses it to
+          // choose the Phemex order type. It was being sent as 1 or 2, which
+          // matches nothing, so the direction was silently discarded.
+          //
+          // Derive it from where the trigger sits relative to the market rather
+          // than from the side, so a trigger on the far side of the market
+          // becomes MarketIfTouched instead of an unreachable Stop.
+          params.triggerDirection =
+            marketPrice !== undefined
+              ? price > marketPrice
+                ? 'up'
+                : 'down'
+              : side === 'sell'
+              ? 'down'
+              : 'up';
+
+          // The UI triggers on last price; ccxt defaults to mark price, and the
+          // two diverge. 'trigger' was the wrong key and never took effect.
+          params.triggerType = 'ByLastPrice';
         }
 
         // If the reduce-only feature is supported by the exchange, add the corresponding property to the parameters object
@@ -1694,10 +1708,13 @@ export class ExchangeClient {
             finalPriceArg = price; // Pass the trigger price as the main price argument for slippage calculation
             if (!finalParams.triggerPrice) finalParams.triggerPrice = price;
             finalParams.reduceOnly = true;
-        } else if (finalOrderType.toLowerCase() === 'stop') {
-            // For Phemex (and potentially other exchanges where 'Stop' means stop-market),
-            // the main price argument for createOrder should be undefined.
-            // The trigger price is already in finalParams.stopPx (or equivalent).
+        } else if (
+            finalOrderType.toLowerCase() === 'stop' ||
+            finalOrderType.toLowerCase() === 'market'
+        ) {
+            // A stop-market has no limit price of its own, so the main price
+            // argument stays undefined. The trigger price is already carried in
+            // finalParams under the exchange's own key.
             finalPriceArg = undefined;
         }
         // --- End Hyperliquid Adjustment ---
