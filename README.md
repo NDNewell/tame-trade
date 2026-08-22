@@ -89,6 +89,10 @@ places one at 15000 for a size of 0.5.
 A stop price far from the current market is rejected rather than placed, because
 it almost always means the price and size were entered the wrong way round.
 
+Stops are sent reduce-only and trigger on the last traded price, matching what the
+exchange UI creates. Being reduce-only, a stop can only close what you hold — it
+can never open a position in the opposite direction.
+
 `trigger buy [size] [price] or trigger sell [size] [price]`: Place a non-reduce-only stop order.
 
 `bump + [value] or bump - [value]`: Bump all orders by the specified value.

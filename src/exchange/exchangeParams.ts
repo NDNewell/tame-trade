@@ -28,6 +28,7 @@ enum StopLossProp {
 
 enum ReduceOnlyProp {
   REDUCE_ONLY = 'reduce_only',
+  REDUCE_ONLY_CAMEL = 'reduceOnly',
 }
 
 export const exchangeParams: ExchangeParams = {
@@ -46,10 +47,18 @@ export const exchangeParams: ExchangeParams = {
   phemex: {
     orders: {
       stopLoss: {
-        ORDER_TYPE: OrderType.STOP,
+        // 'market' rather than 'stop': ccxt turns a market order carrying a
+        // trigger price into the right Phemex order type (Stop when the trigger
+        // is on the losing side, MarketIfTouched when it isn't). Passing 'stop'
+        // bypassed that and forced ordType 'Stop' in every direction.
+        ORDER_TYPE: OrderType.MARKET,
         STOP_LOSS_PROP: StopLossProp.STOP_PRICE,
+        // Phemex does support reduce-only; this was previously marked false, so
+        // stops were sent as ordinary orders that could open a position in the
+        // opposite direction instead of closing the one you hold.
         REDUCE_ONLY: {
-          SUPPORTED: false,
+          SUPPORTED: true,
+          REDUCE_ONLY_PROP: ReduceOnlyProp.REDUCE_ONLY_CAMEL,
         },
       },
     },
