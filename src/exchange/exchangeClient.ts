@@ -10,6 +10,8 @@ import { exchangeParams } from './exchangeParams.js';
 import { parse } from 'path';
 import readline from 'readline';
 import https from 'https';
+import { NotificationManager } from '../utils/notificationManager.js';
+import { NType } from '../utils/notificationManager.js';
 
 // Define a more flexible Position interface to handle ccxt's types
 interface Position {
@@ -51,6 +53,7 @@ export class ExchangeClient {
     string,
     {
       orders: Map<string, Order>;
+      filledSoFar: Map<string, number>;
       running: boolean;
       healthy: boolean;
       syncedAt: number;
@@ -386,6 +389,7 @@ export class ExchangeClient {
 
     const state = {
       orders: new Map<string, Order>(),
+      filledSoFar: new Map<string, number>(),
       running: true,
       healthy: false,
       syncedAt: 0,
@@ -401,7 +405,11 @@ export class ExchangeClient {
           (await this.exchange!.fetchOpenOrders(market, undefined, undefined, params));
 
         for (const order of seed) {
-          if (order.id) state.orders.set(order.id, order);
+          if (!order.id) continue;
+          state.orders.set(order.id, order);
+          // Record what is already filled so the first event doesn't announce
+          // fills that happened before the session started watching.
+          state.filledSoFar.set(order.id, Number(order.filled ?? 0));
         }
 
         state.healthy = true;
@@ -422,8 +430,12 @@ export class ExchangeClient {
             const done =
               status === 'closed' || status === 'canceled' || status === 'rejected';
 
+            // Report what the exchange says happened, before updating the view.
+            this.announceOrderUpdate(market, update, state);
+
             if (done) {
               state.orders.delete(update.id);
+              state.filledSoFar.delete(update.id);
             } else {
               state.orders.set(update.id, update);
             }
@@ -438,6 +450,77 @@ export class ExchangeClient {
         }
       }
     })();
+  }
+
+  // Reports what actually happened to an order, from the exchange's own event
+  // rather than from the response to the request that created it. A 200 means
+  // the order was accepted; it says nothing about whether it filled, and an
+  // order can be rejected, cancelled or filled long after the call returned.
+  private announceOrderUpdate(
+    market: string,
+    update: Order,
+    state: { filledSoFar: Map<string, number> }
+  ): void {
+    const id = update.id;
+    if (!id) return;
+
+    // The chase narrates its own order; two messages for one event is worse
+    // than one.
+    if (id === this.currentChaseOrderId) return;
+
+    const status = String(update.status ?? '');
+    const side = String(update.side ?? 'order');
+    const symbol = market.split(':')[0];
+    const filled = Number(update.filled ?? 0);
+    const previouslyFilled = state.filledSoFar.get(id) ?? 0;
+    const price = update.average ?? update.price;
+    const at = price !== undefined ? ` @${price}` : '';
+
+    if (filled > previouslyFilled) {
+      state.filledSoFar.set(id, filled);
+
+      const total = Number(update.amount ?? 0);
+      const complete =
+        status === 'closed' ||
+        (update.remaining !== undefined && Number(update.remaining) === 0);
+
+      NotificationManager.notify(
+        complete
+          ? `${this.capitalise(side)} filled ${filled}${at} — ${symbol}`
+          : `${this.capitalise(side)} partially filled ${filled}${
+              total ? ` of ${total}` : ''
+            }${at} — ${symbol}`,
+        NType.SUCCESS
+      );
+    }
+
+    if (status === 'canceled' && filled === 0) {
+      NotificationManager.notify(
+        `${this.capitalise(side)} order canceled — ${symbol}`,
+        NType.INFO
+      );
+    }
+
+    if (status === 'rejected') {
+      NotificationManager.notify(
+        `${this.capitalise(side)} order REJECTED by the exchange — ${symbol}. Nothing is resting.`,
+        NType.ERROR
+      );
+    }
+  }
+
+  private capitalise(value: string): string {
+    return value.length > 0 ? value[0].toUpperCase() + value.slice(1) : value;
+  }
+
+  // Begin following a market: prices and order events. Called when the market
+  // changes, so fills and rejections are reported for whatever is being traded
+  // without any command having to ask for them.
+  public followMarket(market: string, params?: Record<string, any>): void {
+    this.stopTickerStream();
+    this.stopOrderStream();
+    this.startTickerStream(market);
+    this.startOrderStream(market, params);
   }
 
   private stopOrderStream(market?: string): void {
@@ -668,28 +751,32 @@ export class ExchangeClient {
       // Call the underlying exchange method with market, remaining original args, and the final combined params
       const order = await (this.exchange as any)[method](market, ...originalArgs, finalParams);
 
-      const orderType = order.info.order_type;
+      // What comes back here is the exchange accepting the request, not the
+      // outcome. Whether it fills, and for how much, arrives on the order feed —
+      // so this reports acceptance only, and announceOrderUpdate reports the
+      // rest. Reading a 200 as a fill is how a rejected order passes for a live
+      // one.
+      //
+      // The shape of the response varies by exchange, so nothing here may throw:
+      // an error formatting a confirmation would land in the catch below and
+      // report a placed order as failed.
+      try {
+        const side = order?.side ? `${this.capitalise(String(order.side))} ` : '';
+        const amount = order?.amount !== undefined ? this.trimAmount(parseFloat(order.amount)) : '';
+        const trigger = order?.triggerPrice ?? order?.stopPrice;
+        const at =
+          trigger !== undefined
+            ? ` triggering at ${trigger}`
+            : order?.price
+            ? ` @${order.price}`
+            : '';
 
-      if (orderType === 'market') {
-        const filledAmount = parseFloat(order.filled);
-        const trimmedFilledAmount = this.trimAmount(filledAmount);
-        const trimmedPrice = parseFloat(order.price).toFixed(2);
-        console.log(`Filled ${trimmedFilledAmount} @${trimmedPrice}`);
-      } else if (orderType === 'limit') {
-        const side = order.side;
-        const amount = parseFloat(order.amount);
-        const trimmedAmount = this.trimAmount(amount);
-        const price = parseFloat(order.price).toFixed(2);
         console.log(
-          `Limit order (${side}) of ${trimmedAmount} placed @${price}, order ID: ${order.id}`
+          `${side}order accepted${amount ? ` for ${amount}` : ''}${at}` +
+            `${order?.id ? ` (id ${order.id})` : ''}`
         );
-      } else if (orderType === 'stop_market') {
-        const amount = parseFloat(order.amount);
-        const trimmedAmount = this.trimAmount(amount);
-        const price = parseFloat(order.stopPrice).toFixed(2);
-        console.log(
-          `Placed stop @${price} for amount ${trimmedAmount}, order ID: ${order.id}`
-        );
+      } catch {
+        console.log(`Order accepted${order?.id ? ` (id ${order.id})` : ''}`);
       }
 
       return order;
