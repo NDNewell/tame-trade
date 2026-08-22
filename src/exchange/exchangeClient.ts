@@ -315,6 +315,42 @@ export class ExchangeClient {
     return this.fatFingerLimit;
   }
 
+  /** Open orders for display. Uses the live view; completeness isn't critical. */
+  async getOpenOrdersForDisplay(market: string): Promise<Order[]> {
+    try {
+      return await this.getLiveOpenOrders(market);
+    } catch {
+      return [];
+    }
+  }
+
+  /** The market values the workspace shows, taken from the feeds where possible. */
+  async getDisplayPrice(market: string): Promise<{
+    last?: number;
+    bid?: number;
+    ask?: number;
+    spread?: string;
+    funding?: string;
+    change?: string;
+  }> {
+    const last = await this.getReferencePrice(market);
+    let bid: number | undefined;
+    let ask: number | undefined;
+
+    try {
+      const book = await this.exchange!.fetchL2OrderBook(market, 1);
+      bid = book.bids?.[0]?.[0];
+      ask = book.asks?.[0]?.[0];
+    } catch {
+      // Book unavailable this tick; the rest of the view is still worth showing.
+    }
+
+    const spread =
+      bid !== undefined && ask !== undefined ? (ask - bid).toFixed(4).replace(/0+$/, '').replace(/\.$/, '') : undefined;
+
+    return { last, bid, ask, spread };
+  }
+
   getConfirmThreshold(): number | undefined {
     return this.confirmThreshold;
   }

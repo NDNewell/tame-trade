@@ -10,6 +10,8 @@ import { ExchangeProfile } from '../config/configManager.js';
 import { ExchangeCommand, OrderType } from '../commands/exchangeCommand.js';
 import { StateManager } from '../config/stateManager.js';
 import { NotificationManager, NType } from '../utils/notificationManager.js';
+import { Workspace } from '../ui/workspace.js';
+import { ActivityLog } from '../ui/activityLog.js';
 
 export class UserInterface {
   private currentMarket: string;
@@ -20,6 +22,7 @@ export class UserInterface {
   private entryPrice: number | null = null;
   private stateManager: StateManager;
   private isDevMode: boolean;
+  private workspace: Workspace | null = null;
 
   constructor() {
     this.exchangeCommand = new ExchangeCommand();
@@ -208,10 +211,27 @@ export class UserInterface {
       }
     }
 
-    this.promptForCommand();
+    // The workspace owns the terminal from here: one repainted view rather than
+    // a scrolling console, with the command line docked.
+    this.workspace = new Workspace(
+      this.exchangeCommand.getExchangeClient(),
+      async (command: string) => {
+        await this.handleCommand(command.trim());
+      },
+      () => this.quit()
+    );
+
+    if (this.currentMarket) {
+      this.workspace.start(this.currentMarket);
+    } else {
+      this.workspace.start('');
+    }
   }
 
   private async promptForCommand() {
+    // Superseded by the workspace while it is running; kept for the pre-trading
+    // flows that still use prompts.
+    if (this.workspace?.isRunning) return;
     const exchangeClient = this.exchangeCommand.getExchangeClient();
     const exchangeName = exchangeClient.getSelectedExchangeName();
     const tameDisplay = `[${fo('Tame', 'yellow')}]`;
@@ -391,7 +411,8 @@ export class UserInterface {
       if (this.availableMarkets.includes(market)) {
         this.currentMarket = market;
         this.exchangeCommand.getExchangeClient().followMarket(market);
-        console.log(`Switched to market: ${market}`);
+        this.workspace?.setMarket(market);
+        ActivityLog.getInstance().add('MARKET', `${market.split(':')[0]} selected`);
 
         // Save state for dev mode
         await this.saveDevState();
@@ -910,6 +931,7 @@ export class UserInterface {
   }
 
   quit() {
+    this.workspace?.stop();
     console.log('Exiting...');
     // Give time for readline to clean up
     setTimeout(() => {
