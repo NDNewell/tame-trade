@@ -18,6 +18,15 @@ const CLEAR_LINE = `${ESC}[K`;
 const CLEAR_BELOW = `${ESC}[J`;
 const CURSOR_SHOW = `${ESC}[?25h`;
 const CURSOR_HIDE = `${ESC}[?25l`;
+// Mouse reporting. Without it the terminal turns wheel events into arrow keys on
+// the alternate screen, so scrolling walks command history instead of the log.
+const MOUSE_ON = `${ESC}[?1000h${ESC}[?1006h`;
+const MOUSE_OFF = `${ESC}[?1006l${ESC}[?1000l`;
+
+const WHEEL_UP = 64;
+const WHEEL_DOWN = 65;
+const SCROLL_STEP = 3;
+const MOUSE_EVENT = /\x1b\[<(\d+);\d+;\d+[Mm]/g;
 
 const at = (row: number, col: number) => `${ESC}[${row + 1};${col + 1}H`;
 
@@ -35,6 +44,7 @@ export class Screen {
   private historyIndex = -1;
   private pendingConfirm: ConfirmHandler | null = null;
   private repaintQueued = false;
+  private activityOffset = 0;
 
   constructor(
     initial: TerminalView,
@@ -56,7 +66,7 @@ export class Screen {
     log.captureConsole();
     log.onChange(() => this.scheduleRepaint());
 
-    process.stdout.write(ALT_SCREEN_ON);
+    process.stdout.write(ALT_SCREEN_ON + MOUSE_ON);
     process.stdout.on('resize', this.handleResize);
 
     if (process.stdin.isTTY) {
@@ -78,7 +88,7 @@ export class Screen {
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
     process.stdin.pause();
 
-    process.stdout.write(CURSOR_SHOW + ALT_SCREEN_OFF);
+    process.stdout.write(MOUSE_OFF + CURSOR_SHOW + ALT_SCREEN_OFF);
     ActivityLog.getInstance().releaseConsole();
   }
 
@@ -125,6 +135,7 @@ export class Screen {
       ...this.view,
       input: this.input,
       activity: ActivityLog.getInstance().visible(),
+      activityOffset: this.activityOffset,
     };
 
     const lines = renderPainted(view, this.size());
@@ -145,6 +156,9 @@ export class Screen {
   }
 
   private handleKey = (data: string): void => {
+    // Wheel events scroll the log and never reach the command line.
+    if (this.handleMouse(data)) return;
+
     if (this.pendingConfirm) {
       this.answerConfirm(data);
       return;
@@ -160,6 +174,7 @@ export class Screen {
         const command = this.input.trim();
         this.input = '';
         this.historyIndex = -1;
+        this.activityOffset = 0;
         if (command.length > 0) {
           this.history.push(command);
           void this.onCommand(command);
@@ -200,6 +215,32 @@ export class Screen {
       this.scheduleRepaint();
     }
   };
+
+  /** Returns true when the input was mouse reporting rather than typing. */
+  private handleMouse(data: string): boolean {
+    if (!data.includes(`${ESC}[<`)) return false;
+
+    MOUSE_EVENT.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    let moved = false;
+
+    while ((match = MOUSE_EVENT.exec(data)) !== null) {
+      const button = Number(match[1]);
+      if (button === WHEEL_UP) {
+        this.activityOffset += SCROLL_STEP;
+        moved = true;
+      } else if (button === WHEEL_DOWN) {
+        this.activityOffset = Math.max(0, this.activityOffset - SCROLL_STEP);
+        moved = true;
+      }
+    }
+
+    if (moved) this.scheduleRepaint();
+
+    // Swallow every mouse report, wheel or not, so button presses never land in
+    // the command line as stray characters.
+    return true;
+  }
 
   private recall(direction: number): void {
     if (this.history.length === 0) return;

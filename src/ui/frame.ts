@@ -101,6 +101,11 @@ export interface TerminalView {
    */
   confirmation: ConfirmationView | null;
   input: string;
+  /**
+   * How far the activity region is scrolled back from the newest event. Zero
+   * follows the tail.
+   */
+  activityOffset?: number;
   footer: string[];
   footerRight: string;
 }
@@ -306,6 +311,30 @@ function confirmationBlock(
   return lines;
 }
 
+/** The slice of activity to show, given how far back the view is scrolled. */
+function windowActivity(
+  activity: ActivityRowView[],
+  rows: number,
+  offset: number
+): ActivityRowView[] {
+  const maxOffset = Math.max(0, activity.length - rows);
+  const back = Math.min(Math.max(0, offset), maxOffset);
+  const end = activity.length - back;
+  return activity.slice(Math.max(0, end - rows), end);
+}
+
+function activityLabel(view: TerminalView, width: number, rows: number): Line {
+  const line = new Line(width).put(2, 'ACTIVITY', 'gray');
+  const offset = view.activityOffset ?? 0;
+
+  if (offset > 0) {
+    const behind = Math.min(offset, Math.max(0, view.activity.length - rows));
+    line.put(12, `scrolled back ${behind}`, 'yellow', width - 2);
+  }
+
+  return line;
+}
+
 function footerRow(view: TerminalView, width: number, inner: number): Line {
   const line = new Line(width);
   const right = view.footerRight ?? '';
@@ -439,8 +468,8 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
   }
 
   lines.push(border());
-  lines.push(new Line(width).put(2, 'ACTIVITY', 'gray'));
-  const visible = activity.slice(-activityRows);
+  lines.push(activityLabel(view, width, activityRows));
+  const visible = windowActivity(activity, activityRows, view.activityOffset ?? 0);
   for (let row = 0; row < activityRows; row++) {
     const line = new Line(width);
     const event = visible[row];
@@ -660,9 +689,9 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
 
   // --- activity ----------------------------------------------------------
   lines.push(border());
-  lines.push(new Line(width).put(2, 'ACTIVITY', 'gray'));
+  lines.push(activityLabel(view, width, activityRows));
 
-  const visible = activity.slice(-activityRows);
+  const visible = windowActivity(activity, activityRows, view.activityOffset ?? 0);
   for (let row = 0; row < activityRows; row++) {
     const line = new Line(width);
     const event = visible[row];
