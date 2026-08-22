@@ -29,6 +29,10 @@ enum StopLossProp {
 enum ReduceOnlyProp {
   REDUCE_ONLY = 'reduce_only',
   REDUCE_ONLY_CAMEL = 'reduceOnly',
+  // Phemex rejects reduceOnly on a conditional order ('Stop cannot accept order
+  // reduce only'). closeOnTrigger is the equivalent for trigger orders: it
+  // implies reduce-only and cancels other orders in the same direction.
+  CLOSE_ON_TRIGGER = 'closeOnTrigger',
 }
 
 export const exchangeParams: ExchangeParams = {
@@ -53,12 +57,14 @@ export const exchangeParams: ExchangeParams = {
         // bypassed that and forced ordType 'Stop' in every direction.
         ORDER_TYPE: OrderType.MARKET,
         STOP_LOSS_PROP: StopLossProp.STOP_PRICE,
-        // Phemex does support reduce-only; this was previously marked false, so
-        // stops were sent as ordinary orders that could open a position in the
-        // opposite direction instead of closing the one you hold.
+        // Phemex stops must not carry reduceOnly -- the exchange rejects the
+        // order outright with 'Stop cannot accept order reduce only'. Sending
+        // nothing at all was also wrong: the stop was then an ordinary order
+        // that could open an opposite position instead of closing the one held.
+        // closeOnTrigger is the flag conditional orders take.
         REDUCE_ONLY: {
           SUPPORTED: true,
-          REDUCE_ONLY_PROP: ReduceOnlyProp.REDUCE_ONLY_CAMEL,
+          REDUCE_ONLY_PROP: ReduceOnlyProp.CLOSE_ON_TRIGGER,
         },
       },
     },
