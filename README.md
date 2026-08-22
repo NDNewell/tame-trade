@@ -82,7 +82,16 @@ With this alias configuration, typing b in the terminal will execute the limit b
 
 `sell [size] @ [price]`: Place a limit sell order (e.g., sell 0.001 @ 9000).
 
-`stop [price]`: Place a stop loss order (e.g., stop 15000).
+`stop [price] [size]`: Place a stop loss order. **The price always comes first.**
+`stop 15000` places a stop at 15000 sized to cover your position; `stop 15000 0.5`
+places one at 15000 for a size of 0.5.
+
+A stop price far from the current market is rejected rather than placed, because
+it almost always means the price and size were entered the wrong way round.
+
+Stops are sent reduce-only and trigger on the last traded price, matching what the
+exchange UI creates. Being reduce-only, a stop can only close what you hold — it
+can never open a position in the opposite direction.
 
 `trigger buy [size] [price] or trigger sell [size] [price]`: Place a non-reduce-only stop order.
 

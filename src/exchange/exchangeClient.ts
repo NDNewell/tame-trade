@@ -10,6 +10,8 @@ import { exchangeParams } from './exchangeParams.js';
 import { parse } from 'path';
 import readline from 'readline';
 import https from 'https';
+import { NotificationManager } from '../utils/notificationManager.js';
+import { NType } from '../utils/notificationManager.js';
 
 // Define a more flexible Position interface to handle ccxt's types
 interface Position {
@@ -38,6 +40,25 @@ export class ExchangeClient {
   private eventEmitter: EventEmitter;
   private chaseLimitOrderActive: boolean = false;
   private fatFingerLimit: number | undefined = undefined;
+  // The order the chase is currently working. It changes whenever a move is
+  // done as cancel/replace, so 'cancel chase' has to read it from here rather
+  // than remember the id the chase started with — otherwise it cancels an order
+  // that is already gone and leaves the live one resting.
+  private currentChaseOrderId: string | undefined = undefined;
+  private tickerStreams = new Map<
+    string,
+    { price: number | undefined; at: number; running: boolean }
+  >();
+  private orderStreams = new Map<
+    string,
+    {
+      orders: Map<string, Order>;
+      filledSoFar: Map<string, number>;
+      running: boolean;
+      healthy: boolean;
+      syncedAt: number;
+    }
+  >();
 
   private constructor() {
     this.exchangeManager = new ConfigManager();
@@ -177,6 +198,11 @@ export class ExchangeClient {
       exchangeConfig.secret = credentials.secret;
     }
 
+    // Feeds belong to the exchange instance being replaced; leaving them running
+    // would keep sockets open against an exchange no longer in use.
+    this.stopTickerStream();
+    this.stopOrderStream();
+
     this.exchange = new (ccxtpro as any)[exchangeId.toLowerCase()](exchangeConfig);
 
     await this.loadMarkets();
@@ -305,6 +331,284 @@ export class ExchangeClient {
     }
   }
 
+  // How stale a streamed price may be before it is fetched again. Long enough
+  // that a quiet market doesn't force a REST call, short enough that nothing
+  // acts on a price from a different market condition.
+  private static readonly STREAMED_PRICE_MAX_AGE_MS = 5000;
+
+  // Keeps the last traded price for a market current from the exchange's ticker
+  // feed. Every stop and market order needs a reference price, and taking it
+  // from a stream rather than a request removes a round trip from paths that are
+  // typed in a hurry.
+  private startTickerStream(market: string): void {
+    if (!this.exchange?.has['watchTicker']) return;
+    if (this.tickerStreams.get(market)?.running) return;
+
+    const state = { price: undefined as number | undefined, at: 0, running: true };
+    this.tickerStreams.set(market, state);
+
+    void (async () => {
+      while (state.running && this.exchange) {
+        try {
+          const ticker = await this.exchange.watchTicker(market);
+          const last = ticker.last ?? ticker.close ?? undefined;
+
+          if (typeof last === 'number' && Number.isFinite(last) && last > 0) {
+            state.price = last;
+            state.at = Date.now();
+          }
+        } catch (error) {
+          // The feed is a shortcut, not a dependency. Stop the loop and let
+          // callers fall back to fetching, rather than surfacing an error for
+          // something the trader never asked for.
+          state.running = false;
+          return;
+        }
+      }
+    })();
+  }
+
+  // A resynced snapshot older than this is not trusted, on the theory that a
+  // feed which has gone quiet for a minute may have missed something.
+  private static readonly ORDER_CACHE_MAX_AGE_MS = 60000;
+
+  // Keeps a live view of open orders for a market: a REST snapshot to start,
+  // then updates applied from the order feed as they arrive.
+  //
+  // watchOrders reports changes, not the whole set, so this view is only as
+  // complete as the snapshot it started from plus every event since. If the feed
+  // drops, it can silently fall behind — so it is marked unhealthy on any error
+  // and callers that need completeness fetch instead. See getLiveOpenOrders.
+  private startOrderStream(
+    market: string,
+    params?: Record<string, any>,
+    snapshot?: Order[]
+  ): void {
+    if (!this.exchange?.has['watchOrders']) return;
+    if (this.orderStreams.get(market)?.running) return;
+
+    const state = {
+      orders: new Map<string, Order>(),
+      filledSoFar: new Map<string, number>(),
+      running: true,
+      healthy: false,
+      syncedAt: 0,
+    };
+    this.orderStreams.set(market, state);
+
+    void (async () => {
+      try {
+        // Callers normally have just fetched the orders themselves; seeding from
+        // that avoids asking for the same thing twice.
+        const seed =
+          snapshot ??
+          (await this.exchange!.fetchOpenOrders(market, undefined, undefined, params));
+
+        for (const order of seed) {
+          if (!order.id) continue;
+          state.orders.set(order.id, order);
+          // Record what is already filled so the first event doesn't announce
+          // fills that happened before the session started watching.
+          state.filledSoFar.set(order.id, Number(order.filled ?? 0));
+        }
+
+        state.healthy = true;
+        state.syncedAt = Date.now();
+      } catch {
+        state.running = false;
+        return;
+      }
+
+      while (state.running && this.exchange) {
+        try {
+          const updates = await this.exchange.watchOrders(market);
+
+          for (const update of updates) {
+            if (!update.id) continue;
+
+            const status = String(update.status ?? '');
+            const done =
+              status === 'closed' || status === 'canceled' || status === 'rejected';
+
+            // Report what the exchange says happened, before updating the view.
+            this.announceOrderUpdate(market, update, state);
+
+            if (done) {
+              state.orders.delete(update.id);
+              state.filledSoFar.delete(update.id);
+            } else {
+              state.orders.set(update.id, update);
+            }
+          }
+
+          state.syncedAt = Date.now();
+        } catch {
+          // Fell behind; the view can no longer be trusted to be complete.
+          state.healthy = false;
+          state.running = false;
+          return;
+        }
+      }
+    })();
+  }
+
+  // Reports what actually happened to an order, from the exchange's own event
+  // rather than from the response to the request that created it. A 200 means
+  // the order was accepted; it says nothing about whether it filled, and an
+  // order can be rejected, cancelled or filled long after the call returned.
+  private announceOrderUpdate(
+    market: string,
+    update: Order,
+    state: { filledSoFar: Map<string, number> }
+  ): void {
+    const id = update.id;
+    if (!id) return;
+
+    // The chase narrates its own order; two messages for one event is worse
+    // than one.
+    if (id === this.currentChaseOrderId) return;
+
+    const status = String(update.status ?? '');
+    const side = String(update.side ?? 'order');
+    const symbol = market.split(':')[0];
+    const filled = Number(update.filled ?? 0);
+    const previouslyFilled = state.filledSoFar.get(id) ?? 0;
+    const price = update.average ?? update.price;
+    const at = price !== undefined ? ` @${price}` : '';
+
+    if (filled > previouslyFilled) {
+      state.filledSoFar.set(id, filled);
+
+      const total = Number(update.amount ?? 0);
+      const complete =
+        status === 'closed' ||
+        (update.remaining !== undefined && Number(update.remaining) === 0);
+
+      NotificationManager.notify(
+        complete
+          ? `${this.capitalise(side)} filled ${filled}${at} — ${symbol}`
+          : `${this.capitalise(side)} partially filled ${filled}${
+              total ? ` of ${total}` : ''
+            }${at} — ${symbol}`,
+        NType.SUCCESS
+      );
+    }
+
+    if (status === 'canceled' && filled === 0) {
+      NotificationManager.notify(
+        `${this.capitalise(side)} order canceled — ${symbol}`,
+        NType.INFO
+      );
+    }
+
+    if (status === 'rejected') {
+      NotificationManager.notify(
+        `${this.capitalise(side)} order REJECTED by the exchange — ${symbol}. Nothing is resting.`,
+        NType.ERROR
+      );
+    }
+  }
+
+  private capitalise(value: string): string {
+    return value.length > 0 ? value[0].toUpperCase() + value.slice(1) : value;
+  }
+
+  // Begin following a market: prices and order events. Called when the market
+  // changes, so fills and rejections are reported for whatever is being traded
+  // without any command having to ask for them.
+  public followMarket(market: string, params?: Record<string, any>): void {
+    this.stopTickerStream();
+    this.stopOrderStream();
+    this.startTickerStream(market);
+    this.startOrderStream(market, params);
+  }
+
+  private stopOrderStream(market?: string): void {
+    for (const [symbol, state] of this.orderStreams) {
+      if (market === undefined || symbol === market) {
+        state.running = false;
+        this.orderStreams.delete(symbol);
+      }
+    }
+  }
+
+  // Open orders for a market.
+  //
+  // `mustBeComplete` is for callers whose correctness depends on seeing every
+  // order — cancelling them all, most importantly. Those always fetch: a cache
+  // that has quietly missed an order would report success while leaving one
+  // live, and being told you are flat when you are not is the worst outcome this
+  // code can produce. Sizing and side-determination paths, which run often and
+  // tolerate being a moment behind, take the streamed view.
+  private async getLiveOpenOrders(
+    market: string,
+    params?: Record<string, any>,
+    mustBeComplete = false
+  ): Promise<Order[]> {
+    const state = this.orderStreams.get(market);
+    const fresh =
+      state?.healthy === true &&
+      Date.now() - state.syncedAt <= ExchangeClient.ORDER_CACHE_MAX_AGE_MS;
+
+    if (!mustBeComplete && fresh) {
+      return Array.from(state!.orders.values());
+    }
+
+    const orders = await this.exchange!.fetchOpenOrders(
+      market,
+      undefined,
+      undefined,
+      params
+    );
+
+    // Seed the feed from this snapshot so the next call can be served from it.
+    this.startOrderStream(market, params, orders);
+
+    return orders;
+  }
+
+  private stopTickerStream(market?: string): void {
+    for (const [symbol, state] of this.tickerStreams) {
+      if (market === undefined || symbol === market) {
+        state.running = false;
+        this.tickerStreams.delete(symbol);
+      }
+    }
+  }
+
+  // Last traded price, or undefined if one can't be established. Callers decide
+  // whether that is fatal — a protective stop should still be placeable when the
+  // ticker is briefly unavailable.
+  private async getReferencePrice(market: string): Promise<number | undefined> {
+    const streamed = this.tickerStreams.get(market);
+
+    if (
+      streamed?.price !== undefined &&
+      Date.now() - streamed.at <= ExchangeClient.STREAMED_PRICE_MAX_AGE_MS
+    ) {
+      return streamed.price;
+    }
+
+    // Nothing live, or what's live is too old to act on.
+    this.startTickerStream(market);
+
+    try {
+      const ticker = await this.exchange!.fetchTicker(market);
+      const last = ticker.last ?? ticker.close ?? undefined;
+
+      return typeof last === 'number' && Number.isFinite(last) && last > 0
+        ? last
+        : undefined;
+    } catch (error) {
+      console.warn(
+        `[ExchangeClient] Could not fetch a reference price for ${market}: ${
+          (error as Error).message
+        }`
+      );
+      return undefined;
+    }
+  }
+
   // Notional value of an order, in the market's quote currency.
   //
   // On inverse contracts (Phemex's BTC/USD:BTC and friends) each contract is
@@ -333,8 +637,7 @@ export class ExchangeClient {
       !Number.isFinite(referencePrice) ||
       referencePrice <= 0
     ) {
-      const ticker = await this.exchange!.fetchTicker(market);
-      referencePrice = ticker.last ?? ticker.close ?? undefined;
+      referencePrice = await this.getReferencePrice(market);
     }
 
     if (
@@ -448,36 +751,44 @@ export class ExchangeClient {
       // Call the underlying exchange method with market, remaining original args, and the final combined params
       const order = await (this.exchange as any)[method](market, ...originalArgs, finalParams);
 
-      const orderType = order.info.order_type;
+      // What comes back here is the exchange accepting the request, not the
+      // outcome. Whether it fills, and for how much, arrives on the order feed —
+      // so this reports acceptance only, and announceOrderUpdate reports the
+      // rest. Reading a 200 as a fill is how a rejected order passes for a live
+      // one.
+      //
+      // The shape of the response varies by exchange, so nothing here may throw:
+      // an error formatting a confirmation would land in the catch below and
+      // report a placed order as failed.
+      try {
+        const side = order?.side ? `${this.capitalise(String(order.side))} ` : '';
+        const amount = order?.amount !== undefined ? this.trimAmount(parseFloat(order.amount)) : '';
+        const trigger = order?.triggerPrice ?? order?.stopPrice;
+        const at =
+          trigger !== undefined
+            ? ` triggering at ${trigger}`
+            : order?.price
+            ? ` @${order.price}`
+            : '';
 
-      if (orderType === 'market') {
-        const filledAmount = parseFloat(order.filled);
-        const trimmedFilledAmount = this.trimAmount(filledAmount);
-        const trimmedPrice = parseFloat(order.price).toFixed(2);
-        console.log(`Filled ${trimmedFilledAmount} @${trimmedPrice}`);
-      } else if (orderType === 'limit') {
-        const side = order.side;
-        const amount = parseFloat(order.amount);
-        const trimmedAmount = this.trimAmount(amount);
-        const price = parseFloat(order.price).toFixed(2);
         console.log(
-          `Limit order (${side}) of ${trimmedAmount} placed @${price}, order ID: ${order.id}`
+          `${side}order accepted${amount ? ` for ${amount}` : ''}${at}` +
+            `${order?.id ? ` (id ${order.id})` : ''}`
         );
-      } else if (orderType === 'stop_market') {
-        const amount = parseFloat(order.amount);
-        const trimmedAmount = this.trimAmount(amount);
-        const price = parseFloat(order.stopPrice).toFixed(2);
-        console.log(
-          `Placed stop @${price} for amount ${trimmedAmount}, order ID: ${order.id}`
-        );
+      } catch {
+        console.log(`Order accepted${order?.id ? ` (id ${order.id})` : ''}`);
       }
 
       return order;
     } catch (error) {
-      console.error(
-        `[ExchangeClient] Failed to place order:`,
-        (error as Error).message
-      );
+      // Never swallow this. Returning undefined made a rejected order
+      // indistinguishable from a placed one, so callers carried on as though
+      // there were an order resting when there was not — and the chase read the
+      // same undefined as 'filled immediately'.
+      //
+      // Callers decide what a failure means for them; none of them get to miss
+      // that it happened.
+      throw error;
     }
   }
 
@@ -854,8 +1165,12 @@ export class ExchangeClient {
   async cancelChaseOrder(orderId: string, market: string, params?: Record<string, any>): Promise<void> {
     // Always set the active flag to false when cancellation is attempted
     this.chaseLimitOrderActive = false;
+    // Prefer the id the chase is actually working; the caller's copy is from
+    // when the chase started and may name an order that has since been replaced.
+    const targetId = this.currentChaseOrderId ?? orderId;
+    this.currentChaseOrderId = undefined;
     try {
-      await this.exchange!.cancelOrder(orderId, market, params);
+      await this.exchange!.cancelOrder(targetId, market, params);
     } catch (error: any) {
         // Check if it's a benign OrderNotFound error
         const errorMessage = String(error.message || '');
@@ -876,6 +1191,167 @@ export class ExchangeClient {
 
   getChaseLimitOrderStatus(): boolean {
     return this.chaseLimitOrderActive;
+  }
+
+  // Chase driven by the exchange's WebSocket feeds instead of polling.
+  //
+  // The book pushes prices as they change, and the order stream reports fills
+  // and cancels as they happen. That removes two REST calls per cycle, so the
+  // only requests left are the ones that actually move an order — which is what
+  // the exchange's order-action rate limit is for. It also means a fill is known
+  // from an event rather than looked up afterwards in an API that lags.
+  //
+  // Phemex has no order placement over WebSocket, so moves stay on REST.
+  private async runStreamingChase(opts: {
+    market: string;
+    side: string;
+    amount: number;
+    orderId: string;
+    orderPrice: number;
+    params?: Record<string, any>;
+  }): Promise<void> {
+    const { market, side, amount, params } = opts;
+    const tickSize = this.getMarketPriceTickSize(market);
+
+    let orderId = opts.orderId;
+    let orderPrice = opts.orderPrice;
+    let remaining = amount;
+    let finished = false;
+    // A move is cancel/replace on some exchanges, which makes the old order
+    // report as cancelled. Without this the order stream would read our own
+    // replacement as the trader's order being cancelled and end the chase.
+    let moveInFlight = false;
+    // The in-flight flag alone isn't enough: the cancellation event for an order
+    // we replaced can arrive after the move has finished. Orders we retired
+    // ourselves are remembered so a late event about one is never mistaken for
+    // the trader cancelling.
+    const retiredOrderIds = new Set<string>();
+
+    this.currentChaseOrderId = orderId;
+
+    const finish = (message: string) => {
+      if (finished) return;
+      finished = true;
+      this.chaseLimitOrderActive = false;
+      this.currentChaseOrderId = undefined;
+      this.logAndReplace(message);
+    };
+
+    const moveTo = async (targetPrice: number) => {
+      if (moveInFlight || finished || !this.chaseLimitOrderActive) return;
+      moveInFlight = true;
+
+      try {
+        try {
+          const edited = await this.editOrder(
+            orderId,
+            market,
+            'limit',
+            targetPrice,
+            remaining,
+            params,
+            // The stream keeps us current on the order, so hand editOrder what
+            // it needs rather than let it fetch order history — that lookup is
+            // the REST call streaming exists to avoid.
+            { id: orderId, side, amount: remaining } as unknown as Order
+          );
+
+          if (edited?.id && edited.id !== orderId) {
+            orderId = edited.id;
+          }
+        } catch (editError) {
+          // Amend refused: cancel and replace instead.
+          retiredOrderIds.add(orderId);
+          await this.exchange!.cancelOrder(orderId, market, params);
+
+          const replacement = await (side === 'buy'
+            ? this.createLimitBuyOrder(market, targetPrice, remaining, params, true)
+            : this.createLimitSellOrder(market, targetPrice, remaining, params, true));
+
+          if (!replacement?.id) {
+            finish(
+              `Chase stopped: the order was cancelled to move it to ${targetPrice}, ` +
+                `but the replacement could not be placed. Nothing is resting — you are not in this trade.`
+            );
+            return;
+          }
+
+          orderId = replacement.id;
+          // An exchange that reuses the id must not leave the live order marked
+          // as retired.
+          retiredOrderIds.delete(orderId);
+        }
+
+        orderPrice = targetPrice;
+        this.currentChaseOrderId = orderId;
+      } catch (error) {
+        this.logAndReplace(
+          `Chase: could not move the order to ${targetPrice} (${(error as Error).message})`
+        );
+      } finally {
+        moveInFlight = false;
+      }
+    };
+
+    const followBook = async () => {
+      while (!finished && this.chaseLimitOrderActive) {
+        const book = await this.exchange!.watchOrderBook(market);
+        if (finished || !this.chaseLimitOrderActive) return;
+
+        const levels = side === 'buy' ? book.bids : book.asks;
+        if (!levels || levels.length === 0) continue;
+
+        const best = levels[0][0];
+        const improves = side === 'buy' ? best > orderPrice : best < orderPrice;
+
+        if (improves && Math.abs(best - orderPrice) >= tickSize) {
+          await moveTo(best);
+        }
+      }
+    };
+
+    const followOrder = async () => {
+      while (!finished && this.chaseLimitOrderActive) {
+        const orders = await this.exchange!.watchOrders(market);
+        if (finished || !this.chaseLimitOrderActive) return;
+
+        for (const update of orders) {
+          // Anything we retired ourselves is our own doing, however late the
+          // event arrives.
+          if (update.id !== undefined && retiredOrderIds.has(update.id)) continue;
+
+          // Only the order being worked; events for orders we have already
+          // replaced are stale by definition.
+          if (update.id !== orderId) continue;
+
+          if (update.remaining !== undefined) {
+            remaining = update.remaining;
+          }
+
+          const status = String(update.status ?? '');
+
+          if (status === 'closed') {
+            finish(
+              `Chase ${side} order filled for ${update.filled ?? amount} ${market}`
+            );
+            return;
+          }
+
+          if (status === 'canceled' || status === 'rejected') {
+            // Our own cancel/replace produces this too; only the trader's
+            // cancellation should end the chase.
+            if (!moveInFlight) {
+              finish(`Chase ${side} order ${status} ${market}`);
+              return;
+            }
+          }
+        }
+      }
+    };
+
+    // Whichever finishes first ends the chase; the other loop sees `finished`
+    // on its next event and exits.
+    await Promise.race([followBook(), followOrder()]);
   }
 
   async chaseLimitOrder(
@@ -912,13 +1388,28 @@ export class ExchangeClient {
     }
 
     // Pass params (containing TIF: Alo for Hyperliquid) AND postOnly: true flag
-    const order = await (side === 'buy'
-      ? await this.createLimitBuyOrder(market, initialPrice, amount, params, true)
-      : await this.createLimitSellOrder(market, initialPrice, amount, params, true));
+    // The active flag is already set, so a failure here has to clear it or the
+    // next chase is refused with 'Chase order already active'.
+    let order;
+    try {
+      order = await (side === 'buy'
+        ? await this.createLimitBuyOrder(market, initialPrice, amount, params, true)
+        : await this.createLimitSellOrder(market, initialPrice, amount, params, true));
+    } catch (error) {
+      this.chaseLimitOrderActive = false;
+      this.currentChaseOrderId = undefined;
+      throw error;
+    }
 
     if (!order) {
-      console.log('Order filled immediately');
+      // executeOrder throws on rejection, so nothing here means the client had
+      // no exchange to talk to rather than an order that vanished.
       this.chaseLimitOrderActive = false;
+      this.currentChaseOrderId = undefined;
+      NotificationManager.notify(
+        'Chase not started: no order was placed.',
+        NType.ERROR
+      );
       return;
     }
 
@@ -926,62 +1417,254 @@ export class ExchangeClient {
     let orderId = order.id;
     let remainingAmount = amount;
 
-    const executeChaseOrder = async () => {
-      // Pass params to fetchOpenOrders
-      const openOrders = await this.exchange!.fetchOpenOrders(market, undefined, undefined, params);
-      const order = openOrders.find((o) => o.id === orderId);
+    // A cycle costs several API calls (open orders, order book, and an edit),
+    // and ccxt's rate limiter spaces every call out. Polling faster than the
+    // limiter allows doesn't chase harder, it just queues work and falls behind,
+    // so the floor is derived from the exchange's own rate limit.
+    const callsPerCycle = 3;
+    const rateLimitFloor = Math.ceil(
+      (this.exchange.rateLimit ?? 100) * callsPerCycle
+    );
+    const chaseInterval = Math.max(
+      this.getExchangeId() === 'hyperliquid' ? 1500 : 100,
+      rateLimitFloor
+    );
 
-      if (!order) {
-        if (this.chaseLimitOrderActive) {
-          this.logAndReplace(`Chase ${side} order filled for ${amount} ${market}`);
-          this.chaseLimitOrderActive = false;
-        } else {
-          this.logAndReplace(`Chase ${side} order cancelled for ${amount} ${market}`);
-        }
+    // Transient failures are normal against a live exchange. Give up only after
+    // several in a row, and say so, rather than dying on the first one.
+    const maxConsecutiveErrors = 5;
+    let consecutiveErrors = 0;
+
+    // Smallest price move the market can express; anything under it isn't a
+    // move worth an API call.
+    const tickSize = this.getMarketPriceTickSize(market);
+
+    const finishChase = (message: string) => {
+      this.chaseLimitOrderActive = false;
+      this.currentChaseOrderId = undefined;
+      this.logAndReplace(message);
+    };
+
+    // Single entry point for running a cycle. Nothing else calls
+    // executeChaseOrder directly, so a rejected promise can never escape and end
+    // the chase silently with the active flag still set — which is what left a
+    // stalled chase unrestartable.
+    const runCycle = () => {
+      executeChaseOrder().catch((error) => {
+        finishChase(
+          `Chase stopped unexpectedly: ${(error as Error).message}. ` +
+            `Any resting order is still live.`
+        );
+      });
+    };
+
+    const scheduleNextCycle = () => {
+      setTimeout(runCycle, chaseInterval);
+    };
+
+    const executeChaseOrder = async () => {
+      // 'cancel chase' clears the flag; stop rather than resurrecting the loop.
+      if (!this.chaseLimitOrderActive) {
+        this.logAndReplace(`Chase ${side} order cancelled for ${amount} ${market}`);
         return;
       }
 
-      const updatedOrderBook = await this.exchange!.fetchL2OrderBook(market);
-      const updatedBestPrice =
-        side === 'buy'
-          ? updatedOrderBook.bids[0][0]
-          : updatedOrderBook.asks[0][0];
-
       try {
-        if (
-          (side === 'buy' && updatedBestPrice > order.price) ||
-          (side === 'sell' && updatedBestPrice < order.price)
-        ) {
-          // Pass params to editOrder
-          const editResult = await this.editOrder(
-            orderId,
-            market,
-            'limit',
-            updatedBestPrice,
-            order.remaining,
-            params // Pass Hyperliquid params here
-          );
+        // Pass params to fetchOpenOrders
+        const openOrders = await this.exchange!.fetchOpenOrders(market, undefined, undefined, params);
+        const order = openOrders.find((o) => o.id === orderId);
 
-          // Check if the order ID changed after edit (esp. for cancel/replace exchanges)
-          if (editResult && editResult.id !== orderId) {
-            orderId = editResult.id; // Update orderId for subsequent checks
+        if (!order) {
+          // Gone from the open orders isn't the same as filled — it may have
+          // been cancelled or rejected.
+          //
+          // Phemex resolves a finished order through its historical data API,
+          // which lags the live book by a second or so, and answers in the
+          // meantime with an empty record. An empty record is 'not yet known',
+          // never 'did not fill', so only a record that actually says something
+          // is allowed to decide the outcome.
+          let outcome: string | undefined;
+
+          for (let attempt = 0; attempt < 3 && outcome === undefined; attempt++) {
+            if (attempt > 0) {
+              await this.sleep(750);
+            }
+
+            try {
+              const finalOrder = await this.exchange!.fetchOrder(orderId, market, params);
+              const filled = Number(finalOrder?.filled ?? 0);
+              const status = String(finalOrder?.status ?? '');
+
+              if (status === 'closed' || filled >= amount) {
+                outcome = `filled for ${filled || amount}`;
+              } else if (status === 'canceled' || status === 'rejected') {
+                outcome =
+                  filled > 0
+                    ? `${status} after filling ${filled} of ${amount}`
+                    : `${status} without filling`;
+              } else if (filled > 0) {
+                outcome = `ended with ${filled} of ${amount} filled`;
+              }
+              // Anything else is an unpopulated record: try again.
+            } catch {
+              // Not visible to the history API yet either; try again.
+            }
           }
+
+          finishChase(
+            outcome !== undefined
+              ? `Chase ${side} order ${outcome} ${market}`
+              : `Chase ${side} order is no longer open for ${market}. ` +
+                  `The exchange hasn't reported the outcome yet — check your position.`
+          );
+          return;
+        }
+
+        const updatedOrderBook = await this.exchange!.fetchL2OrderBook(market);
+        const levels =
+          side === 'buy' ? updatedOrderBook.bids : updatedOrderBook.asks;
+
+        // An empty side of the book is momentary; wait for the next cycle rather
+        // than reading past the end of the array and killing the chase.
+        if (!levels || levels.length === 0) {
+          scheduleNextCycle();
+          return;
+        }
+
+        const updatedBestPrice = levels[0][0];
+
+        // Only chase a move worth chasing. Sub-tick differences can't be
+        // expressed in an order anyway, and amending on every flicker is what
+        // runs an account into the exchange's order-action rate limit.
+        const improves =
+          side === 'buy'
+            ? updatedBestPrice > order.price
+            : updatedBestPrice < order.price;
+        const movedAtLeastOneTick =
+          Math.abs(updatedBestPrice - order.price) >= tickSize;
+
+        if (improves && movedAtLeastOneTick) {
+          try {
+            const editResult = await this.editOrder(
+              orderId,
+              market,
+              'limit',
+              updatedBestPrice,
+              order.remaining,
+              params, // Pass Hyperliquid params here
+              order // already in hand; saves a fetchOrders call per edit
+            );
+
+            // Check if the order ID changed after edit (esp. for cancel/replace exchanges)
+            if (editResult && editResult.id !== orderId) {
+              orderId = editResult.id; // Update orderId for subsequent checks
+              this.currentChaseOrderId = orderId;
+            }
+
+            consecutiveErrors = 0;
+          } catch (error) {
+            // Exchanges refuse amends for all sorts of reasons — order-action
+            // rate limits, a partial fill, an order still settling from the last
+            // amend. Cancelling and placing a fresh order achieves the same
+            // thing and doesn't depend on amend being available at all.
+            try {
+              await this.exchange!.cancelOrder(orderId, market, params);
+            } catch (cancelError) {
+              // Couldn't amend and couldn't cancel: leave it alone this cycle
+              // rather than risk ending up with two live orders.
+              consecutiveErrors++;
+              this.logAndReplace(
+                `Chase: could not move the order to ${updatedBestPrice} ` +
+                  `(${(error as Error).message}) [${consecutiveErrors}/${maxConsecutiveErrors}]`
+              );
+
+              if (consecutiveErrors >= maxConsecutiveErrors) {
+                finishChase(
+                  `Chase stopped after ${maxConsecutiveErrors} failed moves. ` +
+                    `The order is still resting at ${order.price} — cancel it with 'cancel chase'.`
+                );
+                return;
+              }
+
+              scheduleNextCycle();
+              return;
+            }
+
+            // The old order is gone from here on, so a failure to place the
+            // replacement leaves nothing resting and must be said plainly.
+            const replacement = await (side === 'buy'
+              ? this.createLimitBuyOrder(market, updatedBestPrice, order.remaining, params, true)
+              : this.createLimitSellOrder(market, updatedBestPrice, order.remaining, params, true));
+
+            if (!replacement?.id) {
+              finishChase(
+                `Chase stopped: the order was cancelled to move it to ${updatedBestPrice}, ` +
+                  `but the replacement could not be placed. Nothing is resting — you are not in this trade.`
+              );
+              return;
+            }
+
+            orderId = replacement.id;
+            this.currentChaseOrderId = orderId;
+            consecutiveErrors = 0;
+          }
+        } else {
+          consecutiveErrors = 0;
+        }
+
+        remainingAmount = order.remaining;
+
+        if (remainingAmount > 0) {
+          scheduleNextCycle();
+        } else {
+          finishChase(`Chase ${side} order filled for ${amount} ${market}`);
         }
       } catch (error) {
-        // Suppress the error output
-        // Optionally, you can log the error to a file or handle it in another way
-      }
+        // Anything unexpected: keep the chase alive across a blip, but never
+        // leave it running silently forever.
+        consecutiveErrors++;
 
-      remainingAmount = order.remaining;
+        if (consecutiveErrors >= maxConsecutiveErrors) {
+          finishChase(
+            `Chase stopped after ${maxConsecutiveErrors} consecutive errors ` +
+              `(${(error as Error).message}). Any resting order is still live — check with 'cancel chase'.`
+          );
+          return;
+        }
 
-      if (remainingAmount > 0) {
-        // Use a longer interval for Hyperliquid due to higher latency
-        const chaseInterval = this.getExchangeId() === 'hyperliquid' ? 1500 : 100;
-        setTimeout(executeChaseOrder, chaseInterval);
+        scheduleNextCycle();
       }
     };
 
-    executeChaseOrder();
+    this.currentChaseOrderId = orderId;
+
+    // Prefer the live feeds when the exchange has them; fall back to polling if
+    // they aren't supported or the socket refuses to start (bad key, blocked
+    // port). A chase that polls is worse than one that streams, but far better
+    // than one that doesn't run.
+    const canStream =
+      Boolean(this.exchange.has['watchOrderBook']) &&
+      Boolean(this.exchange.has['watchOrders']);
+
+    if (canStream) {
+      this.runStreamingChase({
+        market,
+        side,
+        amount,
+        orderId,
+        orderPrice: initialPrice,
+        params,
+      }).catch((error) => {
+        if (!this.chaseLimitOrderActive) return;
+
+        this.logAndReplace(
+          `Chase: live feed unavailable (${(error as Error).message}); using polling instead.`
+        );
+        runCycle();
+      });
+    } else {
+      runCycle();
+    }
 
     // let's parse the decay time. 'decay' that takes a time argument in seconds e.g. `5s` or minutes e.g. `1m`
     const parseDecayTime = (decay: string): number => {
@@ -1019,12 +1702,21 @@ export class ExchangeClient {
     orderType: string,
     price: number,
     quantity?: number,
-    params?: Record<string, any>
+    params?: Record<string, any>,
+    knownOrder?: Order
   ): Promise<Order | undefined> {
     try {
-      // Pass params to fetchOrders for exchanges like Hyperliquid that require user context
-      const orders = await this.exchange!.fetchOrders(symbol, undefined, undefined, params);
-      let order = orders.find((order) => order.id === orderId);
+      // A caller that already holds the order passes it in. Re-fetching order
+      // history to find an order we were just looking at costs an extra API call
+      // per edit, and on a chase that is the difference between keeping up with
+      // the book and falling behind it.
+      let order = knownOrder;
+
+      if (!order) {
+        // Pass params to fetchOrders for exchanges like Hyperliquid that require user context
+        const orders = await this.exchange!.fetchOrders(symbol, undefined, undefined, params);
+        order = orders.find((order) => order.id === orderId);
+      }
 
       if (!order) {
         throw new Error(`Order with id ${orderId} not found`);
@@ -1198,7 +1890,10 @@ export class ExchangeClient {
         console.error(`[ExchangeClient] No positions found for ${market}.`);
       }
     } catch (error) {
-      console.error(`[ExchangeClient] Failed to close position:`, error);
+      NotificationManager.notify(
+        `Position not closed: ${(error as Error).message}. You are still in this position.`,
+        NType.ERROR
+      );
     }
   }
 
@@ -1497,8 +2192,8 @@ export class ExchangeClient {
     const publicAddress = this.exchange?.id === 'hyperliquid' ?
       (this.exchange as any).publicAddress || (this.exchange as any).walletAddress : undefined;
 
-    // Fetch open orders, potentially with user filter for Hyperliquid
-    const openOrders = await this.exchange!.fetchOpenOrders(market, undefined, undefined,
+    // Sizing only; a moment-old view is fine here.
+    const openOrders = await this.getLiveOpenOrders(market,
         publicAddress ? { 'user': publicAddress } : undefined);
 
     // Filter to only include limit orders, excluding stop/market orders
@@ -1556,14 +2251,31 @@ export class ExchangeClient {
       // Format price to required decimal places
       price = Number(price.toFixed(Math.abs(Math.log10(marketInfo.precision.price))));
 
+      // A stop is only meaningful near the market, so a price nowhere near it is
+      // almost always transposed arguments -- 'stop 0.5 15000' in the old
+      // size-first order, which now reads as a stop at 0.5. Refuse it rather than
+      // resting an order that can never behave as intended.
+      const marketPrice = await this.getReferencePrice(market);
+
+      if (marketPrice !== undefined) {
+        const ratio = price / marketPrice;
+
+        if (ratio > 10 || ratio < 0.1) {
+          throw new Error(
+            `Stop price ${price} is far from the market price of ${marketPrice} for ${market}. ` +
+              `No order was placed. The stop price comes first: 'stop <price> [size]'.`
+          );
+        }
+      }
+
       let side;
 
       // Get public wallet address from exchange config for Hyperliquid
       const walletAddress = this.exchange?.id === 'hyperliquid' ?
         (this.exchange as any).publicAddress || (this.exchange as any).walletAddress : undefined;
 
-      // Fetch open orders needed for side determination if quantity is calculated
-      const openOrders = await this.exchange!.fetchOpenOrders(market, undefined, undefined,
+      // Side determination only; a moment-old view is fine here.
+      const openOrders = await this.getLiveOpenOrders(market,
         walletAddress ? { 'user': walletAddress } : undefined);
 
        // Filter to only include limit orders, excluding stop/market orders (needed for side calculation)
@@ -1577,24 +2289,37 @@ export class ExchangeClient {
           return isLimit && isNotStopTrigger;
       });
 
-      // If no quantity is provided, calculate it using the helper method
-      if (quantity === undefined) {
-         quantity = await this._calculateDefaultStopAmount(market);
+      const position = await this.getPositionStructure(market);
+      const hasPosition =
+        position?.contracts !== undefined && position.contracts > 0;
+
+      // Phemex expresses "the whole position" as an order quantity of zero: the
+      // exchange closes whatever the position is at the moment the stop fires,
+      // rather than a size fixed when it was placed. That is what the UI creates
+      // when you set a stop on a position, and it is why an explicitly sized
+      // stop shows up as a standalone conditional order instead.
+      //
+      // Only when the size wasn't given. 'stop <price> <size>' still means that
+      // size, so a partial stop is still possible.
+      const closeWholePosition =
+        !sizeCameFromUser && this.exchange.id === 'phemex' && hasPosition;
+
+      if (closeWholePosition) {
+        quantity = 0;
+      } else if (quantity === undefined) {
+        quantity = await this._calculateDefaultStopAmount(market);
       }
 
       // If there's a non-zero quantity, proceed with creating the stop order
-      if (quantity > 0) {
+      if (quantity > 0 || closeWholePosition) {
         // Get limit orders only and determine their side if there are no open positions from which to determine the side
-        const position = await this.getPositionStructure(market);
-
-        if (position?.contracts !== undefined && position.contracts > 0) {
+        if (hasPosition) {
           side = position?.side === 'long' ? 'sell' : 'buy';
         } else if (limitOrders.length > 0) {
           side = limitOrders[0].side === 'buy' ? 'sell' : 'buy';
         } else {
-          // Get current market price to determine side
-          const ticker = await this.exchange!.fetchTicker(market);
-          const currentPrice = ticker.last || 0;
+          // Reuse the price already fetched for the sanity check above.
+          const currentPrice = marketPrice ?? 0;
 
           // If stop price is below current price, it's a sell stop
           // If stop price is above current price, it's a buy stop
@@ -1629,12 +2354,26 @@ export class ExchangeClient {
           }
         }
 
-        // Add triggerDirection for Phemex stop orders
         if (this.exchange!.id === 'phemex') {
-          // For sell stops, trigger when price goes down (2)
-          // For buy stops, trigger when price goes up (1)
-          params.triggerDirection = side === 'sell' ? 2 : 1; // Phemex requires 1 (up) or 2 (down)
-          params.trigger = 'ByLastPrice'; // Explicitly set trigger type for Phemex
+          // ccxt wants the direction as the string 'up' or 'down' and uses it to
+          // choose the Phemex order type. It was being sent as 1 or 2, which
+          // matches nothing, so the direction was silently discarded.
+          //
+          // Derive it from where the trigger sits relative to the market rather
+          // than from the side, so a trigger on the far side of the market
+          // becomes MarketIfTouched instead of an unreachable Stop.
+          params.triggerDirection =
+            marketPrice !== undefined
+              ? price > marketPrice
+                ? 'up'
+                : 'down'
+              : side === 'sell'
+              ? 'down'
+              : 'up';
+
+          // The UI triggers on last price; ccxt defaults to mark price, and the
+          // two diverge. 'trigger' was the wrong key and never took effect.
+          params.triggerType = 'ByLastPrice';
         }
 
         // If the reduce-only feature is supported by the exchange, add the corresponding property to the parameters object
@@ -1643,10 +2382,15 @@ export class ExchangeClient {
         }
 
         // Adjust the quantity to match the exchange's precision requirements
-        quantity = await this.getQuantityPrecision(market, quantity, {
-          enforceFatFinger: enforceFatFinger && sizeCameFromUser,
-          price,
-        });
+        // A zero quantity is the "whole position" marker, not a size, so it
+        // skips the size checks -- which would reject it, and which have nothing
+        // to guard against when the exchange caps the fill at the position.
+        if (!closeWholePosition) {
+          quantity = await this.getQuantityPrecision(market, quantity, {
+            enforceFatFinger: enforceFatFinger && sizeCameFromUser,
+            price,
+          });
+        }
 
         // --- Adjust parameters for Hyperliquid Stop Market ---
         let finalOrderType = orderType;
@@ -1658,10 +2402,13 @@ export class ExchangeClient {
             finalPriceArg = price; // Pass the trigger price as the main price argument for slippage calculation
             if (!finalParams.triggerPrice) finalParams.triggerPrice = price;
             finalParams.reduceOnly = true;
-        } else if (finalOrderType.toLowerCase() === 'stop') {
-            // For Phemex (and potentially other exchanges where 'Stop' means stop-market),
-            // the main price argument for createOrder should be undefined.
-            // The trigger price is already in finalParams.stopPx (or equivalent).
+        } else if (
+            finalOrderType.toLowerCase() === 'stop' ||
+            finalOrderType.toLowerCase() === 'market'
+        ) {
+            // A stop-market has no limit price of its own, so the main price
+            // argument stays undefined. The trigger price is already carried in
+            // finalParams under the exchange's own key.
             finalPriceArg = undefined;
         }
         // --- End Hyperliquid Adjustment ---
@@ -1680,7 +2427,11 @@ export class ExchangeClient {
         // Only log and return if the order was successfully created
         if (createdOrder) {
           if (!suppressLog) {
-              console.log(`Stop order placed at ${price} for ${quantity} ${market}`);
+              console.log(
+                closeWholePosition
+                  ? `Stop order placed at ${price} for the whole ${market} position`
+                  : `Stop order placed at ${price} for ${quantity} ${market}`
+              );
           }
           return createdOrder;
         } else {
@@ -1696,7 +2447,10 @@ export class ExchangeClient {
       }
     } catch (error) {
       // If any errors occur during the process, log the error message
-      console.error(`[ExchangeClient] Failed to place order:`, error);
+      NotificationManager.notify(
+        `Stop order NOT placed: ${(error as Error).message}. This position is unprotected.`,
+        NType.ERROR
+      );
       return undefined; // Return undefined on error
     }
   }
