@@ -177,6 +177,19 @@ export class UserInterface {
     this.availableMarkets =
       (await this.exchangeCommand.getExchangeClient().getMarketSymbols()) || [];
 
+    const fatFingerLimit = this.exchangeCommand
+      .getExchangeClient()
+      .getFatFingerLimit();
+
+    console.log(
+      fatFingerLimit === undefined
+        ? fo(
+            'No fatfinger limit set — order value is unlimited. Set one with "fatfinger <amount>".',
+            'yellow'
+          )
+        : `Fatfinger limit: ${fatFingerLimit} per order.`
+    );
+
     // Load saved state if in dev mode and this is a reload
     if (this.isDevMode) {
       const state = await this.stateManager.loadState();
@@ -258,6 +271,47 @@ export class UserInterface {
     return command;
   }
 
+  // fatfinger             show the current limit
+  // fatfinger <amount>    set the most a single order may be worth
+  // fatfinger off         remove the limit
+  private async handleFatFingerCommand(command: string): Promise<void> {
+    const exchangeClient = this.exchangeCommand.getExchangeClient();
+    const arg = command.slice('fatfinger'.length).trim();
+
+    if (arg === '') {
+      const limit = exchangeClient.getFatFingerLimit();
+      console.log(
+        limit === undefined
+          ? 'No fatfinger limit set. Orders of any value will be accepted. Set one with "fatfinger <amount>".'
+          : `Fatfinger limit: ${limit} per order.`
+      );
+      return;
+    }
+
+    if (arg === 'off') {
+      await exchangeClient.setFatFingerLimit(undefined);
+      console.log(
+        'Fatfinger limit removed. Orders of any value will now be accepted.'
+      );
+      return;
+    }
+
+    const limit = Number(arg);
+
+    if (!Number.isFinite(limit) || limit <= 0) {
+      console.log(
+        `Invalid fatfinger amount '${arg}'. Give a number greater than 0, or "off" to remove the limit.`
+      );
+      return;
+    }
+
+    await exchangeClient.setFatFingerLimit(limit);
+    console.log(
+      `Fatfinger limit set to ${limit} per order, measured as size x price in the market's quote currency. ` +
+        `Orders worth more than this are rejected before being sent.`
+    );
+  }
+
   private async handleCommand(command: string) {
     if (command.startsWith('print')) {
       if (command.includes('possize')) {
@@ -328,6 +382,8 @@ export class UserInterface {
     }
     if (command === 'list methods') {
       this.displayAvailableMethods();
+    } else if (command === 'fatfinger' || command.startsWith('fatfinger ')) {
+      await this.handleFatFingerCommand(command);
     } else if (command.startsWith('market')) {
       const market = command.split(' ')[1];
       if (this.availableMarkets.includes(market)) {

@@ -27,7 +27,6 @@ export class Client {
   }
 
   async start() {
-    console.log('Client initialized');
     this.exchangeClient.init();
 
     // In dev mode, check if we have a saved state from a previous session that was reloaded
