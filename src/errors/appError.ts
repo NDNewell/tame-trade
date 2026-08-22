@@ -6,9 +6,11 @@ import { ErrorType } from './errorType.js';
 export class AppError extends Error {
   type: ErrorType;
 
-  constructor(type: ErrorType) {
+  // `detail` adds context to the standard message, so a rejected command can say
+  // what the expected form is instead of only that something was wrong.
+  constructor(type: ErrorType, detail?: string) {
     const message = AppError.getMessage(type);
-    super(message);
+    super(detail ? `${message}. ${detail}` : message);
     this.type = type;
   }
 

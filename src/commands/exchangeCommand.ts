@@ -135,15 +135,23 @@ export namespace OrderType {
       let quantityString;
 
       if (type === OrderType.STOP) {
+        // stop <price> [size]
+        //
+        // The first argument is always the price, whether or not a size follows.
+        // It previously meant price on its own but size when a second argument
+        // was given, so 'stop 15000 0.5' was read as 15000 units at a price of
+        // 0.5 -- the same words the user would use to mean the opposite.
+        priceString = args[1];
+
         if (args.length === 3) {
-          if (!isNaN(Number(args[1]))) {
-            quantity = Number(args[1]);
-            priceString = args[2];
+          if (!isNaN(Number(args[2]))) {
+            quantity = Number(args[2]);
           } else {
-            throw new AppError(ErrorType.INVALID_QUANTITY);
+            throw new AppError(
+              ErrorType.INVALID_QUANTITY,
+              'Usage: stop <price> [size]'
+            );
           }
-        } else if (args.length === 2) {
-          priceString = args[1];
         }
       } else {
         quantityString = args.length === 4 ? args[2] : args[1];
@@ -166,6 +174,23 @@ export namespace OrderType {
         } else {
           throw new AppError(ErrorType.INVALID_PRICE);
         }
+
+        if (!Number.isFinite(price) || price <= 0) {
+          throw new AppError(
+            ErrorType.INVALID_PRICE,
+            `'${priceString}' is not a usable price`
+          );
+        }
+      }
+
+      if (
+        quantity !== undefined &&
+        (!Number.isFinite(quantity) || quantity <= 0)
+      ) {
+        throw new AppError(
+          ErrorType.INVALID_QUANTITY,
+          `'${quantity}' is not a usable size`
+        );
       }
 
       return { type, quantity, price };
