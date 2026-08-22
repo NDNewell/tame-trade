@@ -619,6 +619,7 @@ export class ExchangeClient {
     const status = String(update.status ?? '');
     const side = String(update.side ?? 'order');
     const symbol = market.split(':')[0];
+    const at = this.orderEventTime(update);
     const filled = Number(update.filled ?? 0);
     const previouslyFilled = state.filledSoFar.get(id) ?? 0;
     const rawPrice = update.average ?? update.price;
@@ -639,19 +640,26 @@ export class ExchangeClient {
           ? `${this.capitalise(side)} filled ${filled}${at}`
           : `${this.capitalise(side)} partially filled ${filled}${total ? ` of ${total}` : ''}${at}`,
         NType.SUCCESS,
-        'FILL'
+        'FILL',
+        at
       );
     }
 
     if (status === 'canceled' && filled === 0) {
-      NotificationManager.notify(`${this.capitalise(side)} order canceled`, NType.INFO, 'ORDER');
+      NotificationManager.notify(
+        `${this.capitalise(side)} order canceled`,
+        NType.INFO,
+        'ORDER',
+        at
+      );
     }
 
     if (status === 'rejected') {
       NotificationManager.notify(
         `${this.capitalise(side)} order REJECTED by the exchange. Nothing is resting.`,
         NType.ERROR,
-        'ERROR'
+        'ERROR',
+        at
       );
     }
   }
@@ -665,6 +673,33 @@ export class ExchangeClient {
     } catch {
       return String(Math.round(price * 10000) / 10000);
     }
+  }
+
+  /**
+   * When an order event happened, rather than when it reached us. The feed
+   * replays recent orders on connect, so without this a backlog of old fills all
+   * appear stamped with the moment of login.
+   */
+  private orderEventTime(update: Order): number | undefined {
+    const candidates = [
+      (update as any).lastUpdateTimestamp,
+      update.timestamp,
+      // Phemex reports nanoseconds in the raw payload.
+      (update as any).info?.transactTimeNs
+        ? Number((update as any).info.transactTimeNs) / 1e6
+        : undefined,
+      (update as any).info?.actionTimeNs
+        ? Number((update as any).info.actionTimeNs) / 1e6
+        : undefined,
+    ];
+
+    for (const value of candidates) {
+      const numeric = Number(value);
+      // Guard against a zero or nonsense timestamp being taken as 1970.
+      if (Number.isFinite(numeric) && numeric > 1_000_000_000_000) return numeric;
+    }
+
+    return undefined;
   }
 
   private capitalise(value: string): string {

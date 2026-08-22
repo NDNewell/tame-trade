@@ -8,7 +8,7 @@ export enum NType {
   INFO,
 }
 
-type Sink = (message: string, type: NType, category?: string) => void;
+type Sink = (message: string, type: NType, category?: string, at?: number) => void;
 
 export class NotificationManager {
   private static sink: Sink | null = null;
@@ -18,9 +18,9 @@ export class NotificationManager {
     this.sink = sink;
   }
 
-  static notify(message: string, type: NType, category?: string): void {
+  static notify(message: string, type: NType, category?: string, at?: number): void {
     if (this.sink) {
-      this.sink(message, type, category);
+      this.sink(message, type, category, at);
       return;
     }
 

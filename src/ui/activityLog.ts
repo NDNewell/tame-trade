@@ -20,6 +20,8 @@ export type ActivityCategory =
 
 export interface ActivityEvent {
   time: string;
+  /** When the event actually happened, for ordering. */
+  at: number;
   category: ActivityCategory;
   message: string;
   /** Diagnostics are kept but not shown in the primary view. */
@@ -55,15 +57,24 @@ export class ActivityLog {
     this.listeners.push(listener);
   }
 
-  add(category: ActivityCategory, message: string, debug = false): void {
-    const time = new Date().toTimeString().slice(0, 8);
+  /**
+   * `at` is when the event happened, which is not always when we hear about it:
+   * the order feed replays recent history on connect, and stamping that backlog
+   * with the current time makes every past fill look like it just happened.
+   */
+  add(category: ActivityCategory, message: string, debug = false, at?: number): void {
+    const when = at !== undefined && Number.isFinite(at) ? at : Date.now();
+    const time = new Date(when).toTimeString().slice(0, 8);
     // Colour arrives embedded in captured output. Those bytes take no columns on
     // screen but count as characters, so leaving them in makes every layout
     // measurement wrong and the frame ends short of its border.
     const text = stripAnsi(String(message)).replace(/\s+/g, ' ').trim();
     if (text.length === 0) return;
 
-    this.events.push({ time, category, message: text, debug });
+    this.events.push({ time, at: when, category, message: text, debug });
+    // A replayed backlog can arrive after messages that are newer than it, so
+    // order by when things happened rather than when they were received.
+    this.events.sort((a, b) => a.at - b.at);
     if (this.events.length > MAX_EVENTS) this.events.shift();
 
     for (const listener of this.listeners) listener();
@@ -91,11 +102,11 @@ export class ActivityLog {
 
     // Notifications carry their own category, so a fill reads as a FILL rather
     // than as generic output.
-    NotificationManager.setSink((message, type, category) => {
+    NotificationManager.setSink((message, type, category, at) => {
       const resolved: ActivityCategory =
         (category as ActivityCategory) ??
         (type === NType.ERROR ? 'ERROR' : type === NType.SUCCESS ? 'ORDER' : 'SYSTEM');
-      this.add(resolved, message);
+      this.add(resolved, message, false, at);
     });
 
     const original = {
