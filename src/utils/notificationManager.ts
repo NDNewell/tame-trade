@@ -1,6 +1,6 @@
 // src/utils/notificationManager.ts
 
-import { formatOutput as fo, Color } from "../utils/formatOutput";
+import { formatOutput as fo, Color } from "./formatOutput.js";
 
 export enum NType {
   SUCCESS,

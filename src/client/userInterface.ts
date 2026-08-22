@@ -196,6 +196,7 @@ export class UserInterface {
       if (state.isDevMode && state.isReload && state.currentMarket &&
           this.availableMarkets.includes(state.currentMarket)) {
         this.currentMarket = state.currentMarket;
+        this.exchangeCommand.getExchangeClient().followMarket(this.currentMarket);
         console.log(`[Dev] Restored previous market: ${this.currentMarket}`);
 
         // Reset the reload flag for next time
@@ -388,6 +389,7 @@ export class UserInterface {
       const market = command.split(' ')[1];
       if (this.availableMarkets.includes(market)) {
         this.currentMarket = market;
+        this.exchangeCommand.getExchangeClient().followMarket(market);
         console.log(`Switched to market: ${market}`);
 
         // Save state for dev mode
@@ -418,6 +420,10 @@ export class UserInterface {
     } else if (command === 'list markets') {
       const marketType = await this.selectMarketType();
       this.currentMarket = await this.selectMarketByType(marketType);
+
+      if (this.currentMarket && this.currentMarket !== 'back') {
+        this.exchangeCommand.getExchangeClient().followMarket(this.currentMarket);
+      }
 
       // Save state for dev mode
       if (this.currentMarket && this.currentMarket !== 'back') {
