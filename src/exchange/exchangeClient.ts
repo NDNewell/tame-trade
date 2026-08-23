@@ -1751,6 +1751,12 @@ export class ExchangeClient {
     // ourselves are remembered so a late event about one is never mistaken for
     // the trader cancelling.
     const retiredOrderIds = new Set<string>();
+    // A chase driven by the book retries on every tick, so without a budget a
+    // move that always fails retries forever -- and a chase that will not stop
+    // cannot be stopped from anywhere else either, since the order id it is
+    // working lives only in this process.
+    const maxConsecutiveErrors = 5;
+    let consecutiveErrors = 0;
 
     this.currentChaseOrderId = orderId;
 
@@ -1811,10 +1817,32 @@ export class ExchangeClient {
 
         orderPrice = targetPrice;
         this.currentChaseOrderId = orderId;
+        consecutiveErrors = 0;
       } catch (error) {
+        const message = (error as Error).message ?? String(error);
+
+        // The order being chased is gone. There is nothing left to move, so
+        // stop rather than retry an id that will never resolve again.
+        if (/cannot find order|order ?not ?found|ordernotfound/i.test(message)) {
+          finish(
+            'Chase stopped: the order it was working no longer exists on the exchange.'
+          );
+          return;
+        }
+
+        consecutiveErrors++;
         this.logAndReplace(
-          `Chase: could not move the order to ${targetPrice} (${(error as Error).message})`
+          `Chase: could not move the order to ${targetPrice} (${message}) ` +
+            `[${consecutiveErrors}/${maxConsecutiveErrors}]`
         );
+
+        if (consecutiveErrors >= maxConsecutiveErrors) {
+          finish(
+            `Chase stopped after ${maxConsecutiveErrors} failed moves. ` +
+              `Any resting order is still live — check the exchange.`
+          );
+          return;
+        }
       } finally {
         moveInFlight = false;
       }
