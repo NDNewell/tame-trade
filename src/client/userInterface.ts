@@ -721,14 +721,29 @@ export class UserInterface {
         const newStopPrice = parseFloat(parts[2]);
         if (!isNaN(newStopPrice)) {
           try {
-              const currentStopOrderId = await this.exchangeCommand.getExchangeClient().editCurrentStopOrder(this.currentMarket, newStopPrice);
+              const currentStopOrderId = await this.exchangeCommand
+                .getExchangeClient()
+                .editCurrentStopOrder(this.currentMarket, newStopPrice);
+
+              // 'processed' was reported whether or not anything moved, so a
+              // failed move read as a successful one.
               if (currentStopOrderId) {
-                  console.log(`Stop order moved to ${newStopPrice}.`);
+                NotificationManager.notify(
+                  `Stop moved to ${newStopPrice}.`,
+                  NType.SUCCESS,
+                  'ORDER'
+                );
               } else {
-                  console.log(`Stop order update processed for ${this.currentMarket}.`);
+                NotificationManager.notify(
+                  `Stop was NOT moved — no stop order was found for ${this.currentMarket}.`,
+                  NType.ERROR
+                );
               }
           } catch (error) {
-              console.error(`Error processing 'move stop' command:`, error);
+              NotificationManager.notify(
+                `Stop was NOT moved: ${(error as Error).message}`,
+                NType.ERROR
+              );
           }
         } else {
           console.log('Invalid price format.');
