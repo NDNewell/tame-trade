@@ -1982,7 +1982,7 @@ export class ExchangeClient {
                 symbol,
                 orderType, // 'limit'
                 String(order.side ?? ''),
-                order.amount,
+                Number(order.amount) > 0 ? order.amount : undefined,
                 newPrice,
                 hyperliquidParams
               );
@@ -2017,13 +2017,17 @@ export class ExchangeClient {
             }
 
             if (originalNewPrice !== undefined) {
-                console.log(`[ExchangeClient/bumpOrders] Non-Hyperliquid: Bumping ${orderType} order ${order.id} to ${originalNewPrice}`);
+
                 await this.exchange!.editOrder(
                     order.id,
                     symbol,
                     orderType,
                     String(order.side ?? ''),
-                    order.amount,
+                    // A stop sized to the whole position has an amount of zero.
+                    // Sending that is rejected as below the minimum; sending
+                    // nothing leaves the existing size untouched, which is what
+                    // moving a stop should do anyway.
+                    Number(order.amount) > 0 ? order.amount : undefined,
                     originalNewPrice, // Pass the new price directly
                     paramsForEdit // Pass specific params if any (like for stop orders)
                 );
@@ -2034,7 +2038,8 @@ export class ExchangeClient {
         throw new Error('No open orders to bump');
       }
     } catch (error) {
-      console.error('Error bumping orders:', error);
+      // Rethrown for the caller to report; logging here as well showed the same
+      // failure twice.
       throw error;
     }
   }

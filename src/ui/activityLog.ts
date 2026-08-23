@@ -35,7 +35,7 @@ const stripAnsi = (value: string): string => value.replace(ANSI, '');
 
 /** Output that is about the machinery rather than the trading. */
 const DIAGNOSTIC = [
-  /^\[ExchangeClient\]/,
+  /^\[ExchangeClient[\]/]/,
   /^\[Dev\]/,
   /not supported by/i,
   /DeprecationWarning/,

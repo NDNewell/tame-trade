@@ -474,10 +474,11 @@ export class UserInterface {
         console.log('No market selected. Please select a market first.');
       }
     } else if (command.startsWith('bump')) {
-      const bumpRegex = /^bump\s+([-+]?\d*\.?\d+)/;
+      // Accepts 'bump +10', 'bump + 10', 'bump -10', 'bump - 10' and 'bump 10'.
+      const bumpRegex = /^bump\s+([-+])?\s*(\d*\.?\d+)/;
       const match = command.match(bumpRegex);
       if (match) {
-        const priceChange = parseFloat(match[1]);
+        const priceChange = parseFloat(`${match[1] ?? ''}${match[2]}`);
         if (this.currentMarket) {
           try {
             await this.exchangeCommand
