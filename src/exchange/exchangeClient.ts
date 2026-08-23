@@ -15,6 +15,7 @@ import {
   PositionRiskResult,
   ProtectiveStopTranche,
 } from '../trading/positionRisk.js';
+import { describeExchangeError } from '../utils/exchangeErrors.js';
 import { NotificationManager } from '../utils/notificationManager.js';
 import { NType } from '../utils/notificationManager.js';
 
@@ -66,6 +67,7 @@ export class ExchangeClient {
   >();
   /** Looked up once per session; it does not change while connected. */
   private accountLabel: string | undefined;
+  private equityCache: { at: number; currency: string; equity?: number } | undefined;
   private accountLookupDone = false;
   private orderStreams = new Map<
     string,
@@ -343,6 +345,7 @@ export class ExchangeClient {
     unrealizedPnl?: number;
     realizedPnl?: number;
     leverage?: number;
+    effectiveLeverage?: number;
     liquidation?: number;
     currency: string;
   } | null> {
@@ -374,9 +377,50 @@ export class ExchangeClient {
       unrealizedPnl,
       realizedPnl: this.readRealizedPnl(info),
       leverage: Number(info.leverage) || undefined,
+      effectiveLeverage: await this.getEffectiveLeverage(
+        market,
+        contracts,
+        mark,
+        unrealizedPnl,
+        currency
+      ),
       liquidation: Number(info.liquidationPrice) || undefined,
       currency,
     };
+  }
+
+  /**
+   * Effective leverage: what the position is actually levered at right now, as
+   * opposed to the leverage the account is configured for.
+   *
+   * Phemex reports only the configured figure, so this is derived from the
+   * position's notional against account equity -- the standard cross-margin
+   * reading, where equity is the balance plus what the position is currently up
+   * or down. Undefined when equity can't be established, since a number that
+   * looks authoritative and isn't would be worse than an honest gap.
+   */
+  private async getEffectiveLeverage(
+    market: string,
+    contracts: number,
+    markPrice: number | undefined,
+    unrealizedPnl: number | undefined,
+    currency: string
+  ): Promise<number | undefined> {
+    if (!(contracts > 0) || markPrice === undefined || !(markPrice > 0)) return undefined;
+
+    const balance = await this.getAccountBalance(currency);
+    if (balance === undefined) return undefined;
+
+    const equity = balance + (unrealizedPnl ?? 0);
+    if (!(equity > 0)) return undefined;
+
+    try {
+      const { notional } = await this.calculateNotional(market, contracts, markPrice);
+      if (!(notional > 0)) return undefined;
+      return notional / equity;
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -565,6 +609,37 @@ export class ExchangeClient {
     }
 
     return this.accountLabel;
+  }
+
+  private static readonly EQUITY_CACHE_MS = 10000;
+
+  /**
+   * Account balance in a settlement currency, cached briefly.
+   *
+   * Effective leverage needs account equity, and the balance call is
+   * authenticated, so it is not made on every repaint.
+   */
+  private async getAccountBalance(currency: string): Promise<number | undefined> {
+    const cached = this.equityCache;
+    if (
+      cached &&
+      cached.currency === currency &&
+      Date.now() - cached.at <= ExchangeClient.EQUITY_CACHE_MS
+    ) {
+      return cached.equity;
+    }
+
+    let equity: number | undefined;
+    try {
+      const balance: any = await this.exchange!.fetchBalance();
+      const total = balance?.total?.[currency];
+      equity = Number.isFinite(Number(total)) ? Number(total) : undefined;
+    } catch {
+      equity = undefined;
+    }
+
+    this.equityCache = { at: Date.now(), currency, equity };
+    return equity;
   }
 
   /** The market values the workspace shows, taken from the feeds where possible. */
@@ -1673,7 +1748,9 @@ export class ExchangeClient {
       finished = true;
       this.chaseLimitOrderActive = false;
       this.currentChaseOrderId = undefined;
-      this.logAndReplace(message);
+      // An empty message ends the chase without a row: the event that ended it
+      // has already been reported in its own right.
+      if (message) this.logAndReplace(message);
     };
 
     const moveTo = async (targetPrice: number) => {
@@ -1772,9 +1849,21 @@ export class ExchangeClient {
           const status = String(update.status ?? '');
 
           if (status === 'closed') {
-            finish(
-              `Chase ${side} order filled for ${update.filled ?? amount} ${market}`
-            );
+            const filled = Number(update.filled ?? amount);
+            const fillPrice = update.average ?? update.price;
+
+            NotificationManager.notify('', NType.SUCCESS, 'FILL', undefined, {
+              side: side.toUpperCase(),
+              quantity: this.formatQuantity(filled),
+              // No price is invented when the fill data hasn't arrived.
+              price:
+                fillPrice === undefined
+                  ? undefined
+                  : this.formatPriceForDisplay(market, Number(fillPrice)),
+              status: 'FILLED',
+            });
+
+            finish('');
             return;
           }
 
@@ -2874,11 +2963,12 @@ export class ExchangeClient {
         // Only log and return if the order was successfully created
         if (createdOrder) {
           if (!suppressLog) {
-              console.log(
-                closeWholePosition
-                  ? `Stop order placed at ${price} for the whole ${market} position`
-                  : `Stop order placed at ${price} for ${quantity} ${market}`
-              );
+              NotificationManager.notify('', NType.INFO, 'ORDER', undefined, {
+                side: side.toUpperCase(),
+                quantity: closeWholePosition ? 'ALL' : this.formatQuantity(quantity),
+                price: this.formatPriceForDisplay(market, price),
+                status: 'STOP WORKING',
+              });
           }
           return createdOrder;
         } else {
@@ -2894,10 +2984,15 @@ export class ExchangeClient {
       }
     } catch (error) {
       // If any errors occur during the process, log the error message
-      NotificationManager.notify(
-        `Stop order NOT placed: ${(error as Error).message}. This position is unprotected.`,
-        NType.ERROR
-      );
+      const failure = describeExchangeError(error);
+      // The full response stays available, marked as diagnostic so it doesn't
+      // run across the activity row.
+      console.error(`[ExchangeClient/createStopOrder] ${failure.raw}`);
+
+      NotificationManager.notify(failure.summary, NType.ERROR, 'ERROR', undefined, {
+        side: 'STOP',
+        status: 'REJECTED',
+      });
       return undefined; // Return undefined on error
     }
   }

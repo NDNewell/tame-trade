@@ -57,6 +57,8 @@ export interface PositionView {
   /** Shorter form, used when the panel can't fit the full one. */
   riskShort?: string;
   leverage: string;
+  /** What the position is actually levered at now, as against the setting. */
+  effectiveLeverage: string;
   liquidation: string;
 }
 
@@ -321,7 +323,7 @@ export function planHeight(height: number, hasChase: boolean) {
 
   // The position panel wants ten rows (label, gap, eight fields). Give it that
   // when there's room, and let activity take the remainder.
-  const splitRows = Math.max(4, Math.min(11, flexible - 4));
+  const splitRows = Math.max(4, Math.min(12, flexible - 4));
   const activityRows = Math.max(1, flexible - splitRows - 1); // -1 for its label
 
   return { splitRows, activityRows };
@@ -340,7 +342,7 @@ function confirmationBlock(
 ): Line[] {
   const inner = width - 1;
   const lines: Line[] = [];
-  const valueCol = 20;
+  const valueCol = 21;
 
   const border = (edge?: 'top' | 'bottom'): Line => {
     const left = edge === 'top' ? box.tl : edge === 'bottom' ? box.bl : box.teeRight;
@@ -760,7 +762,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
 
   // The full form is preferred; the short one is used only when the panel can't
   // hold it, so an unprotected quantity is never silently cut off.
-  const riskRoom = divider - 17 - 1;
+  const riskRoom = divider - 21 - 1;
   const riskValue = position
     ? position.risk.length <= riskRoom
       ? position.risk
@@ -786,6 +788,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
         // the warning treatment rather than the green a positive PnL earns.
         ['Position Risk', riskValue, riskColor],
         ['Leverage', position.leverage, undefined],
+        ['Effective Leverage', position.effectiveLeverage, undefined],
         ['Liquidation', position.liquidation, undefined],
       ]
     : [];
@@ -806,7 +809,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   const oType = oPrice + 9;
   const oStatus = oType + 7;
 
-  const valueCol = 17;
+  const valueCol = 21;
   const bodyRows = Math.max(1, splitRows - 1); // first row of the block is a gap
 
   for (let row = 0; row < bodyRows; row++) {

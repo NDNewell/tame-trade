@@ -253,6 +253,10 @@ export class Workspace {
               risk: formatRisk(risk, base),
               riskShort: formatRisk(risk, base, true),
               leverage: dash(position.leverage, 'x'),
+              effectiveLeverage:
+                position.effectiveLeverage !== undefined
+                  ? `${position.effectiveLeverage.toFixed(2)}x`
+                  : NO_VALUE,
               liquidation: dash(position.liquidation),
             }
           : null,
