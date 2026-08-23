@@ -9,6 +9,7 @@ import { ExchangeProfile } from '../config/configManager.js';
 import { ExchangeCommand, OrderType } from '../commands/exchangeCommand.js';
 import { StateManager } from '../config/stateManager.js';
 import { NotificationManager, NType } from '../utils/notificationManager.js';
+import { describeExchangeError } from '../utils/exchangeErrors.js';
 import { Workspace } from '../ui/workspace.js';
 import { ActivityLog } from '../ui/activityLog.js';
 
@@ -728,22 +729,41 @@ export class UserInterface {
               // 'processed' was reported whether or not anything moved, so a
               // failed move read as a successful one.
               if (currentStopOrderId) {
-                NotificationManager.notify(
-                  `Stop moved to ${newStopPrice}.`,
-                  NType.SUCCESS,
-                  'ORDER'
-                );
+                const client = this.exchangeCommand.getExchangeClient();
+                const position = await client
+                  .getPositionView(this.currentMarket)
+                  .catch(() => null);
+
+                // The protective side is the one that closes the position.
+                const side =
+                  position?.side === 'LONG'
+                    ? 'SELL'
+                    : position?.side === 'SHORT'
+                    ? 'BUY'
+                    : undefined;
+
+                NotificationManager.notify('', NType.SUCCESS, 'ORDER', undefined, {
+                  side,
+                  quantity: 'ALL',
+                  price: client.formatPriceForDisplay(this.currentMarket, newStopPrice),
+                  status: 'STOP UPDATED',
+                });
               } else {
                 NotificationManager.notify(
-                  `Stop was NOT moved — no stop order was found for ${this.currentMarket}.`,
-                  NType.ERROR
+                  'No stop order found to move',
+                  NType.ERROR,
+                  'ERROR',
+                  undefined,
+                  { side: 'STOP', status: 'REJECTED' }
                 );
               }
           } catch (error) {
-              NotificationManager.notify(
-                `Stop was NOT moved: ${(error as Error).message}`,
-                NType.ERROR
-              );
+              const failure = describeExchangeError(error);
+              console.error(`[userInterface/move stop] ${failure.raw}`);
+              NotificationManager.notify(failure.summary, NType.ERROR, 'ERROR', undefined, {
+                side: 'STOP',
+                status: 'REJECTED',
+              });
           }
         } else {
           console.log('Invalid price format.');
