@@ -7,6 +7,7 @@ import { ExchangeClient } from '../exchange/exchangeClient.js';
 import { ActivityLog } from './activityLog.js';
 import { Screen } from './screen.js';
 import { NO_VALUE, TerminalView } from './frame.js';
+import { PositionRiskResult } from '../trading/positionRisk.js';
 
 const FOOTER = [
   'buy',
@@ -83,6 +84,40 @@ export function emptyView(): TerminalView {
   };
 }
 
+/**
+ * Three states that must stay distinct:
+ *   '--'            no protective coverage, so no risk can be stated
+ *   '0.00 USDT'     covered, and the stops sit beyond breakeven
+ *   '1,000.00 USDT' a real planned downside
+ *
+ * Partial coverage names the unprotected quantity rather than implying the
+ * whole position carries the stated risk.
+ */
+const formatRisk = (
+  risk: PositionRiskResult | undefined,
+  base?: string,
+  short = false
+): string => {
+  if (!risk || risk.totalRisk === undefined) {
+    // Ambiguous coverage is flagged rather than resolved into a number that
+    // would look precise and be wrong.
+    return risk?.isAmbiguous ? `${NO_VALUE} [AMBIGUOUS STOPS]` : NO_VALUE;
+  }
+
+  const amount = risk.totalRisk.toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  const value = `${amount} ${risk.currency}`.trim();
+
+  if (risk.isFullyProtected) return value;
+
+  const unprotected = Number(risk.unprotectedQuantity.toFixed(8)).toLocaleString('en-US');
+  return short
+    ? `${value} [PARTIAL]`
+    : `${value} + ${unprotected}${base ? ` ${base}` : ''} unprotected`;
+};
+
 export class Workspace {
   private screen: Screen | null = null;
   private market = '';
@@ -147,9 +182,10 @@ export class Workspace {
     const symbol = this.market.split(':')[0];
 
     try {
-      const [position, orders] = await Promise.all([
+      const [position, orders, risk] = await Promise.all([
         this.client.getPositionView(this.market).catch(() => null),
         this.client.getOpenOrdersForDisplay(this.market).catch(() => []),
+        this.client.getPositionRisk(this.market).catch(() => undefined),
       ]);
 
       const price = await this.client.getDisplayPrice(this.market);
@@ -194,6 +230,8 @@ export class Workspace {
                 position.realizedPnl !== undefined
                   ? `${signed(position.realizedPnl)}${position.currency ? ` ${position.currency}` : ''}`
                   : NO_VALUE,
+              risk: formatRisk(risk, base),
+              riskShort: formatRisk(risk, base, true),
               leverage: dash(position.leverage, 'x'),
               liquidation: dash(position.liquidation),
             }

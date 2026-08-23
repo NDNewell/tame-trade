@@ -52,6 +52,10 @@ export interface PositionView {
   mark: string;
   unrealizedPnl: string;
   realizedPnl: string;
+  /** Planned downside to the protective stops. */
+  risk: string;
+  /** Shorter form, used when the panel can't fit the full one. */
+  riskShort?: string;
   leverage: string;
   liquidation: string;
 }
@@ -317,7 +321,7 @@ export function planHeight(height: number, hasChase: boolean) {
 
   // The position panel wants ten rows (label, gap, eight fields). Give it that
   // when there's room, and let activity take the remainder.
-  const splitRows = Math.max(4, Math.min(10, flexible - 4));
+  const splitRows = Math.max(4, Math.min(11, flexible - 4));
   const activityRows = Math.max(1, flexible - splitRows - 1); // -1 for its label
 
   return { splitRows, activityRows };
@@ -492,6 +496,20 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
   };
 
   // Narrow keeps the values you trade on and drops the reference ones.
+  const riskRoom = inner - 19 - 1;
+  const riskValue = position
+    ? position.risk.length <= riskRoom
+      ? position.risk
+      : position.riskShort ?? position.risk
+    : '';
+  const riskColor: Color | undefined = !position
+    ? undefined
+    : position.risk === NO_VALUE || position.risk.startsWith(NO_VALUE)
+    ? MUTED
+    : position.risk.startsWith('0.00')
+    ? undefined
+    : 'yellow';
+
   const positionFields: Array<[string, string, Color | undefined]> = position
     ? [
         ['Side', position.side, sideColor(position.side)],
@@ -499,6 +517,7 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
         ['Entry', position.entry, undefined],
         ['Mark', position.mark, undefined],
         ['Unrealized PnL', position.unrealizedPnl, signedColor(position.unrealizedPnl)],
+        ['Position Risk', riskValue, riskColor],
       ]
     : [];
 
@@ -739,6 +758,22 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
     new Line(width).divider(divider).put(2, 'POSITION', HEADING_COLOR).put(divider + 2, 'ACTIVE ORDERS', HEADING_COLOR)
   );
 
+  // The full form is preferred; the short one is used only when the panel can't
+  // hold it, so an unprotected quantity is never silently cut off.
+  const riskRoom = divider - 17 - 1;
+  const riskValue = position
+    ? position.risk.length <= riskRoom
+      ? position.risk
+      : position.riskShort ?? position.risk
+    : '';
+  const riskColor: Color | undefined = !position
+    ? undefined
+    : position.risk === NO_VALUE || position.risk.startsWith(NO_VALUE)
+    ? MUTED
+    : position.risk.startsWith('0.00')
+    ? undefined
+    : 'yellow';
+
   const positionFields: Array<[string, string, Color | undefined]> = position
     ? [
         ['Side', position.side, sideColor(position.side)],
@@ -747,6 +782,9 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
         ['Mark', position.mark, undefined],
         ['Unrealized PnL', position.unrealizedPnl, signedColor(position.unrealizedPnl)],
         ['Realized PnL', position.realizedPnl, signedColor(position.realizedPnl)],
+        // Risk is not profit: a positive number here is exposure, so it takes
+        // the warning treatment rather than the green a positive PnL earns.
+        ['Position Risk', riskValue, riskColor],
         ['Leverage', position.leverage, undefined],
         ['Liquidation', position.liquidation, undefined],
       ]

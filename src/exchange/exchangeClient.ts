@@ -10,6 +10,11 @@ import { exchangeParams } from './exchangeParams.js';
 import { parse } from 'path';
 import readline from 'readline';
 import https from 'https';
+import {
+  calculatePositionRisk,
+  PositionRiskResult,
+  ProtectiveStopTranche,
+} from '../trading/positionRisk.js';
 import { NotificationManager } from '../utils/notificationManager.js';
 import { NType } from '../utils/notificationManager.js';
 
@@ -385,6 +390,99 @@ export class ExchangeClient {
     }
 
     return undefined;
+  }
+
+  /**
+   * Which open orders actually protect the current position.
+   *
+   * Not every reducing order is a stop. A take profit could close the same
+   * quantity under favourable conditions, but it does nothing for the downside,
+   * so counting it would understate risk. The exchange distinguishes them by
+   * order type -- a trigger on the losing side is a Stop, one on the winning
+   * side is a MarketIfTouched -- which is more reliable than comparing the
+   * trigger to the entry, since a stop moved past breakeven is still a stop.
+   */
+  private toProtectiveStops(
+    orders: Order[],
+    market: string,
+    positionSide: 'long' | 'short'
+  ): ProtectiveStopTranche[] {
+    const closingSide = positionSide === 'long' ? 'sell' : 'buy';
+
+    return orders
+      .filter((order) => {
+        // Another instrument's stop protects another position.
+        if (order.symbol && order.symbol !== market) return false;
+
+        // Only orders that could close this position.
+        if (String(order.side ?? '').toLowerCase() !== closingSide) return false;
+
+        // Anything already finished no longer protects anything.
+        const status = String(order.status ?? 'open').toLowerCase();
+        if (['canceled', 'cancelled', 'rejected', 'expired', 'closed', 'filled'].includes(status)) {
+          return false;
+        }
+
+        const info = (order as any).info ?? {};
+        const trigger = Number((order as any).triggerPrice ?? info.stopPxRp ?? info.stopPxEp ?? 0);
+        if (!(trigger > 0)) return false;
+
+        const orderType = String(info.ordType ?? info.orderType ?? order.type ?? '').toLowerCase();
+
+        // Touch orders are take profits: they trigger on the winning side.
+        if (orderType.includes('iftouched')) return false;
+
+        return orderType.includes('stop') || orderType === 'trigger';
+      })
+      .map((order) => {
+        const info = (order as any).info ?? {};
+        const trigger = Number((order as any).triggerPrice ?? info.stopPxRp ?? info.stopPxEp ?? 0);
+        const requested = Number(order.remaining ?? order.amount ?? 0);
+        const execInst = String(info.execInst ?? '');
+
+        return {
+          orderId: String(order.id ?? ''),
+          triggerPrice: trigger,
+          requestedQuantity: requested,
+          // A quantity of zero on a trigger order means the whole position,
+          // which follows the position rather than the size at creation.
+          coversAll: !(requested > 0),
+          reduceOnly:
+            (order as any).reduceOnly === true || /closeontrigger|reduceonly/i.test(execInst),
+          orderGroup: info.orderGroup ?? info.clOrdIDGroup ?? undefined,
+        };
+      });
+  }
+
+  /**
+   * Planned downside for the current position, from its protective stops.
+   * Returns undefined when there is no position to speak of.
+   */
+  async getPositionRisk(market: string): Promise<PositionRiskResult | undefined> {
+    const position = await this.getPositionView(market);
+    if (!position || !(position.size > 0) || position.entry === undefined) {
+      return undefined;
+    }
+
+    const side = position.side.toLowerCase() === 'long' ? 'long' : 'short';
+    const marketInfo = this.availableMarkets?.[market];
+
+    let orders: Order[] = [];
+    try {
+      orders = await this.getLiveOpenOrders(market);
+    } catch {
+      orders = [];
+    }
+
+    return calculatePositionRisk({
+      side,
+      quantity: position.size,
+      entryPrice: position.entry,
+      currency: position.currency,
+      contractSize: Number((marketInfo as any)?.contractSize ?? 1),
+      inverse: Boolean((marketInfo as any)?.inverse),
+      stops: this.toProtectiveStops(orders, market, side),
+    });
   }
 
   /** Open orders for display. Uses the live view; completeness isn't critical. */
