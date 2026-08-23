@@ -288,7 +288,10 @@ const categoryColor = (category: string): Color | undefined => {
     case 'ORDER':
       return 'cyan';
     case 'MARKET':
-      return 'blue';
+      // Plain blue is ANSI 34, the dimmest colour in the palette and hard to
+      // read on a dark background. Bright blue stays in the same family, so it
+      // remains distinct from ORDER's cyan.
+      return 'brightBlue';
     case 'SYSTEM':
       return 'gray';
     default:
