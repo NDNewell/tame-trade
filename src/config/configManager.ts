@@ -25,6 +25,9 @@ export interface Profile {
   passwordHash: string;
   // Maximum size for a single order. Undefined means no limit is set.
   fatFinger?: number;
+  // Orders worth at least this much ask for confirmation before being sent.
+  // Undefined means no order is ever held for confirmation.
+  confirmAbove?: number;
 }
 
 export class ConfigManager {
@@ -91,10 +94,45 @@ export class ConfigManager {
     await this.updateProfile(profile);
   }
 
+  async getConfirmAbove(): Promise<number | undefined> {
+    if (!(await this.hasProfile())) return undefined;
+
+    const profile = await this.getProfile();
+    const threshold = profile.confirmAbove;
+
+    return typeof threshold === 'number' &&
+      Number.isFinite(threshold) &&
+      threshold > 0
+      ? threshold
+      : undefined;
+  }
+
+  async setConfirmAbove(threshold: number | undefined): Promise<void> {
+    const profile = await this.getProfile();
+
+    if (threshold === undefined) {
+      delete profile.confirmAbove;
+    } else {
+      profile.confirmAbove = threshold;
+    }
+
+    await this.updateProfile(profile);
+  }
+
   async addExchange(
     exchange: string,
     authType: ExchangeAuthType,
-    credentials: { key?: string; secret?: string; privateKey?: string; walletAddress?: string }
+    credentials: {
+      key?: string;
+      secret?: string;
+      privateKey?: string;
+      walletAddress?: string;
+      // Hyperliquid queries positions by a public address separate from the
+      // signing wallet. It was already being passed and stored via the spread,
+      // but was absent from this type, so a typo in the caller would have gone
+      // unnoticed and silently saved nothing.
+      publicAddress?: string;
+    }
   ): Promise<void> {
     const exchangeProfile: ExchangeProfile = {
       exchange,

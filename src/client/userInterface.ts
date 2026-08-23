@@ -1,7 +1,6 @@
 // src/client/userInterface.ts
 
 import inquirer from 'inquirer';
-import InquirerExpanded from '../../plugins/inquirer-expanded.js';
 
 import autocomplete from 'inquirer-autocomplete-prompt';
 import clear from 'console-clear';
@@ -10,6 +9,10 @@ import { ExchangeProfile } from '../config/configManager.js';
 import { ExchangeCommand, OrderType } from '../commands/exchangeCommand.js';
 import { StateManager } from '../config/stateManager.js';
 import { NotificationManager, NType } from '../utils/notificationManager.js';
+import { describeExchangeError } from '../utils/exchangeErrors.js';
+import { Workspace } from '../ui/workspace.js';
+import { ActivityLog } from '../ui/activityLog.js';
+import { releaseInstanceLock } from '../config/instanceLock.js';
 
 export class UserInterface {
   private currentMarket: string;
@@ -20,6 +23,7 @@ export class UserInterface {
   private entryPrice: number | null = null;
   private stateManager: StateManager;
   private isDevMode: boolean;
+  private workspace: Workspace | null = null;
 
   constructor() {
     this.exchangeCommand = new ExchangeCommand();
@@ -29,7 +33,6 @@ export class UserInterface {
     this.stateManager = StateManager.getInstance();
     this.isDevMode = process.env.NODE_ENV === 'development';
     inquirer.registerPrompt('autocomplete', autocomplete);
-    inquirer.registerPrompt('inquirer-expanded', InquirerExpanded as any);
   }
 
   // Save current application state for dev mode
@@ -208,36 +211,21 @@ export class UserInterface {
       }
     }
 
-    this.promptForCommand();
-  }
-
-  private async promptForCommand() {
-    const exchangeClient = this.exchangeCommand.getExchangeClient();
-    const exchangeName = exchangeClient.getSelectedExchangeName();
-    const tameDisplay = `[${fo('Tame', 'yellow')}]`;
-    // remove market string after ':' if it exists
-    const currentMarket = this.currentMarket
-      ? this.currentMarket.split(':')[0]
-      : '';
-    const marketDisplay = `[${fo(`${currentMarket}`, 'green')}]`;
-    const exchangeDisplay = exchangeName
-      ? `[${fo(exchangeName, 'orange')}]`
-      : '';
-
-    const promptMessage = this.currentMarket
-      ? `${marketDisplay} `
-      : `${tameDisplay}${exchangeDisplay} `;
-
-    const { command } = await inquirer.prompt<{ command: string }>([
-      {
-        type: 'inquirer-expanded' as any, // Update the type to use the new plugin and bypass type checking
-        name: 'command',
-        message: promptMessage,
-        prefix: '',
+    // The workspace owns the terminal from here: one repainted view rather than
+    // a scrolling console, with the command line docked.
+    this.workspace = new Workspace(
+      this.exchangeCommand.getExchangeClient(),
+      async (command: string) => {
+        await this.handleCommand(command.trim());
       },
-    ]);
+      () => this.quit()
+    );
 
-    this.handleCommand(command.trim());
+    if (this.currentMarket) {
+      this.workspace.start(this.currentMarket);
+    } else {
+      this.workspace.start('');
+    }
   }
 
   private async formatPriceToMarketPrecision(price: number, market: string): Promise<number> {
@@ -338,7 +326,6 @@ export class UserInterface {
         console.log(precision);
       }
 
-      this.promptForCommand();
       return;
     }
 
@@ -351,7 +338,6 @@ export class UserInterface {
 
       if (this.lastPositionSize === 0) {
         console.log('Error: Cannot execute an order with a position size of zero.');
-        this.promptForCommand();
         return;
       }
 
@@ -366,7 +352,6 @@ export class UserInterface {
 
       if (this.entryPrice === null) {
         console.log('Error: Cannot execute an order with an entry price of null.');
-        this.promptForCommand();
         return;
       }
 
@@ -374,7 +359,6 @@ export class UserInterface {
 
       if (this.entryPrice === 0) {
         console.log('Error: Cannot execute an order with an entry price of zero.');
-        this.promptForCommand();
         return;
       }
 
@@ -391,7 +375,8 @@ export class UserInterface {
       if (this.availableMarkets.includes(market)) {
         this.currentMarket = market;
         this.exchangeCommand.getExchangeClient().followMarket(market);
-        console.log(`Switched to market: ${market}`);
+        this.workspace?.setMarket(market);
+        ActivityLog.getInstance().add('MARKET', `${market.split(':')[0]} selected`);
 
         // Save state for dev mode
         await this.saveDevState();
@@ -491,10 +476,11 @@ export class UserInterface {
         console.log('No market selected. Please select a market first.');
       }
     } else if (command.startsWith('bump')) {
-      const bumpRegex = /^bump\s+([-+]?\d*\.?\d+)/;
+      // Accepts 'bump +10', 'bump + 10', 'bump -10', 'bump - 10' and 'bump 10'.
+      const bumpRegex = /^bump\s+([-+])?\s*(\d*\.?\d+)/;
       const match = command.match(bumpRegex);
       if (match) {
-        const priceChange = parseFloat(match[1]);
+        const priceChange = parseFloat(`${match[1] ?? ''}${match[2]}`);
         if (this.currentMarket) {
           try {
             await this.exchangeCommand
@@ -737,14 +723,48 @@ export class UserInterface {
         const newStopPrice = parseFloat(parts[2]);
         if (!isNaN(newStopPrice)) {
           try {
-              const currentStopOrderId = await this.exchangeCommand.getExchangeClient().editCurrentStopOrder(this.currentMarket, newStopPrice);
+              const currentStopOrderId = await this.exchangeCommand
+                .getExchangeClient()
+                .editCurrentStopOrder(this.currentMarket, newStopPrice);
+
+              // 'processed' was reported whether or not anything moved, so a
+              // failed move read as a successful one.
               if (currentStopOrderId) {
-                  console.log(`Stop order moved to ${newStopPrice}.`);
+                const client = this.exchangeCommand.getExchangeClient();
+                const position = await client
+                  .getPositionView(this.currentMarket)
+                  .catch(() => null);
+
+                // The protective side is the one that closes the position.
+                const side =
+                  position?.side === 'LONG'
+                    ? 'SELL'
+                    : position?.side === 'SHORT'
+                    ? 'BUY'
+                    : undefined;
+
+                NotificationManager.notify('', NType.SUCCESS, 'ORDER', undefined, {
+                  side,
+                  quantity: 'ALL',
+                  price: client.formatPriceForDisplay(this.currentMarket, newStopPrice),
+                  status: 'STOP UPDATED',
+                });
               } else {
-                  console.log(`Stop order update processed for ${this.currentMarket}.`);
+                NotificationManager.notify(
+                  'No stop order found to move',
+                  NType.ERROR,
+                  'ERROR',
+                  undefined,
+                  { side: 'STOP', status: 'REJECTED' }
+                );
               }
           } catch (error) {
-              console.error(`Error processing 'move stop' command:`, error);
+              const failure = describeExchangeError(error);
+              console.error(`[userInterface/move stop] ${failure.raw}`);
+              NotificationManager.notify(failure.summary, NType.ERROR, 'ERROR', undefined, {
+                side: 'STOP',
+                status: 'REJECTED',
+              });
           }
         } else {
           console.log('Invalid price format.');
@@ -757,13 +777,11 @@ export class UserInterface {
       let amount: number | undefined;
       if (parts.length > 3 || parts.length < 2) {
           console.log('Usage: update stop <amount>');
-          this.promptForCommand();
           return;
       }
 
       if (parts[1] !== 'stop') {
           console.log('Invalid command. Only stop order can be updated.');
-          this.promptForCommand();
           return;
       }
 
@@ -771,7 +789,6 @@ export class UserInterface {
           amount = parseFloat(parts[2]);
           if (isNaN(amount)) {
               console.log('Invalid amount. Amount should be a number.');
-              this.promptForCommand();
               return;
           }
       }
@@ -828,7 +845,6 @@ export class UserInterface {
       this.quit();
     }
 
-    this.promptForCommand();
   }
 
   private async selectMarketType(): Promise<string | undefined> {
@@ -910,6 +926,8 @@ export class UserInterface {
   }
 
   quit() {
+    releaseInstanceLock();
+    this.workspace?.stop();
     console.log('Exiting...');
     // Give time for readline to clean up
     setTimeout(() => {

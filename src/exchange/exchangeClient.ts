@@ -10,6 +10,12 @@ import { exchangeParams } from './exchangeParams.js';
 import { parse } from 'path';
 import readline from 'readline';
 import https from 'https';
+import {
+  calculatePositionRisk,
+  PositionRiskResult,
+  ProtectiveStopTranche,
+} from '../trading/positionRisk.js';
+import { describeExchangeError, isMissingOrderError } from '../utils/exchangeErrors.js';
 import { NotificationManager } from '../utils/notificationManager.js';
 import { NType } from '../utils/notificationManager.js';
 
@@ -40,6 +46,7 @@ export class ExchangeClient {
   private eventEmitter: EventEmitter;
   private chaseLimitOrderActive: boolean = false;
   private fatFingerLimit: number | undefined = undefined;
+  private confirmThreshold: number | undefined = undefined;
   // The order the chase is currently working. It changes whenever a move is
   // done as cancel/replace, so 'cancel chase' has to read it from here rather
   // than remember the id the chase started with — otherwise it cancels an order
@@ -49,6 +56,21 @@ export class ExchangeClient {
     string,
     { price: number | undefined; at: number; running: boolean }
   >();
+  /**
+   * Mark, index and funding come from one call, cached: funding moves every few
+   * hours and index barely differs second to second, so refetching them on every
+   * two-second repaint would spend the rate limit on values that haven't changed.
+   */
+  private fundingCache = new Map<
+    string,
+    { at: number; mark?: number; index?: number; funding?: number }
+  >();
+  /** Looked up once per session; it does not change while connected. */
+  private accountLabel: string | undefined;
+  private equityCache: { at: number; currency: string; equity?: number } | undefined;
+  private accountLookupDone = false;
+  /** The market being followed, so account lookups know which wallet to ask for. */
+  private lastFollowedMarket: string | undefined;
   private orderStreams = new Map<
     string,
     {
@@ -91,9 +113,7 @@ export class ExchangeClient {
   }
 
   logAndReplace(msg: string) {
-    readline.clearLine(process.stdout, 0);
-    readline.cursorTo(process.stdout, 0);
-    console.log(msg);
+    NotificationManager.notify(msg, NType.INFO, 'ORDER');
   }
 
   async watchOrderBook(symbol: string): Promise<void> {
@@ -208,6 +228,7 @@ export class ExchangeClient {
     await this.loadMarkets();
     await this.loadExchanges();
     await this.loadFatFingerLimit();
+    await this.loadConfirmThreshold();
     this.setEventListeners();
 
     // Call the time synchronization method here
@@ -311,6 +332,435 @@ export class ExchangeClient {
 
   getFatFingerLimit(): number | undefined {
     return this.fatFingerLimit;
+  }
+
+  /**
+   * Position values ready for display, with unrealized PnL computed here rather
+   * than read from the exchange payload. getPositionStructure has several
+   * fallback paths that return differently shaped objects, so the field is not
+   * dependable; entry, mark and size are, and the arithmetic is not in doubt.
+   */
+  async getPositionView(market: string): Promise<{
+    side: string;
+    size: number;
+    entry?: number;
+    unrealizedPnl?: number;
+    realizedPnl?: number;
+    leverage?: number;
+    effectiveLeverage?: number;
+    liquidation?: number;
+    currency: string;
+  } | null> {
+    const position = await this.getPositionStructure(market);
+    const contracts = Math.abs(Number(position?.contracts ?? 0));
+    if (!position || contracts === 0) return null;
+
+    const info = position as any;
+    const marketInfo = this.availableMarkets?.[market];
+    const contractSize = Number(marketInfo?.contractSize ?? 1);
+    const currency = String(marketInfo?.settle ?? marketInfo?.quote ?? '');
+
+    const entry = Number(position.entryPrice ?? info.entryPrice ?? NaN);
+    const mark = await this.getReferencePrice(market);
+    const isLong = String(position.side ?? '').toLowerCase() === 'long';
+
+    let unrealizedPnl: number | undefined;
+    if (Number.isFinite(entry) && mark !== undefined && entry > 0) {
+      const direction = isLong ? 1 : -1;
+      unrealizedPnl = marketInfo?.inverse
+        ? contracts * contractSize * (1 / entry - 1 / mark) * direction
+        : contracts * contractSize * (mark - entry) * direction;
+    }
+
+    return {
+      side: String(position.side ?? '').toUpperCase(),
+      size: contracts,
+      entry: Number.isFinite(entry) ? entry : undefined,
+      unrealizedPnl,
+      realizedPnl: this.readRealizedPnl(info),
+      leverage: Number(info.leverage) || undefined,
+      effectiveLeverage: await this.getEffectiveLeverage(
+        market,
+        Math.abs(Number(position.notional ?? info.valueRv ?? NaN)),
+        currency
+      ),
+      liquidation: Number(info.liquidationPrice) || undefined,
+      currency,
+    };
+  }
+
+  /**
+   * Effective leverage: what the position is actually levered at right now, as
+   * opposed to the leverage the account is configured for.
+   *
+   * Phemex reports only the configured figure, so this is derived: the
+   * position's notional over the wallet balance.
+   *
+   * Unrealized PnL is deliberately excluded from the denominator. Including it
+   * put the figure a few percent under what Phemex displays -- with a position
+   * showing +193 against a 3,737 balance, this read 23.82x where the exchange
+   * said 25.05x, a gap that is exactly the size of the unrealized amount. The
+   * exchange divides by wallet balance, so this does too: a figure that
+   * disagrees with the one on the exchange screen is worse than no figure.
+   *
+   * Undefined when the balance can't be established.
+   */
+  private async getEffectiveLeverage(
+    market: string,
+    notional: number | undefined,
+    currency: string
+  ): Promise<number | undefined> {
+    if (notional === undefined || !(notional > 0)) return undefined;
+
+    const balance = await this.getAccountBalance(currency);
+    if (balance === undefined || !(balance > 0)) return undefined;
+
+    return notional / balance;
+  }
+
+  /**
+   * Realized PnL for the current position, read from the raw payload.
+   *
+   * ccxt's parsed position has no realizedPnl for Phemex -- it only computes
+   * unrealizedPnl -- so taking profit on part of a position showed nothing. The
+   * exchange reports it under curTermRealisedPnl, which is the realized amount
+   * for the position as currently held rather than for all time.
+   *
+   * USDT-settled markets report real values ('Rv'); inverse markets report them
+   * scaled ('Ev'), by the exchange's fixed 1e8 factor.
+   */
+  private readRealizedPnl(position: Record<string, any>): number | undefined {
+    // The realized figure lives in the raw exchange payload, not on the parsed
+    // position -- unlike leverage and liquidation price, which ccxt lifts to the
+    // top level. Both shapes are accepted because getPositionStructure has
+    // several fallback paths that return differently shaped objects.
+    const info = position?.info ?? position;
+    const real = info?.curTermRealisedPnlRv ?? info?.cumClosedPnlRv;
+    if (real !== undefined && real !== null && Number.isFinite(Number(real))) {
+      return Number(real);
+    }
+
+    const scaled = info?.curTermRealisedPnlEv ?? info?.cumClosedPnlEv;
+    if (scaled !== undefined && scaled !== null && Number.isFinite(Number(scaled))) {
+      return Number(scaled) / 1e8;
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Which open orders actually protect the current position.
+   *
+   * Not every reducing order is a stop. A take profit could close the same
+   * quantity under favourable conditions, but it does nothing for the downside,
+   * so counting it would understate risk. The exchange distinguishes them by
+   * order type -- a trigger on the losing side is a Stop, one on the winning
+   * side is a MarketIfTouched -- which is more reliable than comparing the
+   * trigger to the entry, since a stop moved past breakeven is still a stop.
+   */
+  private toProtectiveStops(
+    orders: Order[],
+    market: string,
+    positionSide: 'long' | 'short'
+  ): ProtectiveStopTranche[] {
+    const closingSide = positionSide === 'long' ? 'sell' : 'buy';
+
+    return orders
+      .filter((order) => {
+        // Another instrument's stop protects another position.
+        if (order.symbol && order.symbol !== market) return false;
+
+        // Only orders that could close this position.
+        if (String(order.side ?? '').toLowerCase() !== closingSide) return false;
+
+        // Anything already finished no longer protects anything.
+        const status = String(order.status ?? 'open').toLowerCase();
+        if (['canceled', 'cancelled', 'rejected', 'expired', 'closed', 'filled'].includes(status)) {
+          return false;
+        }
+
+        const info = (order as any).info ?? {};
+        const trigger = Number((order as any).triggerPrice ?? info.stopPxRp ?? info.stopPxEp ?? 0);
+        if (!(trigger > 0)) return false;
+
+        const orderType = String(info.ordType ?? info.orderType ?? order.type ?? '').toLowerCase();
+
+        // Touch orders are take profits: they trigger on the winning side.
+        if (orderType.includes('iftouched')) return false;
+
+        return orderType.includes('stop') || orderType === 'trigger';
+      })
+      .map((order) => {
+        const info = (order as any).info ?? {};
+        const trigger = Number((order as any).triggerPrice ?? info.stopPxRp ?? info.stopPxEp ?? 0);
+        const requested = Number(order.remaining ?? order.amount ?? 0);
+        const execInst = String(info.execInst ?? '');
+
+        return {
+          orderId: String(order.id ?? ''),
+          triggerPrice: trigger,
+          requestedQuantity: requested,
+          // A quantity of zero on a trigger order means the whole position,
+          // which follows the position rather than the size at creation.
+          coversAll: !(requested > 0),
+          reduceOnly:
+            (order as any).reduceOnly === true || /closeontrigger|reduceonly/i.test(execInst),
+          orderGroup: info.orderGroup ?? info.clOrdIDGroup ?? undefined,
+        };
+      });
+  }
+
+  /**
+   * Planned downside for the current position, from its protective stops.
+   * Returns undefined when there is no position to speak of.
+   */
+  async getPositionRisk(market: string): Promise<PositionRiskResult | undefined> {
+    const position = await this.getPositionView(market);
+    if (!position || !(position.size > 0) || position.entry === undefined) {
+      return undefined;
+    }
+
+    const side = position.side.toLowerCase() === 'long' ? 'long' : 'short';
+    const marketInfo = this.availableMarkets?.[market];
+
+    let orders: Order[] = [];
+    try {
+      orders = await this.getLiveOpenOrders(market);
+    } catch {
+      orders = [];
+    }
+
+    return calculatePositionRisk({
+      side,
+      quantity: position.size,
+      entryPrice: position.entry,
+      currency: position.currency,
+      contractSize: Number((marketInfo as any)?.contractSize ?? 1),
+      inverse: Boolean((marketInfo as any)?.inverse),
+      stops: this.toProtectiveStops(orders, market, side),
+    });
+  }
+
+  /** Open orders for display. Uses the live view; completeness isn't critical. */
+  async getOpenOrdersForDisplay(market: string): Promise<Order[]> {
+    try {
+      return await this.getLiveOpenOrders(market);
+    } catch {
+      return [];
+    }
+  }
+
+  private static readonly FUNDING_CACHE_MS = 15000;
+
+  /** Mark price, index price and funding rate, refreshed at a sensible interval. */
+  private async getFundingSnapshot(market: string) {
+    const cached = this.fundingCache.get(market);
+    if (cached && Date.now() - cached.at <= ExchangeClient.FUNDING_CACHE_MS) {
+      return cached;
+    }
+
+    const snapshot: { at: number; mark?: number; index?: number; funding?: number } = {
+      at: Date.now(),
+    };
+
+    try {
+      const rate = await this.exchange!.fetchFundingRate(market);
+      snapshot.mark = Number(rate.markPrice) || undefined;
+      snapshot.index = Number(rate.indexPrice) || undefined;
+      snapshot.funding =
+        rate.fundingRate === undefined || rate.fundingRate === null
+          ? undefined
+          : Number(rate.fundingRate);
+    } catch {
+      // Not every instrument has a funding rate; leave the fields unset rather
+      // than inventing them.
+    }
+
+    this.fundingCache.set(market, snapshot);
+    return snapshot;
+  }
+
+  /** Seconds between funding payments, as the instrument reports them. */
+  private fundingIntervalSeconds(market: string): number | undefined {
+    const seconds = Number(
+      (this.availableMarkets?.[market]?.info as any)?.fundingInterval
+    );
+    return Number.isFinite(seconds) && seconds > 0 ? seconds : undefined;
+  }
+
+  private formatFunding(market: string, rate: number): string {
+    const perInterval = `${(rate * 100).toFixed(4)}%`;
+    const interval = this.fundingIntervalSeconds(market);
+
+    // Without a known interval there is no honest way to annualise it.
+    if (interval === undefined) return perInterval;
+
+    const periodsPerYear = 31536000 / interval;
+    const apr = rate * periodsPerYear * 100;
+
+    return `${perInterval} (${apr.toFixed(2)}% APR)`;
+  }
+
+  /**
+   * The account the keys belong to, for the header. Read once: it can't change
+   * while connected, and it costs an authenticated call.
+   */
+  async getAccountLabel(): Promise<string | undefined> {
+    if (this.accountLookupDone) return this.accountLabel;
+    this.accountLookupDone = true;
+
+    try {
+      const balance: any = await this.fetchAccountSnapshot(
+        this.availableMarkets?.[this.lastFollowedMarket ?? '']?.settle
+      );
+      const info = balance?.info?.data ?? balance?.info ?? {};
+      const account = info.account ?? info;
+
+      const id =
+        account.accountId ??
+        account.accountID ??
+        info.accountId ??
+        info.accountID ??
+        account.userID ??
+        account.userId ??
+        info.userID ??
+        info.userId;
+
+      this.accountLabel = id === undefined || id === null ? undefined : String(id);
+    } catch {
+      this.accountLabel = undefined;
+    }
+
+    return this.accountLabel;
+  }
+
+  private static readonly EQUITY_CACHE_MS = 10000;
+
+  /**
+   * Balance for a settlement currency.
+   *
+   * The client is configured with defaultType 'future', which ccxt rejects for
+   * this call -- it accepts only 'spot' and 'swap' -- so every balance lookup
+   * was throwing before it reached the exchange. The type and settlement
+   * currency are named explicitly here rather than inherited.
+   */
+  private async fetchAccountSnapshot(currency?: string): Promise<any> {
+    const settle = currency ?? 'USDT';
+    return this.exchange!.fetchBalance({ type: 'swap', code: settle });
+  }
+
+  /**
+   * Account balance in a settlement currency, cached briefly.
+   *
+   * Effective leverage needs account equity, and the balance call is
+   * authenticated, so it is not made on every repaint.
+   */
+  private async getAccountBalance(currency: string): Promise<number | undefined> {
+    const cached = this.equityCache;
+    if (
+      cached &&
+      cached.currency === currency &&
+      Date.now() - cached.at <= ExchangeClient.EQUITY_CACHE_MS
+    ) {
+      return cached.equity;
+    }
+
+    let equity: number | undefined;
+    try {
+      const balance: any = await this.fetchAccountSnapshot(currency);
+      const total = balance?.total?.[currency];
+      equity = Number.isFinite(Number(total)) ? Number(total) : undefined;
+    } catch {
+      equity = undefined;
+    }
+
+    this.equityCache = { at: Date.now(), currency, equity };
+    return equity;
+  }
+
+  /** The market values the workspace shows, taken from the feeds where possible. */
+  async getDisplayPrice(market: string): Promise<{
+    last?: number;
+    bid?: number;
+    ask?: number;
+    mark?: number;
+    index?: number;
+    spread?: string;
+    funding?: string;
+    change?: string;
+  }> {
+    const last = await this.getReferencePrice(market);
+    let bid: number | undefined;
+    let ask: number | undefined;
+
+    try {
+      const book = await this.exchange!.fetchL2OrderBook(market, 1);
+      bid = book.bids?.[0]?.[0];
+      ask = book.asks?.[0]?.[0];
+    } catch {
+      // Book unavailable this tick; the rest of the view is still worth showing.
+    }
+
+    const spread =
+      bid !== undefined && ask !== undefined ? (ask - bid).toFixed(4).replace(/0+$/, '').replace(/\.$/, '') : undefined;
+
+    const funding = await this.getFundingSnapshot(market);
+
+    return {
+      last,
+      bid,
+      ask,
+      mark: funding.mark,
+      index: funding.index,
+      spread,
+      // Quoted as a percentage, with the annualised equivalent alongside: the
+      // per-interval figure is small enough to look negligible, and the yearly
+      // one is what tells you whether holding the position actually costs
+      // anything. The interval comes from the instrument rather than assuming
+      // the usual eight hours.
+      funding:
+        funding.funding === undefined
+          ? undefined
+          : this.formatFunding(market, funding.funding),
+    };
+  }
+
+  getConfirmThreshold(): number | undefined {
+    return this.confirmThreshold;
+  }
+
+  async setConfirmThreshold(threshold: number | undefined): Promise<void> {
+    await this.exchangeManager.setConfirmAbove(threshold);
+    this.confirmThreshold = threshold;
+  }
+
+  async loadConfirmThreshold(): Promise<void> {
+    try {
+      this.confirmThreshold = await this.exchangeManager.getConfirmAbove();
+    } catch {
+      this.confirmThreshold = undefined;
+    }
+  }
+
+  /**
+   * What an order is worth, for showing before it is sent and for deciding
+   * whether it needs confirming. Confirmation is threshold-based rather than
+   * universal: a prompt on every order would make a tool built for speed
+   * unusable, and would train the reflex of confirming without reading.
+   */
+  async describeOrder(
+    market: string,
+    quantity: number,
+    price?: number
+  ): Promise<{ notional: number; currency: string; needsConfirmation: boolean }> {
+    const { notional, currency } = await this.calculateNotional(market, quantity, price);
+
+    return {
+      notional,
+      currency,
+      needsConfirmation:
+        this.confirmThreshold !== undefined && notional >= this.confirmThreshold,
+    };
   }
 
   async setFatFingerLimit(limit: number | undefined): Promise<void> {
@@ -471,42 +921,138 @@ export class ExchangeClient {
     const status = String(update.status ?? '');
     const side = String(update.side ?? 'order');
     const symbol = market.split(':')[0];
+    const eventTime = this.orderEventTime(update);
     const filled = Number(update.filled ?? 0);
     const previouslyFilled = state.filledSoFar.get(id) ?? 0;
-    const price = update.average ?? update.price;
+    const rawPrice = update.average ?? update.price;
+    const price =
+      rawPrice !== undefined ? this.formatPriceForDisplay(market, Number(rawPrice)) : undefined;
     const at = price !== undefined ? ` @${price}` : '';
 
+    // Structured rather than prose: the row is columns the eye can run down,
+    // and the market isn't repeated because it is already in the header.
     if (filled > previouslyFilled) {
       state.filledSoFar.set(id, filled);
 
-      const total = Number(update.amount ?? 0);
       const complete =
         status === 'closed' ||
         (update.remaining !== undefined && Number(update.remaining) === 0);
 
-      NotificationManager.notify(
-        complete
-          ? `${this.capitalise(side)} filled ${filled}${at} — ${symbol}`
-          : `${this.capitalise(side)} partially filled ${filled}${
-              total ? ` of ${total}` : ''
-            }${at} — ${symbol}`,
-        NType.SUCCESS
-      );
+      NotificationManager.notify('', NType.SUCCESS, 'FILL', eventTime, {
+        side: side.toUpperCase(),
+        quantity: this.formatQuantity(filled),
+        price: price,
+        status: complete ? 'FILLED' : 'PARTIAL',
+      });
     }
 
     if (status === 'canceled' && filled === 0) {
-      NotificationManager.notify(
-        `${this.capitalise(side)} order canceled — ${symbol}`,
-        NType.INFO
-      );
+      NotificationManager.notify('', NType.INFO, 'ORDER', eventTime, {
+        side: side.toUpperCase(),
+        quantity: this.formatQuantity(Number(update.amount ?? 0)),
+        price: price,
+        status: 'CANCELLED',
+      });
     }
 
     if (status === 'rejected') {
       NotificationManager.notify(
-        `${this.capitalise(side)} order REJECTED by the exchange — ${symbol}. Nothing is resting.`,
-        NType.ERROR
+        'nothing is resting',
+        NType.ERROR,
+        'ERROR',
+        eventTime,
+        {
+          side: side.toUpperCase(),
+          quantity: this.formatQuantity(Number(update.amount ?? 0)),
+          price: price,
+          status: 'REJECTED',
+        }
       );
     }
+  }
+
+  /** The instrument's base asset, for labelling quantities. */
+  getBaseAsset(market: string): string | undefined {
+    const info = this.availableMarkets?.[market];
+    const base = info?.base ?? market.split('/')[0];
+    return base ? String(base) : undefined;
+  }
+
+  /**
+   * How many decimals the instrument's prices are quoted to.
+   *
+   * ccxt reports precision either as a tick size (0.01, 0.5) or as a count of
+   * decimal places, depending on the exchange, so both are handled.
+   */
+  private priceDecimals(market: string): number | undefined {
+    const tick = this.availableMarkets?.[market]?.precision?.price;
+    if (tick === undefined || tick === null) return undefined;
+
+    const value = Number(tick);
+    if (!Number.isFinite(value) || value <= 0) return undefined;
+
+    // A tick-size mode exchange reports the smallest price step.
+    if ((this.exchange as any)?.precisionMode === 4 || value < 1) {
+      const decimals = String(value).split('.')[1]?.length ?? 0;
+      return decimals;
+    }
+
+    return Math.round(value);
+  }
+
+  /**
+   * A price at the instrument's own precision, for display.
+   *
+   * priceToPrecision rounds to the tick but does not pad, so a column would
+   * otherwise mix 95.1 with 94.59. Padding to the instrument's decimals keeps
+   * quoted prices reading as one set of numbers. Display only -- no stored or
+   * calculated value is changed.
+   */
+  formatPriceForDisplay(market: string, price: number): string {
+    if (!Number.isFinite(price)) return String(price);
+
+    let rounded = price;
+    try {
+      rounded = Number(this.exchange!.priceToPrecision(market, price));
+    } catch {
+      rounded = Math.round(price * 10000) / 10000;
+    }
+
+    const decimals = this.priceDecimals(market);
+    return decimals === undefined ? String(rounded) : rounded.toFixed(decimals);
+  }
+
+  /**
+   * When an order event happened, rather than when it reached us. The feed
+   * replays recent orders on connect, so without this a backlog of old fills all
+   * appear stamped with the moment of login.
+   */
+  private orderEventTime(update: Order): number | undefined {
+    const candidates = [
+      (update as any).lastUpdateTimestamp,
+      update.timestamp,
+      // Phemex reports nanoseconds in the raw payload.
+      (update as any).info?.transactTimeNs
+        ? Number((update as any).info.transactTimeNs) / 1e6
+        : undefined,
+      (update as any).info?.actionTimeNs
+        ? Number((update as any).info.actionTimeNs) / 1e6
+        : undefined,
+    ];
+
+    for (const value of candidates) {
+      const numeric = Number(value);
+      // Guard against a zero or nonsense timestamp being taken as 1970.
+      if (Number.isFinite(numeric) && numeric > 1_000_000_000_000) return numeric;
+    }
+
+    return undefined;
+  }
+
+  /** Quantities without trailing precision the value doesn't carry. */
+  private formatQuantity(value: number): string {
+    if (!Number.isFinite(value) || value <= 0) return 'ALL';
+    return String(Number(value.toFixed(8)));
   }
 
   private capitalise(value: string): string {
@@ -517,6 +1063,7 @@ export class ExchangeClient {
   // changes, so fills and rejections are reported for whatever is being traded
   // without any command having to ask for them.
   public followMarket(market: string, params?: Record<string, any>): void {
+    this.lastFollowedMarket = market;
     this.stopTickerStream();
     this.stopOrderStream();
     this.startTickerStream(market);
@@ -620,7 +1167,13 @@ export class ExchangeClient {
     quantity: number,
     price?: number
   ): Promise<{ notional: number; currency: string }> {
-    const marketInfo = this.availableMarkets![market];
+    const marketInfo = this.availableMarkets?.[market];
+    if (!marketInfo) {
+      throw new Error(
+        `Cannot value an order for ${market}: the market is not loaded. No order was placed.`
+      );
+    }
+
     const contractSize = (marketInfo as any).contractSize ?? 1;
     const currency = String(marketInfo.quote ?? '');
 
@@ -771,10 +1324,12 @@ export class ExchangeClient {
             ? ` @${order.price}`
             : '';
 
-        console.log(
-          `${side}order accepted${amount ? ` for ${amount}` : ''}${at}` +
-            `${order?.id ? ` (id ${order.id})` : ''}`
-        );
+        NotificationManager.notify('', NType.INFO, 'ORDER', undefined, {
+          side: order?.side ? String(order.side).toUpperCase() : undefined,
+          quantity: this.formatQuantity(Number(order?.amount)),
+          price: trigger !== undefined ? String(trigger) : order?.price ? String(order.price) : undefined,
+          status: trigger !== undefined ? 'STOP' : 'ACCEPTED',
+        });
       } catch {
         console.log(`Order accepted${order?.id ? ` (id ${order.id})` : ''}`);
       }
@@ -1226,6 +1781,12 @@ export class ExchangeClient {
     // ourselves are remembered so a late event about one is never mistaken for
     // the trader cancelling.
     const retiredOrderIds = new Set<string>();
+    // A chase driven by the book retries on every tick, so without a budget a
+    // move that always fails retries forever -- and a chase that will not stop
+    // cannot be stopped from anywhere else either, since the order id it is
+    // working lives only in this process.
+    const maxConsecutiveErrors = 5;
+    let consecutiveErrors = 0;
 
     this.currentChaseOrderId = orderId;
 
@@ -1234,7 +1795,9 @@ export class ExchangeClient {
       finished = true;
       this.chaseLimitOrderActive = false;
       this.currentChaseOrderId = undefined;
-      this.logAndReplace(message);
+      // An empty message ends the chase without a row: the event that ended it
+      // has already been reported in its own right.
+      if (message) this.logAndReplace(message);
     };
 
     const moveTo = async (targetPrice: number) => {
@@ -1284,10 +1847,35 @@ export class ExchangeClient {
 
         orderPrice = targetPrice;
         this.currentChaseOrderId = orderId;
+        consecutiveErrors = 0;
       } catch (error) {
+        // The order being chased is gone. Rather than retry an id that will
+        // never resolve, find out what actually became of it and say so --
+        // leaving a chase quiet about an unfilled remainder is how a position
+        // ends up smaller than intended without anyone noticing.
+        if (isMissingOrderError(error)) {
+          await this.reportChaseOutcome(market, orderId, side, amount, finish);
+          return;
+        }
+
+        const failure = describeExchangeError(error);
+        // The raw payload is kept as a diagnostic rather than printed across
+        // the activity row.
+        console.error(`[ExchangeClient/chase] ${failure.raw}`);
+
+        consecutiveErrors++;
         this.logAndReplace(
-          `Chase: could not move the order to ${targetPrice} (${(error as Error).message})`
+          `Chase: could not move the order (${failure.summary}) ` +
+            `[${consecutiveErrors}/${maxConsecutiveErrors}]`
         );
+
+        if (consecutiveErrors >= maxConsecutiveErrors) {
+          finish(
+            `Chase stopped after ${maxConsecutiveErrors} failed moves. ` +
+              `Any resting order is still live — check the exchange.`
+          );
+          return;
+        }
       } finally {
         moveInFlight = false;
       }
@@ -1301,7 +1889,9 @@ export class ExchangeClient {
         const levels = side === 'buy' ? book.bids : book.asks;
         if (!levels || levels.length === 0) continue;
 
-        const best = levels[0][0];
+        const best = Number(levels[0]?.[0]);
+        if (!Number.isFinite(best) || best <= 0) continue;
+
         const improves = side === 'buy' ? best > orderPrice : best < orderPrice;
 
         if (improves && Math.abs(best - orderPrice) >= tickSize) {
@@ -1331,9 +1921,21 @@ export class ExchangeClient {
           const status = String(update.status ?? '');
 
           if (status === 'closed') {
-            finish(
-              `Chase ${side} order filled for ${update.filled ?? amount} ${market}`
-            );
+            const filled = Number(update.filled ?? amount);
+            const fillPrice = update.average ?? update.price;
+
+            NotificationManager.notify('', NType.SUCCESS, 'FILL', undefined, {
+              side: side.toUpperCase(),
+              quantity: this.formatQuantity(filled),
+              // No price is invented when the fill data hasn't arrived.
+              price:
+                fillPrice === undefined
+                  ? undefined
+                  : this.formatPriceForDisplay(market, Number(fillPrice)),
+              status: 'FILLED',
+            });
+
+            finish('');
             return;
           }
 
@@ -1696,6 +2298,53 @@ export class ExchangeClient {
     return orderId;
   }
 
+  /**
+   * What became of a chase order that vanished, reported as a fill event.
+   *
+   * A chase whose order disappears has usually filled, but not always in full.
+   * The remainder is the thing worth knowing, so it is stated rather than left
+   * for the trader to spot in the position size.
+   */
+  private async reportChaseOutcome(
+    market: string,
+    orderId: string,
+    side: string,
+    requested: number,
+    finish: (message: string) => void
+  ): Promise<void> {
+    let filled: number | undefined;
+    let price: number | undefined;
+
+    try {
+      const order = await this.exchange!.fetchOrder(orderId, market);
+      filled = Number(order?.filled ?? 0);
+      const raw = order?.average ?? order?.price;
+      price = raw === undefined ? undefined : Number(raw);
+    } catch {
+      // The order is gone from the live book and not yet in history.
+    }
+
+    if (filled !== undefined && filled > 0) {
+      NotificationManager.notify('', NType.SUCCESS, 'FILL', undefined, {
+        side: side.toUpperCase(),
+        quantity: this.formatQuantity(filled),
+        price:
+          price === undefined ? undefined : this.formatPriceForDisplay(market, price),
+        status: filled + 1e-9 >= requested ? 'FILLED' : 'PARTIAL',
+      });
+    }
+
+    const remainder = filled === undefined ? undefined : requested - filled;
+
+    finish(
+      remainder !== undefined && remainder > 1e-9
+        ? `Chase ended with ${this.formatQuantity(remainder)} unfilled.`
+        : filled === undefined
+        ? 'Chase ended: the order is no longer on the exchange.'
+        : ''
+    );
+  }
+
   async editOrder(
     orderId: string,
     symbol: string,
@@ -1779,7 +2428,7 @@ export class ExchangeClient {
                 symbol,
                 orderType, // 'limit'
                 String(order.side ?? ''),
-                order.amount,
+                Number(order.amount) > 0 ? order.amount : undefined,
                 newPrice,
                 hyperliquidParams
               );
@@ -1814,13 +2463,17 @@ export class ExchangeClient {
             }
 
             if (originalNewPrice !== undefined) {
-                console.log(`[ExchangeClient/bumpOrders] Non-Hyperliquid: Bumping ${orderType} order ${order.id} to ${originalNewPrice}`);
+
                 await this.exchange!.editOrder(
                     order.id,
                     symbol,
                     orderType,
                     String(order.side ?? ''),
-                    order.amount,
+                    // A stop sized to the whole position has an amount of zero.
+                    // Sending that is rejected as below the minimum; sending
+                    // nothing leaves the existing size untouched, which is what
+                    // moving a stop should do anyway.
+                    Number(order.amount) > 0 ? order.amount : undefined,
                     originalNewPrice, // Pass the new price directly
                     paramsForEdit // Pass specific params if any (like for stop orders)
                 );
@@ -1831,7 +2484,8 @@ export class ExchangeClient {
         throw new Error('No open orders to bump');
       }
     } catch (error) {
-      console.error('Error bumping orders:', error);
+      // Rethrown for the caller to report; logging here as well showed the same
+      // failure twice.
       throw error;
     }
   }
@@ -2151,39 +2805,40 @@ export class ExchangeClient {
     }
 
     // --- Original Logic for Other Exchanges ---
-    try {
-        // Original fetch without params - might need adjustment if other exchanges require user context here too
-        const openOrders = await this.exchange.fetchOpenOrders(symbol);
-        const stopOrder = openOrders.find(
-            (order) => (order as any).type.toLowerCase() === 'stop'
-        );
+    // Identified by carrying a trigger price rather than by an order-type
+    // string, which varies by exchange and by how ccxt happens to map it.
+    const openOrders = await this.exchange.fetchOpenOrders(symbol);
+    const stopOrder = openOrders.find((order) => {
+      const info = (order as any).info ?? {};
+      const trigger = Number((order as any).triggerPrice ?? info.stopPxRp ?? info.stopPxEp ?? 0);
+      if (!(trigger > 0)) return false;
 
-        if (!stopOrder) {
-          return undefined;
-        } else {
-          let params;
+      const orderType = String(info.ordType ?? info.orderType ?? order.type ?? '').toLowerCase();
+      // A touch order is a take profit, not a stop.
+      return !orderType.includes('iftouched');
+    });
 
-          // stopOrder = order as StopOrder;
-          params = {
-            // stopLossPrice: price, // only available on Deribit so far
-            stopPrice: newStopPrice, // Phemex's property name for a stop order
-            // reduce_only: true, // only available on Deribit so far
-          }
-
-          await this.exchange!.editOrder(
-            stopOrder.id,
-            symbol,
-            'stop',
-            String(stopOrder.side ?? ''),
-            stopOrder.amount,
-            newStopPrice,
-            params ? params : {}
-          );
-          return stopOrder.id;
-        }
-    } catch (error) {
-        console.error(`[ExchangeClient] Failed to fetch stop order ID:`, error);
+    if (!stopOrder) {
+      throw new Error(`No stop order found for ${symbol} to move.`);
     }
+
+    await this.exchange.editOrder(
+      stopOrder.id,
+      symbol,
+      'stop',
+      String(stopOrder.side ?? ''),
+      // A stop covering the whole position has an amount of zero. Sending that
+      // is rejected as below the minimum; sending nothing leaves the existing
+      // size alone, which is what moving a stop should do.
+      Number(stopOrder.amount) > 0 ? stopOrder.amount : undefined,
+      // A stop-market has no limit price of its own. Passing the trigger here
+      // as well would set a limit price on an order that shouldn't have one --
+      // the trigger belongs in the params below.
+      undefined,
+      { stopPrice: newStopPrice }
+    );
+
+    return stopOrder.id;
   }
 
   // Helper method to calculate default stop amount
@@ -2427,11 +3082,12 @@ export class ExchangeClient {
         // Only log and return if the order was successfully created
         if (createdOrder) {
           if (!suppressLog) {
-              console.log(
-                closeWholePosition
-                  ? `Stop order placed at ${price} for the whole ${market} position`
-                  : `Stop order placed at ${price} for ${quantity} ${market}`
-              );
+              NotificationManager.notify('', NType.INFO, 'ORDER', undefined, {
+                side: side.toUpperCase(),
+                quantity: closeWholePosition ? 'ALL' : this.formatQuantity(quantity),
+                price: this.formatPriceForDisplay(market, price),
+                status: 'STOP WORKING',
+              });
           }
           return createdOrder;
         } else {
@@ -2447,10 +3103,15 @@ export class ExchangeClient {
       }
     } catch (error) {
       // If any errors occur during the process, log the error message
-      NotificationManager.notify(
-        `Stop order NOT placed: ${(error as Error).message}. This position is unprotected.`,
-        NType.ERROR
-      );
+      const failure = describeExchangeError(error);
+      // The full response stays available, marked as diagnostic so it doesn't
+      // run across the activity row.
+      console.error(`[ExchangeClient/createStopOrder] ${failure.raw}`);
+
+      NotificationManager.notify(failure.summary, NType.ERROR, 'ERROR', undefined, {
+        side: 'STOP',
+        status: 'REJECTED',
+      });
       return undefined; // Return undefined on error
     }
   }
