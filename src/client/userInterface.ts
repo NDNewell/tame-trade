@@ -264,6 +264,17 @@ export class UserInterface {
   // fatfinger             show the current limit
   // fatfinger <amount>    set the most a single order may be worth
   // fatfinger off         remove the limit
+  /**
+   * Reports a failed command by its meaning, keeping the exchange's own
+   * response as a diagnostic. A raw payload in the activity feed breaks the row
+   * structure and answers a question the trader wasn't asking.
+   */
+  private reportFailure(error: unknown): void {
+    const failure = describeExchangeError(error);
+    NotificationManager.diagnostic(`[command] ${failure.raw}`);
+    NotificationManager.notify(failure.summary, NType.ERROR, 'ERROR');
+  }
+
   private async handleFatFingerCommand(command: string): Promise<void> {
     const exchangeClient = this.exchangeCommand.getExchangeClient();
     const arg = command.slice('fatfinger'.length).trim();
@@ -395,7 +406,7 @@ export class UserInterface {
               .getExchangeClient()
               .watchOrderBook(market);
           } catch (error: unknown) {
-            NotificationManager.notify((error as Error).message, NType.ERROR);
+            this.reportFailure(error);
           }
         } else {
           console.log(`Invalid market: ${market}`);
@@ -431,7 +442,7 @@ export class UserInterface {
             .cancelAllOrders(this.currentMarket);
           console.log('All orders cancelled for market:', this.currentMarket);
         } catch (error: unknown) {
-          NotificationManager.notify((error as Error).message, NType.ERROR);
+          this.reportFailure(error);
         }
       } else {
         console.log('No market selected. Please select a market first.');
@@ -444,7 +455,7 @@ export class UserInterface {
             .cancelAllLimitOrders(this.currentMarket);
           console.log('All limit orders have been cancelled.');
         } catch (error: unknown) {
-          NotificationManager.notify((error as Error).message, NType.ERROR);
+          this.reportFailure(error);
         }
       } else {
         console.log('No market selected. Please select a market first.');
@@ -457,7 +468,7 @@ export class UserInterface {
             .closePosition(this.currentMarket);
           console.log('Position closed');
         } catch (error: unknown) {
-          NotificationManager.notify((error as Error).message, NType.ERROR);
+          this.reportFailure(error);
         }
       } else {
         console.log('No market selected. Please select a market first.');
@@ -470,7 +481,7 @@ export class UserInterface {
             .cancelAllStopOrders(this.currentMarket);
           console.log('All stop orders have been cancelled.');
         } catch (error: unknown) {
-          NotificationManager.notify((error as Error).message, NType.ERROR);
+          this.reportFailure(error);
         }
       } else {
         console.log('No market selected. Please select a market first.');
@@ -488,7 +499,7 @@ export class UserInterface {
               .bumpOrders(this.currentMarket, priceChange);
             console.log(`All orders have been bumped by ${priceChange}.`);
           } catch (error: unknown) {
-            NotificationManager.notify((error as Error).message, NType.ERROR);
+            this.reportFailure(error);
           }
         } else {
           console.log('No market selected. Please select a market first.');
@@ -525,7 +536,7 @@ export class UserInterface {
               rangeEnd
             );
         } catch (error: unknown) {
-          NotificationManager.notify((error as Error).message, NType.ERROR);
+          this.reportFailure(error);
         }
       } else {
         console.log(
@@ -614,7 +625,7 @@ export class UserInterface {
             `Range ${action} orders placed between ${answers.startPrice} and ${answers.endPrice}`
           );
         } catch (error: unknown) {
-          NotificationManager.notify((error as Error).message, NType.ERROR);
+          this.reportFailure(error);
         }
       } else {
         console.log(
@@ -645,7 +656,7 @@ export class UserInterface {
               throw new Error('orderId is undefined');
             }
           } catch (error: unknown) {
-            NotificationManager.notify((error as Error).message, NType.ERROR);
+            this.reportFailure(error);
           }
         } else {
           console.log(
@@ -665,7 +676,7 @@ export class UserInterface {
             .getExchangeClient()
             .cancelChaseOrder(this.chaseOrderId, this.currentMarket);
         } catch (error: unknown) {
-          NotificationManager.notify((error as Error).message, NType.ERROR);
+          this.reportFailure(error);
         }
         this.chaseOrderId = '';
       } else {
@@ -712,7 +723,7 @@ export class UserInterface {
               entryPrice
             );
         } catch (error: unknown) {
-          NotificationManager.notify((error as Error).message, NType.ERROR);
+          this.reportFailure(error);
         }
       } else {
         console.log('Invalid bracket command format. Please try again.');
@@ -802,7 +813,7 @@ export class UserInterface {
           console.log('Stop order updated.');
         }
       } catch (error: unknown) {
-          NotificationManager.notify((error as Error).message, NType.ERROR);
+          this.reportFailure(error);
       }
     } else if (this.currentMarket) {
       try {
@@ -831,7 +842,7 @@ export class UserInterface {
           }
         }
       } catch (error: unknown) {
-        NotificationManager.notify((error as Error).message, NType.ERROR);
+        this.reportFailure(error);
       }
     } else {
       console.log('No market selected. Please select a market first.');

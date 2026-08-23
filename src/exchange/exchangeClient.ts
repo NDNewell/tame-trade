@@ -182,7 +182,9 @@ export class ExchangeClient {
     try {
       this.availableMarkets = await this.exchange.loadMarkets();
     } catch (error) {
-      console.error(`[ExchangeClient] Failed to fetch markets:`, error);
+      const failure = describeExchangeError(error);
+      NotificationManager.diagnostic(`[loadMarkets] ${failure.raw}`);
+      NotificationManager.notify(`Could not load markets: ${failure.summary}`, NType.ERROR, 'ERROR');
     }
   }
 
@@ -1664,7 +1666,9 @@ export class ExchangeClient {
       // Wait for all cancellations to complete
       await Promise.all(cancelPromises);
     } catch (error) {
-      console.error('Error cancelling limit orders:', error);
+      const failure = describeExchangeError(error);
+      NotificationManager.diagnostic(`[cancelAllLimitOrders] ${failure.raw}`);
+      NotificationManager.notify(`Limit orders NOT cancelled: ${failure.summary}`, NType.ERROR, 'ERROR');
     }
   }
 
@@ -1709,7 +1713,9 @@ export class ExchangeClient {
         await Promise.all(cancelPromises);
       }
     } catch (error) {
-      console.error('Error cancelling stop orders:', error);
+      const failure = describeExchangeError(error);
+      NotificationManager.diagnostic(`[cancelAllStopOrders] ${failure.raw}`);
+      NotificationManager.notify(`Stop orders NOT cancelled: ${failure.summary}`, NType.ERROR, 'ERROR');
     }
   }
 
@@ -1737,7 +1743,7 @@ export class ExchangeClient {
             // console.warn(`[cancelChaseOrder] Attempted to cancel chase order ${orderId}, but it was likely already finalized.`);
         } else {
             // Log other errors as actual problems
-            console.error('Error cancelling chase order:', error);
+            NotificationManager.diagnostic(`[cancelChaseOrder] ${(error as Error).message}`);
             // Optionally re-throw if needed downstream
             // throw error;
         }
@@ -1861,7 +1867,7 @@ export class ExchangeClient {
         const failure = describeExchangeError(error);
         // The raw payload is kept as a diagnostic rather than printed across
         // the activity row.
-        console.error(`[ExchangeClient/chase] ${failure.raw}`);
+        NotificationManager.diagnostic(`[chase] ${failure.raw}`);
 
         consecutiveErrors++;
         this.logAndReplace(
@@ -2798,7 +2804,7 @@ export class ExchangeClient {
             const newOrderId = await this.updateStopOrder(symbol, undefined, newStopPrice);
             return newOrderId;
         } catch (error) {
-            console.error(`[ExchangeClient] Failed to update stop order for Hyperliquid via editCurrentStopOrder:`, error);
+            NotificationManager.diagnostic(`[editCurrentStopOrder] ${(error as Error).message}`);
             // Re-throw or return undefined based on desired error handling
             throw error;
         }
@@ -3106,7 +3112,7 @@ export class ExchangeClient {
       const failure = describeExchangeError(error);
       // The full response stays available, marked as diagnostic so it doesn't
       // run across the activity row.
-      console.error(`[ExchangeClient/createStopOrder] ${failure.raw}`);
+      NotificationManager.diagnostic(`[createStopOrder] ${failure.raw}`);
 
       NotificationManager.notify(failure.summary, NType.ERROR, 'ERROR', undefined, {
         side: 'STOP',
@@ -3234,7 +3240,9 @@ export class ExchangeClient {
         if (error.message && error.message.includes('Order not found')) {
             console.warn(`[ExchangeClient] Attempted to update stop order ${market}, but it might have been filled or cancelled.`);
         } else {
-            console.error(`[ExchangeClient] Failed to update stop order for ${market}:`, error);
+            const failure = describeExchangeError(error);
+      NotificationManager.diagnostic(`[updateStopOrder] ${failure.raw}`);
+      NotificationManager.notify(`Stop NOT updated: ${failure.summary}`, NType.ERROR, 'ERROR');
             // Potentially re-throw or handle specific errors differently
              throw error;
         }
@@ -3272,7 +3280,7 @@ export class ExchangeClient {
         console.log(`No need to synchronize time. Time difference: ${timeDifference} ms`);
       }
     } catch (error) {
-      console.error(`[ExchangeClient] Failed to synchronize time with exchange:`, error);
+      NotificationManager.diagnostic(`[synchronizeTime] ${(error as Error).message}`);
     }
   }
 

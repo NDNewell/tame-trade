@@ -119,11 +119,13 @@ export class ActivityLog {
 
     // Notifications carry their own category, so a fill reads as a FILL rather
     // than as generic output.
-    NotificationManager.setSink((message, type, category, at, detail) => {
+    NotificationManager.setSink((message, type, category, at, detail, debug) => {
       const resolved: ActivityCategory =
         (category as ActivityCategory) ??
         (type === NType.ERROR ? 'ERROR' : type === NType.SUCCESS ? 'ORDER' : 'SYSTEM');
-      this.add(resolved, message, false, at, detail);
+      // An explicit diagnostic is kept but stays out of the trading view,
+      // whatever it contains.
+      this.add(resolved, message, debug === true, at, detail);
     });
 
     const original = {
