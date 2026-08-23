@@ -55,6 +55,18 @@ export class ExchangeClient {
     string,
     { price: number | undefined; at: number; running: boolean }
   >();
+  /**
+   * Mark, index and funding come from one call, cached: funding moves every few
+   * hours and index barely differs second to second, so refetching them on every
+   * two-second repaint would spend the rate limit on values that haven't changed.
+   */
+  private fundingCache = new Map<
+    string,
+    { at: number; mark?: number; index?: number; funding?: number }
+  >();
+  /** Looked up once per session; it does not change while connected. */
+  private accountLabel: string | undefined;
+  private accountLookupDone = false;
   private orderStreams = new Map<
     string,
     {
@@ -494,11 +506,74 @@ export class ExchangeClient {
     }
   }
 
+  private static readonly FUNDING_CACHE_MS = 15000;
+
+  /** Mark price, index price and funding rate, refreshed at a sensible interval. */
+  private async getFundingSnapshot(market: string) {
+    const cached = this.fundingCache.get(market);
+    if (cached && Date.now() - cached.at <= ExchangeClient.FUNDING_CACHE_MS) {
+      return cached;
+    }
+
+    const snapshot: { at: number; mark?: number; index?: number; funding?: number } = {
+      at: Date.now(),
+    };
+
+    try {
+      const rate = await this.exchange!.fetchFundingRate(market);
+      snapshot.mark = Number(rate.markPrice) || undefined;
+      snapshot.index = Number(rate.indexPrice) || undefined;
+      snapshot.funding =
+        rate.fundingRate === undefined || rate.fundingRate === null
+          ? undefined
+          : Number(rate.fundingRate);
+    } catch {
+      // Not every instrument has a funding rate; leave the fields unset rather
+      // than inventing them.
+    }
+
+    this.fundingCache.set(market, snapshot);
+    return snapshot;
+  }
+
+  /**
+   * The account the keys belong to, for the header. Read once: it can't change
+   * while connected, and it costs an authenticated call.
+   */
+  async getAccountLabel(): Promise<string | undefined> {
+    if (this.accountLookupDone) return this.accountLabel;
+    this.accountLookupDone = true;
+
+    try {
+      const balance: any = await this.exchange!.fetchBalance();
+      const info = balance?.info?.data ?? balance?.info ?? {};
+      const account = info.account ?? info;
+
+      const id =
+        account.accountId ??
+        account.accountID ??
+        info.accountId ??
+        info.accountID ??
+        account.userID ??
+        account.userId ??
+        info.userID ??
+        info.userId;
+
+      this.accountLabel = id === undefined || id === null ? undefined : String(id);
+    } catch {
+      this.accountLabel = undefined;
+    }
+
+    return this.accountLabel;
+  }
+
   /** The market values the workspace shows, taken from the feeds where possible. */
   async getDisplayPrice(market: string): Promise<{
     last?: number;
     bid?: number;
     ask?: number;
+    mark?: number;
+    index?: number;
     spread?: string;
     funding?: string;
     change?: string;
@@ -518,7 +593,21 @@ export class ExchangeClient {
     const spread =
       bid !== undefined && ask !== undefined ? (ask - bid).toFixed(4).replace(/0+$/, '').replace(/\.$/, '') : undefined;
 
-    return { last, bid, ask, spread };
+    const funding = await this.getFundingSnapshot(market);
+
+    return {
+      last,
+      bid,
+      ask,
+      mark: funding.mark,
+      index: funding.index,
+      spread,
+      // Quoted as a percentage, which is how funding is normally read.
+      funding:
+        funding.funding === undefined
+          ? undefined
+          : `${(funding.funding * 100).toFixed(4)}%`,
+    };
   }
 
   getConfirmThreshold(): number | undefined {

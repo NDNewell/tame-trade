@@ -121,6 +121,7 @@ const formatRisk = (
 export class Workspace {
   private screen: Screen | null = null;
   private market = '';
+  private accountLabel: string | undefined;
   private refreshTimer: NodeJS.Timeout | null = null;
 
   constructor(
@@ -131,6 +132,14 @@ export class Workspace {
 
   start(market: string): void {
     this.market = market;
+
+    // Looked up once; the header shows '--' until it arrives rather than
+    // blocking the workspace from opening.
+    void this.client.getAccountLabel().then((account) => {
+      if (!account) return;
+      this.accountLabel = account;
+      this.screen?.update({ header: this.header() });
+    });
 
     const view = emptyView();
     view.header.exchange = this.client.getSelectedExchangeName() ?? NO_VALUE;
@@ -149,6 +158,17 @@ export class Workspace {
     // can tell us, chiefly the position.
     this.refreshTimer = setInterval(() => void this.refresh(), 2000);
     void this.refresh();
+  }
+
+  /** The header as it currently stands, for partial updates. */
+  private header() {
+    return {
+      ...emptyView().header,
+      exchange: this.client.getSelectedExchangeName() ?? NO_VALUE,
+      symbol: this.market,
+      connection: 'CONNECTED',
+      account: this.accountLabel ?? NO_VALUE,
+    };
   }
 
   setMarket(market: string): void {
@@ -206,8 +226,8 @@ export class Workspace {
           change: price.change ?? NO_VALUE,
           bid: tick(price.bid),
           ask: tick(price.ask),
-          mark: NO_VALUE,
-          index: NO_VALUE,
+          mark: tick(price.mark),
+          index: tick(price.index),
           funding: dash(price.funding),
           spread: dash(price.spread),
         },
@@ -221,7 +241,7 @@ export class Workspace {
                 position.entry !== undefined
                   ? String(Number(position.entry.toFixed(6)))
                   : NO_VALUE,
-              mark: tick(price.last),
+              mark: tick(price.mark ?? price.last),
               unrealizedPnl:
                 position.unrealizedPnl !== undefined
                   ? `${signed(position.unrealizedPnl)}${position.currency ? ` ${position.currency}` : ''}`
