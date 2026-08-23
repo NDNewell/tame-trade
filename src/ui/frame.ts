@@ -17,8 +17,12 @@ import { formatOutput as fo, Color } from '../utils/formatOutput.js';
 export const MIN_WIDTH = 72;
 export const MIN_HEIGHT = 24;
 
-/** Shown where the layout has a slot but the exchange gives us no value. */
-export const NO_VALUE = '-';
+/**
+ * The single representation for a value that is unavailable, unloaded or not
+ * applicable. Deliberately two characters so it cannot be mistaken for the minus
+ * sign of a negative number: '-2.13' is a value, '--' is the absence of one.
+ */
+export const NO_VALUE = '--';
 
 export interface HeaderView {
   environment: string;
@@ -57,6 +61,9 @@ export interface OrderRowView {
   side: string;
   qty: string;
   price: string;
+  /** What the order is: LIMIT, STOP, MARKET. */
+  type: string;
+  /** Where it is in its life: WORKING, PARTIAL, FILLED, CANCELLED, REJECTED. */
   status: string;
 }
 
@@ -74,6 +81,13 @@ export interface ActivityRowView {
   time: string;
   category: string;
   message: string;
+  /** Present on trade events; renders as columns rather than prose. */
+  detail?: {
+    side?: string;
+    quantity?: string;
+    price?: string;
+    status?: string;
+  };
 }
 
 export interface ConfirmationView {
@@ -115,6 +129,48 @@ export interface Size {
   height: number;
 }
 
+/**
+ * Box-drawing characters, if the environment can render them. A terminal that
+ * can't would show replacement glyphs and break every column, so ASCII stays the
+ * fallback rather than the risk being taken.
+ */
+const canRenderUnicode = (): boolean => {
+  const term = process.env.TERM ?? '';
+  if (term === '' || term === 'dumb') return false;
+
+  const encoding = `${process.env.LC_ALL ?? ''}${process.env.LC_CTYPE ?? ''}${process.env.LANG ?? ''}`;
+  return /UTF-?8/i.test(encoding);
+};
+
+interface BoxChars {
+  h: string; v: string;
+  tl: string; tr: string; bl: string; br: string;
+  teeDown: string; teeUp: string; teeLeft: string; teeRight: string;
+}
+
+const UNICODE_BOX: BoxChars = {
+  h: '─', v: '│',
+  tl: '┌', tr: '┐', bl: '└', br: '┘',
+  teeDown: '┬', teeUp: '┴', teeLeft: '┤', teeRight: '├',
+};
+
+const ASCII_BOX: BoxChars = {
+  h: '-', v: '|',
+  tl: '+', tr: '+', bl: '+', br: '+',
+  teeDown: '+', teeUp: '+', teeLeft: '+', teeRight: '+',
+};
+
+const box: BoxChars = canRenderUnicode() ? UNICODE_BOX : ASCII_BOX;
+
+/**
+ * (5) Three levels of prominence, so headings are findable without competing
+ * with the numbers: muted for metadata and empty states, plain white for
+ * section headings, bright for the values actually being traded on.
+ */
+const MUTED: Color = 'gray';
+const HEADING_COLOR: Color = 'white';
+const PRIMARY: Color = 'brightWhite';
+
 interface Span {
   col: number;
   length: number;
@@ -128,13 +184,13 @@ class Line {
   constructor(private width: number, edges = true) {
     this.chars = new Array(width).fill(' ');
     if (edges) {
-      this.chars[0] = '|';
-      this.chars[width - 1] = '|';
+      this.chars[0] = box.v;
+      this.chars[width - 1] = box.v;
     }
   }
 
   divider(col: number): this {
-    if (col > 0 && col < this.width - 1) this.chars[col] = '|';
+    if (col > 0 && col < this.width - 1) this.chars[col] = box.v;
     return this;
   }
 
@@ -280,9 +336,11 @@ function confirmationBlock(
   const lines: Line[] = [];
   const valueCol = 20;
 
-  const border = (): Line => {
+  const border = (edge?: 'top' | 'bottom'): Line => {
+    const left = edge === 'top' ? box.tl : edge === 'bottom' ? box.bl : box.teeRight;
+    const right = edge === 'top' ? box.tr : edge === 'bottom' ? box.br : box.teeLeft;
     const line = new Line(width, false);
-    line.put(0, '+' + '-'.repeat(width - 2) + '+', undefined, width);
+    line.put(0, left + box.h.repeat(width - 2) + right, undefined, width);
     return line;
   };
 
@@ -323,8 +381,56 @@ function windowActivity(
   return activity.slice(Math.max(0, end - rows), end);
 }
 
+/**
+ * (11)(12)(15) An activity row.
+ *
+ * Trade events are laid out in fixed columns so they can be scanned rather than
+ * read. The event type says what happened and the side carries the direction
+ * colour -- colouring a whole FILL row green would make a sell fill look like a
+ * buy, which is the one thing a trader must never misread.
+ *
+ * Events without structured data keep their message, rather than being padded
+ * with placeholders into a shape they don't have.
+ */
+function activityRow(
+  event: ActivityRowView,
+  width: number,
+  inner: number
+): Line {
+  const line = new Line(width);
+  const cTime = 2;
+  const cEvent = 18;
+  const cSide = 26;
+  const cQty = 32;
+  const cPrice = 43;
+  const cStatus = 54;
+
+  line
+    .put(cTime, event.time, MUTED, cEvent)
+    .put(cEvent, event.category, categoryColor(event.category), cSide);
+
+  const detail = event.detail;
+  if (!detail) {
+    line.put(cSide, event.message, undefined, inner);
+    return line;
+  }
+
+  if (detail.side) line.put(cSide, detail.side, sideColor(detail.side), cQty);
+  if (detail.quantity) line.putRight(cPrice - 2, detail.quantity, undefined, cQty);
+  if (detail.price) line.putRight(cStatus - 2, detail.price, undefined, cPrice);
+  if (detail.status) line.put(cStatus, detail.status, statusColor(detail.status), inner);
+
+  // Anything the columns don't cover follows them rather than being lost.
+  if (event.message) {
+    const after = detail.status ? cStatus + detail.status.length + 2 : cStatus;
+    line.put(after, event.message, MUTED, inner);
+  }
+
+  return line;
+}
+
 function activityLabel(view: TerminalView, width: number, rows: number): Line {
-  const line = new Line(width).put(2, 'ACTIVITY', 'gray');
+  const line = new Line(width).put(2, 'ACTIVITY', HEADING_COLOR);
   const offset = view.activityOffset ?? 0;
 
   if (offset > 0) {
@@ -335,18 +441,30 @@ function activityLabel(view: TerminalView, width: number, rows: number): Line {
   return line;
 }
 
+/** Commands that place or withdraw orders, as opposed to ones that only look. */
+const EXECUTION_COMMANDS = new Set(['buy', 'sell', 'chase', 'limit', 'cancel']);
+
 function footerRow(view: TerminalView, width: number, inner: number): Line {
   const line = new Line(width);
   const right = view.footerRight ?? '';
   let col = 2;
+  let crossed = false;
 
   for (const command of view.footer) {
+    // A wider gap where the list stops being about acting on the market and
+    // starts being about looking at it. Whitespace does the grouping; no labels
+    // are needed to say so.
+    if (!crossed && !EXECUTION_COMMANDS.has(command)) {
+      col += 4;
+      crossed = true;
+    }
+
     if (col + command.length >= inner - right.length - 2) break;
-    line.put(col, command, 'gray');
+    line.put(col, command, MUTED);
     col += command.length + 2;
   }
 
-  line.putRight(inner - 1, right, 'gray', col);
+  line.putRight(inner - 1, right, MUTED, col);
   return line;
 }
 
@@ -363,9 +481,11 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
   const lines: Line[] = [];
   const { header, market, position, orders, chase, activity } = view;
 
-  const border = (): Line => {
+  const border = (edge?: 'top' | 'bottom'): Line => {
+    const left = edge === 'top' ? box.tl : edge === 'bottom' ? box.bl : box.teeRight;
+    const right = edge === 'top' ? box.tr : edge === 'bottom' ? box.br : box.teeLeft;
     const line = new Line(width, false);
-    line.put(0, '+' + '-'.repeat(width - 2) + '+', undefined, width);
+    line.put(0, left + box.h.repeat(width - 2) + right, undefined, width);
     return line;
   };
 
@@ -404,11 +524,11 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
   lines.push(new Line(width).put(2, `${header.exchange} | ${header.symbol}`, undefined, inner));
 
   lines.push(border());
-  lines.push(new Line(width).put(2, 'MARKET', 'gray'));
+  lines.push(new Line(width).put(2, 'MARKET', HEADING_COLOR));
   lines.push(
     new Line(width)
-      .put(2, market.symbol, 'white', 16)
-      .put(16, market.last, 'white', 26)
+      .put(2, market.symbol, HEADING_COLOR, 16)
+      .put(16, market.last, PRIMARY, 26)
       .put(26, market.change, signedColor(market.change), inner)
   );
   lines.push(
@@ -420,9 +540,9 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
   );
 
   lines.push(border());
-  lines.push(new Line(width).put(2, 'POSITION', 'gray'));
+  lines.push(new Line(width).put(2, 'POSITION', HEADING_COLOR));
   if (positionFields.length === 0) {
-    lines.push(new Line(width).put(2, 'No open position', 'gray', inner));
+    lines.push(new Line(width).put(2, 'No open position', MUTED, inner));
   } else {
     for (const [label, value, color] of positionFields) {
       lines.push(new Line(width).put(2, label, undefined, 19).put(19, value, color, inner));
@@ -430,7 +550,7 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
   }
 
   lines.push(border());
-  lines.push(new Line(width).put(2, 'ACTIVE ORDERS', 'gray'));
+  lines.push(new Line(width).put(2, 'ACTIVE ORDERS', HEADING_COLOR));
   const c1 = 2, c2 = 10, c3 = 17, c4 = 24, c5 = 33;
   lines.push(
     new Line(width)
@@ -441,7 +561,7 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
       .put(c5, 'STATUS', 'gray', inner)
   );
   if (orderRows === 0) {
-    lines.push(new Line(width).put(2, 'No active orders', 'gray', inner));
+    lines.push(new Line(width).put(2, 'No active orders', MUTED, inner));
   } else {
     for (const order of orders.slice(0, orderRows)) {
       lines.push(
@@ -457,7 +577,7 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
 
   if (chase) {
     lines.push(border());
-    lines.push(new Line(width).put(2, 'CHASE', 'gray'));
+    lines.push(new Line(width).put(2, 'CHASE', HEADING_COLOR));
     lines.push(new Line(width).put(2, chase.side, sideColor(chase.side), 7).put(7, chase.quantity, undefined, inner));
     const summary = `Working ${chase.working} | Reprices ${chase.reprices} | ${chase.elapsed} | `;
     lines.push(
@@ -486,15 +606,7 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
   lines.push(new Line(width).put(2, '>', 'cyan').put(4, view.input, undefined, inner));
 
   lines.push(border());
-  const footerLine = new Line(width);
-  let col = 2;
-  for (const command of view.footer) {
-    if (col + command.length >= inner - 1) break;
-    footerLine.put(col, command, 'gray');
-    col += command.length + 1;
-  }
-  if (col + view.footerRight.length < inner) footerLine.put(col, view.footerRight, 'gray');
-  lines.push(footerLine);
+  lines.push(footerRow(view, width, inner));
 
   lines.push(border());
   return lines;
@@ -512,10 +624,19 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   const lines: Line[] = [];
   const { header, market, position, orders, chase, activity } = view;
 
-  const border = (withDivider = false): Line => {
+  const border = (
+    opts: { edge?: 'top' | 'bottom'; divider?: 'down' | 'up' } = {}
+  ): Line => {
+    const left = opts.edge === 'top' ? box.tl : opts.edge === 'bottom' ? box.bl : box.teeRight;
+    const right = opts.edge === 'top' ? box.tr : opts.edge === 'bottom' ? box.br : box.teeLeft;
+
     const line = new Line(width, false);
-    line.put(0, '+' + '-'.repeat(width - 2) + '+', undefined, width);
-    if (withDivider) line.put(divider, '+', undefined, width);
+    line.put(0, left + box.h.repeat(width - 2) + right, undefined, width);
+
+    if (opts.divider) {
+      line.put(divider, opts.divider === 'down' ? box.teeDown : box.teeUp, undefined, width);
+    }
+
     return line;
   };
 
@@ -525,7 +646,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   );
 
   // --- header: identity on the left, connection state on the right ------
-  lines.push(border());
+  lines.push(border({ edge: 'top' }));
 
   const connectionText = `${header.environment} | ${header.connection}`;
   lines.push(
@@ -550,30 +671,42 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
 
   // --- market: symbol and last price lead, the rest supports -------------
   lines.push(border());
-  lines.push(new Line(width).put(2, 'MARKET', 'gray'));
+  lines.push(new Line(width).put(2, 'MARKET', HEADING_COLOR));
 
-  lines.push(
-    new Line(width)
-      .put(2, market.symbol, 'white', 20)
-      .put(20, market.last, 'white', 34)
-      .put(34, market.change, signedColor(market.change), 46)
-      .put(46, `Bid ${market.bid}`, undefined, Math.floor(inner * 0.8))
-      .putRight(inner - 1, `Ask ${market.ask}`, undefined, Math.floor(inner * 0.8))
-  );
+  // Four evenly spaced columns, so the primary and secondary rows line up with
+  // each other and every value keeps a fixed starting position.
+  const span = Math.max(16, Math.floor((inner - 18) / 4));
+  const col1 = 18;
+  const col2 = col1 + span;
+  const col3 = col2 + span;
+  const col4 = col3 + span;
 
-  lines.push(
-    new Line(width)
-      .put(2, `Mark ${market.mark}`, undefined, 20)
-      .put(20, `Index ${market.index}`, undefined, 46)
-      .put(46, `Funding ${market.funding}`, undefined, Math.floor(inner * 0.82))
-      .putRight(inner - 1, `Spread ${market.spread}`, undefined, Math.floor(inner * 0.82))
-  );
+  const field = (line: Line, col: number, label: string, value: string, limit: number) =>
+    line
+      .put(col, label, MUTED, col + label.length + 1)
+      .put(col + label.length + 1, value, undefined, limit);
+
+  const primaryRow = new Line(width).put(2, market.symbol, HEADING_COLOR, col1);
+  primaryRow
+    .put(col1, 'Last', MUTED, col1 + 5)
+    .put(col1 + 5, market.last, PRIMARY, col2);
+  field(primaryRow, col2, 'Bid', market.bid, col3);
+  field(primaryRow, col3, 'Ask', market.ask, col4);
+  primaryRow.put(col4, market.change, signedColor(market.change), inner);
+  lines.push(primaryRow);
+
+  const secondaryRow = new Line(width);
+  field(secondaryRow, 2, 'Mark', market.mark, col1);
+  field(secondaryRow, col1, 'Index', market.index, col2);
+  field(secondaryRow, col2, 'Funding', market.funding, col3);
+  field(secondaryRow, col3, 'Spread', market.spread, col4);
+  lines.push(secondaryRow);
 
   // --- confirmation takes the place of position/orders when pending --------
   if (view.confirmation) {
     lines.push(...confirmationBlock(view.confirmation, width, splitRows + 1));
     lines.push(border());
-    lines.push(new Line(width).put(2, 'ACTIVITY', 'gray'));
+    lines.push(new Line(width).put(2, 'ACTIVITY', HEADING_COLOR));
     const pending = activity.slice(-activityRows);
     for (let row = 0; row < activityRows; row++) {
       const line = new Line(width);
@@ -595,9 +728,9 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   }
 
   // --- position | active orders -----------------------------------------
-  lines.push(border(true));
+  lines.push(border({ divider: 'down' }));
   lines.push(
-    new Line(width).divider(divider).put(2, 'POSITION', 'gray').put(divider + 2, 'ACTIVE ORDERS', 'gray')
+    new Line(width).divider(divider).put(2, 'POSITION', HEADING_COLOR).put(divider + 2, 'ACTIVE ORDERS', HEADING_COLOR)
   );
 
   const positionFields: Array<[string, string, Color | undefined]> = position
@@ -613,14 +746,21 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
       ]
     : [];
 
-  // Order columns are anchored from the right edge, so status and price — the
-  // values that matter when scanning — keep their room and the order id gives up
-  // width first as the panel narrows.
-  const oStatus = inner - 7;
-  const oPrice = oStatus - 8;
-  const oQty = oPrice - 6;
-  const oSide = oQty - 5;
-  const oId = divider + 2;
+  // Columns run left to right across the panel. Widths come from the space
+  // available, and the order id gives up room first: it identifies an order but
+  // you don't trade on it, whereas side, size, price, type and status are what
+  // you read when deciding whether to act.
+  const panelStart = divider + 2;
+  const panelWidth = Math.max(20, inner - panelStart);
+  const fixed = 5 + 8 + 9 + 7 + 8; // side, qty, price, type, status
+  const idWidth = Math.max(0, Math.min(10, panelWidth - fixed));
+
+  const oId = panelStart;
+  const oSide = oId + idWidth;
+  const oQty = oSide + 5;
+  const oPrice = oQty + 8;
+  const oType = oPrice + 9;
+  const oStatus = oType + 7;
 
   const valueCol = 19;
   const bodyRows = Math.max(1, splitRows - 1); // first row of the block is a gap
@@ -629,23 +769,27 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
     const line = new Line(width).divider(divider);
 
     if (row === 0) {
+      if (idWidth > 0) line.put(oId, 'ID', MUTED, oSide - 1);
       line
-        .put(oId, 'ID', 'gray', oSide)
-        .put(oSide, 'SIDE', 'gray', oQty)
-        .put(oQty, 'QTY', 'gray', oPrice)
-        .put(oPrice, 'PRICE', 'gray', oStatus)
-        .put(oStatus, 'STATUS', 'gray');
+        .put(oSide, 'SIDE', MUTED, oQty)
+        .putRight(oPrice - 2, 'QTY', MUTED, oQty)
+        .putRight(oType - 2, 'PRICE', MUTED, oPrice)
+        .put(oType, 'TYPE', MUTED, oStatus)
+        .put(oStatus, 'STATUS', MUTED, inner);
     } else {
       const order = orders[row - 1];
       if (order) {
+        if (idWidth > 0) line.put(oId, order.id, MUTED, oSide - 1);
         line
-          .put(oId, order.id, undefined, oSide)
           .put(oSide, order.side, sideColor(order.side), oQty)
-          .put(oQty, order.qty, undefined, oPrice)
-          .put(oPrice, order.price, undefined, oStatus)
-          .put(oStatus, order.status, statusColor(order.status));
+          // Numbers right-aligned in their column so decimals line up and a
+          // changing value never shifts its neighbours.
+          .putRight(oPrice - 2, order.qty, undefined, oQty)
+          .putRight(oType - 2, order.price, undefined, oPrice)
+          .put(oType, order.type, MUTED, oStatus)
+          .put(oStatus, order.status, statusColor(order.status), inner);
       } else if (row === 1 && orders.length === 0) {
-        line.put(oId, 'No active orders', 'gray', divider + Math.floor(width / 2) - 2);
+        line.put(panelStart, 'No active orders', MUTED, inner);
       }
     }
 
@@ -653,16 +797,16 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
     if (field) {
       line.put(2, field[0], undefined, valueCol).put(valueCol, field[1], field[2], divider);
     } else if (row === 0 && !position) {
-      line.put(2, 'No open position', 'gray', divider);
+      line.put(2, 'No open position', MUTED, divider);
     }
 
     lines.push(line);
   }
 
   // --- chase: only present while one is running --------------------------
+  lines.push(border({ divider: 'up' }));
   if (chase) {
-    lines.push(border());
-    lines.push(new Line(width).put(2, 'CHASE', 'gray'));
+    lines.push(new Line(width).put(2, 'CHASE', HEADING_COLOR));
     lines.push(
       new Line(width).put(2, chase.side, sideColor(chase.side), 7).put(7, chase.quantity)
     );
@@ -685,10 +829,10 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
     lines.push(
       new Line(width).put(2, 'Status').put(14, chase.status, statusColor(chase.status))
     );
+    lines.push(border());
   }
 
   // --- activity ----------------------------------------------------------
-  lines.push(border());
   lines.push(activityLabel(view, width, activityRows));
 
   const visible = windowActivity(activity, activityRows, view.activityOffset ?? 0);
@@ -697,10 +841,8 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
     const event = visible[row];
 
     if (event) {
-      line
-        .put(2, event.time, 'gray', 17)
-        .put(17, event.category, categoryColor(event.category), 26)
-        .put(26, event.message, undefined, inner);
+      lines.push(activityRow(event, width, inner));
+      continue;
     }
 
     lines.push(line);
@@ -713,18 +855,9 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   // --- footer ------------------------------------------------------------
   lines.push(border());
 
-  const footerLine = new Line(width);
-  const right = view.footerRight ?? '';
-  let col = 2;
-  for (const command of view.footer) {
-    if (col + command.length >= inner - right.length - 2) break;
-    footerLine.put(col, command, 'gray');
-    col += command.length + 2;
-  }
-  footerLine.putRight(inner - 1, right, 'gray', col);
-  lines.push(footerLine);
+  lines.push(footerRow(view, width, inner));
 
-  lines.push(border());
+  lines.push(border({ edge: 'bottom' }));
 
   return lines;
 }

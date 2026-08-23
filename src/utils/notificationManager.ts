@@ -8,7 +8,21 @@ export enum NType {
   INFO,
 }
 
-type Sink = (message: string, type: NType, category?: string, at?: number) => void;
+/** Structured fields for a trade event, so the UI can column-align it. */
+export interface EventDetail {
+  side?: string;
+  quantity?: string;
+  price?: string;
+  status?: string;
+}
+
+type Sink = (
+  message: string,
+  type: NType,
+  category?: string,
+  at?: number,
+  detail?: EventDetail
+) => void;
 
 export class NotificationManager {
   private static sink: Sink | null = null;
@@ -18,9 +32,15 @@ export class NotificationManager {
     this.sink = sink;
   }
 
-  static notify(message: string, type: NType, category?: string, at?: number): void {
+  static notify(
+    message: string,
+    type: NType,
+    category?: string,
+    at?: number,
+    detail?: EventDetail
+  ): void {
     if (this.sink) {
-      this.sink(message, type, category, at);
+      this.sink(message, type, category, at, detail);
       return;
     }
 

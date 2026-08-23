@@ -23,6 +23,12 @@ const FOOTER = [
 const dash = (value: unknown, suffix = ''): string =>
   value === undefined || value === null || value === '' ? NO_VALUE : `${value}${suffix}`;
 
+/** Trims trailing zeros so 1.000 shows as 1 but 0.5 keeps its precision. */
+const formatQuantity = (value: number): string => {
+  if (!Number.isFinite(value)) return NO_VALUE;
+  return String(Number(value.toFixed(8)));
+};
+
 const signed = (value: unknown): string => {
   if (value === undefined || value === null || value === '') return NO_VALUE;
   const numeric = Number(value);
@@ -121,6 +127,8 @@ export class Workspace {
   private async refresh(): Promise<void> {
     if (!this.screen || !this.market) return;
 
+    // 'SOL/USDT' rather than 'SOL/USDT:USDT': the settlement suffix is exchange
+    // notation and adds nothing once the market is named in the header.
     const symbol = this.market.split(':')[0];
 
     try {
@@ -167,14 +175,30 @@ export class Workspace {
           const size = Number(order.remaining ?? order.amount ?? 0);
           const isTrigger = trigger !== undefined && Number(trigger) > 0;
 
+          // What the order is, kept separate from where it is in its life. The
+          // exchange conflates the two; the distinction is ours to present.
+          const type = isTrigger
+            ? 'STOP'
+            : String(order.type ?? 'LIMIT').toUpperCase();
+
+          const filled = Number(order.filled ?? 0);
+          const status = isTrigger
+            ? 'WORKING'
+            : filled > 0 && size > 0
+            ? 'PARTIAL'
+            : String(order.status ?? 'open').toLowerCase() === 'open'
+            ? 'WORKING'
+            : String(order.status ?? '').toUpperCase();
+
           return {
             id: String(order.id ?? '').slice(0, 8),
             side: String(order.side ?? '').toUpperCase(),
-            // A conditional order sized to the whole position carries a
-            // quantity of zero; showing '0' reads as an empty order.
-            qty: size > 0 ? String(size) : isTrigger ? 'POSITION' : NO_VALUE,
+            // An order covering the whole position carries a quantity of zero.
+            // 'ALL' says what that means; '0' reads as an empty order.
+            qty: size > 0 ? formatQuantity(size) : isTrigger ? 'ALL' : NO_VALUE,
             price: isTrigger ? String(trigger) : String(order.price ?? NO_VALUE),
-            status: isTrigger && !size ? 'STOP' : String(order.status ?? 'WORKING').toUpperCase(),
+            type,
+            status,
           };
         }),
       });

@@ -627,39 +627,44 @@ export class ExchangeClient {
       rawPrice !== undefined ? this.formatPriceForDisplay(market, Number(rawPrice)) : undefined;
     const at = price !== undefined ? ` @${price}` : '';
 
+    // Structured rather than prose: the row is columns the eye can run down,
+    // and the market isn't repeated because it is already in the header.
     if (filled > previouslyFilled) {
       state.filledSoFar.set(id, filled);
 
-      const total = Number(update.amount ?? 0);
       const complete =
         status === 'closed' ||
         (update.remaining !== undefined && Number(update.remaining) === 0);
 
-      NotificationManager.notify(
-        complete
-          ? `${this.capitalise(side)} filled ${filled}${at}`
-          : `${this.capitalise(side)} partially filled ${filled}${total ? ` of ${total}` : ''}${at}`,
-        NType.SUCCESS,
-        'FILL',
-        eventTime
-      );
+      NotificationManager.notify('', NType.SUCCESS, 'FILL', eventTime, {
+        side: side.toUpperCase(),
+        quantity: this.formatQuantity(filled),
+        price: price,
+        status: complete ? 'FILLED' : 'PARTIAL',
+      });
     }
 
     if (status === 'canceled' && filled === 0) {
-      NotificationManager.notify(
-        `${this.capitalise(side)} order canceled`,
-        NType.INFO,
-        'ORDER',
-        eventTime
-      );
+      NotificationManager.notify('', NType.INFO, 'ORDER', eventTime, {
+        side: side.toUpperCase(),
+        quantity: this.formatQuantity(Number(update.amount ?? 0)),
+        price: price,
+        status: 'CANCELLED',
+      });
     }
 
     if (status === 'rejected') {
       NotificationManager.notify(
-        `${this.capitalise(side)} order REJECTED by the exchange. Nothing is resting.`,
+        'nothing is resting',
         NType.ERROR,
         'ERROR',
-        eventTime
+        eventTime,
+        {
+          side: side.toUpperCase(),
+          quantity: this.formatQuantity(Number(update.amount ?? 0)),
+          price: price,
+          status: 'REJECTED',
+        }
       );
     }
   }
@@ -700,6 +705,12 @@ export class ExchangeClient {
     }
 
     return undefined;
+  }
+
+  /** Quantities without trailing precision the value doesn't carry. */
+  private formatQuantity(value: number): string {
+    if (!Number.isFinite(value) || value <= 0) return 'ALL';
+    return String(Number(value.toFixed(8)));
   }
 
   private capitalise(value: string): string {
@@ -970,12 +981,12 @@ export class ExchangeClient {
             ? ` @${order.price}`
             : '';
 
-        NotificationManager.notify(
-          `${side}order accepted${amount ? ` for ${amount}` : ''}${at}` +
-            `${order?.id ? ` (id ${String(order.id).slice(0, 8)})` : ''}`,
-          NType.INFO,
-          'ORDER'
-        );
+        NotificationManager.notify('', NType.INFO, 'ORDER', undefined, {
+          side: order?.side ? String(order.side).toUpperCase() : undefined,
+          quantity: this.formatQuantity(Number(order?.amount)),
+          price: trigger !== undefined ? String(trigger) : order?.price ? String(order.price) : undefined,
+          status: trigger !== undefined ? 'STOP' : 'ACCEPTED',
+        });
       } catch {
         console.log(`Order accepted${order?.id ? ` (id ${order.id})` : ''}`);
       }

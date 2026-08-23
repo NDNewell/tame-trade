@@ -8,7 +8,7 @@
 // interface brief, keeps low-level client output out of the primary view.
 
 import { ActivityRowView } from './frame.js';
-import { NotificationManager, NType } from '../utils/notificationManager.js';
+import { NotificationManager, NType, EventDetail } from '../utils/notificationManager.js';
 
 export type ActivityCategory =
   | 'SYSTEM'
@@ -24,6 +24,11 @@ export interface ActivityEvent {
   at: number;
   category: ActivityCategory;
   message: string;
+  /**
+   * Present on trade events. When set the row is rendered in columns rather
+   * than as prose, so events align with each other and can be scanned.
+   */
+  detail?: EventDetail;
   /** Diagnostics are kept but not shown in the primary view. */
   debug: boolean;
 }
@@ -62,7 +67,13 @@ export class ActivityLog {
    * the order feed replays recent history on connect, and stamping that backlog
    * with the current time makes every past fill look like it just happened.
    */
-  add(category: ActivityCategory, message: string, debug = false, at?: number): void {
+  add(
+    category: ActivityCategory,
+    message: string,
+    debug = false,
+    at?: number,
+    detail?: EventDetail
+  ): void {
     const when = at !== undefined && Number.isFinite(at) ? at : Date.now();
     // Date as well as time: the feed replays events from earlier sessions, so a
     // bare clock time is ambiguous about which day it belongs to.
@@ -75,9 +86,9 @@ export class ActivityLog {
     // screen but count as characters, so leaving them in makes every layout
     // measurement wrong and the frame ends short of its border.
     const text = stripAnsi(String(message)).replace(/\s+/g, ' ').trim();
-    if (text.length === 0) return;
+    if (text.length === 0 && !detail) return;
 
-    this.events.push({ time, at: when, category, message: text, debug });
+    this.events.push({ time, at: when, category, message: text, detail, debug });
     // A replayed backlog can arrive after messages that are newer than it, so
     // order by when things happened rather than when they were received.
     this.events.sort((a, b) => a.at - b.at);
@@ -90,7 +101,7 @@ export class ActivityLog {
   visible(): ActivityRowView[] {
     return this.events
       .filter((event) => !event.debug)
-      .map(({ time, category, message }) => ({ time, category, message }));
+      .map(({ time, category, message, detail }) => ({ time, category, message, detail }));
   }
 
   /** Everything, for the debug view. */
@@ -108,11 +119,11 @@ export class ActivityLog {
 
     // Notifications carry their own category, so a fill reads as a FILL rather
     // than as generic output.
-    NotificationManager.setSink((message, type, category, at) => {
+    NotificationManager.setSink((message, type, category, at, detail) => {
       const resolved: ActivityCategory =
         (category as ActivityCategory) ??
         (type === NType.ERROR ? 'ERROR' : type === NType.SUCCESS ? 'ORDER' : 'SYSTEM');
-      this.add(resolved, message, false, at);
+      this.add(resolved, message, false, at, detail);
     });
 
     const original = {
