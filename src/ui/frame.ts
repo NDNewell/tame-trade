@@ -726,10 +726,15 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   lines.push(primaryRow);
 
   const secondaryRow = new Line(width);
+  const spreadLabel = `Spread ${market.spread}`;
+  const spreadCol = Math.max(col3, inner - 1 - spreadLabel.length);
+
   field(secondaryRow, 2, 'Mark', market.mark, col1);
   field(secondaryRow, col1, 'Index', market.index, col2);
-  field(secondaryRow, col2, 'Funding', market.funding, col3);
-  field(secondaryRow, col3, 'Spread', market.spread, col4);
+  field(secondaryRow, col2, 'Funding', market.funding, spreadCol - 1);
+  secondaryRow
+    .put(spreadCol, 'Spread', MUTED, spreadCol + 7)
+    .put(spreadCol + 7, market.spread, undefined, inner);
   lines.push(secondaryRow);
 
   // --- confirmation takes the place of position/orders when pending --------
