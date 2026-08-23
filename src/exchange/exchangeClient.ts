@@ -575,6 +575,27 @@ export class ExchangeClient {
     return snapshot;
   }
 
+  /** Seconds between funding payments, as the instrument reports them. */
+  private fundingIntervalSeconds(market: string): number | undefined {
+    const seconds = Number(
+      (this.availableMarkets?.[market]?.info as any)?.fundingInterval
+    );
+    return Number.isFinite(seconds) && seconds > 0 ? seconds : undefined;
+  }
+
+  private formatFunding(market: string, rate: number): string {
+    const perInterval = `${(rate * 100).toFixed(4)}%`;
+    const interval = this.fundingIntervalSeconds(market);
+
+    // Without a known interval there is no honest way to annualise it.
+    if (interval === undefined) return perInterval;
+
+    const periodsPerYear = 31536000 / interval;
+    const apr = rate * periodsPerYear * 100;
+
+    return `${perInterval} (${apr.toFixed(2)}% APR)`;
+  }
+
   /**
    * The account the keys belong to, for the header. Read once: it can't change
    * while connected, and it costs an authenticated call.
@@ -687,11 +708,15 @@ export class ExchangeClient {
       mark: funding.mark,
       index: funding.index,
       spread,
-      // Quoted as a percentage, which is how funding is normally read.
+      // Quoted as a percentage, with the annualised equivalent alongside: the
+      // per-interval figure is small enough to look negligible, and the yearly
+      // one is what tells you whether holding the position actually costs
+      // anything. The interval comes from the instrument rather than assuming
+      // the usual eight hours.
       funding:
         funding.funding === undefined
           ? undefined
-          : `${(funding.funding * 100).toFixed(4)}%`,
+          : this.formatFunding(market, funding.funding),
     };
   }
 
