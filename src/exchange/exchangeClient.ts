@@ -2508,39 +2508,40 @@ export class ExchangeClient {
     }
 
     // --- Original Logic for Other Exchanges ---
-    try {
-        // Original fetch without params - might need adjustment if other exchanges require user context here too
-        const openOrders = await this.exchange.fetchOpenOrders(symbol);
-        const stopOrder = openOrders.find(
-            (order) => (order as any).type.toLowerCase() === 'stop'
-        );
+    // Identified by carrying a trigger price rather than by an order-type
+    // string, which varies by exchange and by how ccxt happens to map it.
+    const openOrders = await this.exchange.fetchOpenOrders(symbol);
+    const stopOrder = openOrders.find((order) => {
+      const info = (order as any).info ?? {};
+      const trigger = Number((order as any).triggerPrice ?? info.stopPxRp ?? info.stopPxEp ?? 0);
+      if (!(trigger > 0)) return false;
 
-        if (!stopOrder) {
-          return undefined;
-        } else {
-          let params;
+      const orderType = String(info.ordType ?? info.orderType ?? order.type ?? '').toLowerCase();
+      // A touch order is a take profit, not a stop.
+      return !orderType.includes('iftouched');
+    });
 
-          // stopOrder = order as StopOrder;
-          params = {
-            // stopLossPrice: price, // only available on Deribit so far
-            stopPrice: newStopPrice, // Phemex's property name for a stop order
-            // reduce_only: true, // only available on Deribit so far
-          }
-
-          await this.exchange!.editOrder(
-            stopOrder.id,
-            symbol,
-            'stop',
-            String(stopOrder.side ?? ''),
-            stopOrder.amount,
-            newStopPrice,
-            params ? params : {}
-          );
-          return stopOrder.id;
-        }
-    } catch (error) {
-        console.error(`[ExchangeClient] Failed to fetch stop order ID:`, error);
+    if (!stopOrder) {
+      throw new Error(`No stop order found for ${symbol} to move.`);
     }
+
+    await this.exchange.editOrder(
+      stopOrder.id,
+      symbol,
+      'stop',
+      String(stopOrder.side ?? ''),
+      // A stop covering the whole position has an amount of zero. Sending that
+      // is rejected as below the minimum; sending nothing leaves the existing
+      // size alone, which is what moving a stop should do.
+      Number(stopOrder.amount) > 0 ? stopOrder.amount : undefined,
+      // A stop-market has no limit price of its own. Passing the trigger here
+      // as well would set a limit price on an order that shouldn't have one --
+      // the trigger belongs in the params below.
+      undefined,
+      { stopPrice: newStopPrice }
+    );
+
+    return stopOrder.id;
   }
 
   // Helper method to calculate default stop amount
