@@ -12,6 +12,7 @@ import { NotificationManager, NType } from '../utils/notificationManager.js';
 import { describeExchangeError } from '../utils/exchangeErrors.js';
 import { Workspace } from '../ui/workspace.js';
 import { ActivityLog } from '../ui/activityLog.js';
+import { releaseInstanceLock } from '../config/instanceLock.js';
 
 export class UserInterface {
   private currentMarket: string;
@@ -925,6 +926,7 @@ export class UserInterface {
   }
 
   quit() {
+    releaseInstanceLock();
     this.workspace?.stop();
     console.log('Exiting...');
     // Give time for readline to clean up
