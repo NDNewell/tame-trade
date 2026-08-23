@@ -15,7 +15,7 @@ import {
   PositionRiskResult,
   ProtectiveStopTranche,
 } from '../trading/positionRisk.js';
-import { describeExchangeError } from '../utils/exchangeErrors.js';
+import { describeExchangeError, isMissingOrderError } from '../utils/exchangeErrors.js';
 import { NotificationManager } from '../utils/notificationManager.js';
 import { NType } from '../utils/notificationManager.js';
 
@@ -1844,20 +1844,23 @@ export class ExchangeClient {
         this.currentChaseOrderId = orderId;
         consecutiveErrors = 0;
       } catch (error) {
-        const message = (error as Error).message ?? String(error);
-
-        // The order being chased is gone. There is nothing left to move, so
-        // stop rather than retry an id that will never resolve again.
-        if (/cannot find order|order ?not ?found|ordernotfound/i.test(message)) {
-          finish(
-            'Chase stopped: the order it was working no longer exists on the exchange.'
-          );
+        // The order being chased is gone. Rather than retry an id that will
+        // never resolve, find out what actually became of it and say so --
+        // leaving a chase quiet about an unfilled remainder is how a position
+        // ends up smaller than intended without anyone noticing.
+        if (isMissingOrderError(error)) {
+          await this.reportChaseOutcome(market, orderId, side, amount, finish);
           return;
         }
 
+        const failure = describeExchangeError(error);
+        // The raw payload is kept as a diagnostic rather than printed across
+        // the activity row.
+        console.error(`[ExchangeClient/chase] ${failure.raw}`);
+
         consecutiveErrors++;
         this.logAndReplace(
-          `Chase: could not move the order to ${targetPrice} (${message}) ` +
+          `Chase: could not move the order (${failure.summary}) ` +
             `[${consecutiveErrors}/${maxConsecutiveErrors}]`
         );
 
@@ -2288,6 +2291,53 @@ export class ExchangeClient {
     }
 
     return orderId;
+  }
+
+  /**
+   * What became of a chase order that vanished, reported as a fill event.
+   *
+   * A chase whose order disappears has usually filled, but not always in full.
+   * The remainder is the thing worth knowing, so it is stated rather than left
+   * for the trader to spot in the position size.
+   */
+  private async reportChaseOutcome(
+    market: string,
+    orderId: string,
+    side: string,
+    requested: number,
+    finish: (message: string) => void
+  ): Promise<void> {
+    let filled: number | undefined;
+    let price: number | undefined;
+
+    try {
+      const order = await this.exchange!.fetchOrder(orderId, market);
+      filled = Number(order?.filled ?? 0);
+      const raw = order?.average ?? order?.price;
+      price = raw === undefined ? undefined : Number(raw);
+    } catch {
+      // The order is gone from the live book and not yet in history.
+    }
+
+    if (filled !== undefined && filled > 0) {
+      NotificationManager.notify('', NType.SUCCESS, 'FILL', undefined, {
+        side: side.toUpperCase(),
+        quantity: this.formatQuantity(filled),
+        price:
+          price === undefined ? undefined : this.formatPriceForDisplay(market, price),
+        status: filled + 1e-9 >= requested ? 'FILLED' : 'PARTIAL',
+      });
+    }
+
+    const remainder = filled === undefined ? undefined : requested - filled;
+
+    finish(
+      remainder !== undefined && remainder > 1e-9
+        ? `Chase ended with ${this.formatQuantity(remainder)} unfilled.`
+        : filled === undefined
+        ? 'Chase ended: the order is no longer on the exchange.'
+        : ''
+    );
   }
 
   async editOrder(

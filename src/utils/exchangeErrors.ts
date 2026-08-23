@@ -24,6 +24,7 @@ const KNOWN_CODES: Record<string, string> = {
   TE_POS_ZERO_CANNOT_CREATE_TP_SL_ORDER: 'No position available to protect',
   TE_CANNOT_UPDATE_ORDER_STATUS: 'Order can no longer be changed',
   TE_ORDER_NOT_EXIST: 'Order no longer exists',
+  OM_ORDER_NOT_FOUND: 'Order no longer exists',
   TE_NO_ENOUGH_AVAILABLE_BALANCE: 'Insufficient margin',
   TE_INVALID_ORDER_QTY: 'Invalid quantity',
   TE_INVALID_PRICE: 'Invalid price',
@@ -36,10 +37,30 @@ function findCode(raw: string): string | undefined {
   const fromJson = raw.match(/"msg"\s*:\s*"([A-Z_0-9]+)"/);
   if (fromJson) return fromJson[1];
 
-  const bare = raw.match(/\b(TE_[A-Z_0-9]+)\b/);
+  const bare = raw.match(/\b((?:TE|OM|OR)_[A-Z_0-9]+)\b/);
   if (bare) return bare[1];
 
   return undefined;
+}
+
+/**
+ * Whether the exchange is saying the order is gone.
+ *
+ * Punctuation is stripped before matching: the same condition arrives as
+ * 'OM_ORDER_NOT_FOUND', 'TE_ORDER_NOT_EXIST' and 'cannot find order' depending
+ * on the endpoint, and a pattern written for one of those spellings silently
+ * fails on the others.
+ */
+export function isMissingOrderError(error: unknown): boolean {
+  const raw = error instanceof Error ? error.message : String(error);
+  const flattened = raw.toLowerCase().replace(/[^a-z]/g, '');
+
+  return (
+    flattened.includes('ordernotfound') ||
+    flattened.includes('ordernotexist') ||
+    flattened.includes('cannotfindorder') ||
+    flattened.includes('orderwasneverplaced')
+  );
 }
 
 export function describeExchangeError(error: unknown): ExchangeFailure {
