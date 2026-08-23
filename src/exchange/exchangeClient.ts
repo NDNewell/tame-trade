@@ -69,6 +69,8 @@ export class ExchangeClient {
   private accountLabel: string | undefined;
   private equityCache: { at: number; currency: string; equity?: number } | undefined;
   private accountLookupDone = false;
+  /** The market being followed, so account lookups know which wallet to ask for. */
+  private lastFollowedMarket: string | undefined;
   private orderStreams = new Map<
     string,
     {
@@ -589,7 +591,9 @@ export class ExchangeClient {
     this.accountLookupDone = true;
 
     try {
-      const balance: any = await this.exchange!.fetchBalance();
+      const balance: any = await this.fetchAccountSnapshot(
+        this.availableMarkets?.[this.lastFollowedMarket ?? '']?.settle
+      );
       const info = balance?.info?.data ?? balance?.info ?? {};
       const account = info.account ?? info;
 
@@ -614,6 +618,19 @@ export class ExchangeClient {
   private static readonly EQUITY_CACHE_MS = 10000;
 
   /**
+   * Balance for a settlement currency.
+   *
+   * The client is configured with defaultType 'future', which ccxt rejects for
+   * this call -- it accepts only 'spot' and 'swap' -- so every balance lookup
+   * was throwing before it reached the exchange. The type and settlement
+   * currency are named explicitly here rather than inherited.
+   */
+  private async fetchAccountSnapshot(currency?: string): Promise<any> {
+    const settle = currency ?? 'USDT';
+    return this.exchange!.fetchBalance({ type: 'swap', code: settle });
+  }
+
+  /**
    * Account balance in a settlement currency, cached briefly.
    *
    * Effective leverage needs account equity, and the balance call is
@@ -631,7 +648,7 @@ export class ExchangeClient {
 
     let equity: number | undefined;
     try {
-      const balance: any = await this.exchange!.fetchBalance();
+      const balance: any = await this.fetchAccountSnapshot(currency);
       const total = balance?.total?.[currency];
       equity = Number.isFinite(Number(total)) ? Number(total) : undefined;
     } catch {
@@ -1023,6 +1040,7 @@ export class ExchangeClient {
   // changes, so fills and rejections are reported for whatever is being traded
   // without any command having to ask for them.
   public followMarket(market: string, params?: Record<string, any>): void {
+    this.lastFollowedMarket = market;
     this.stopTickerStream();
     this.stopOrderStream();
     this.startTickerStream(market);
