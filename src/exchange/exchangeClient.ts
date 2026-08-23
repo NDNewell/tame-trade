@@ -429,7 +429,12 @@ export class ExchangeClient {
    * USDT-settled markets report real values ('Rv'); inverse markets report them
    * scaled ('Ev'), by the exchange's fixed 1e8 factor.
    */
-  private readRealizedPnl(info: Record<string, any>): number | undefined {
+  private readRealizedPnl(position: Record<string, any>): number | undefined {
+    // The realized figure lives in the raw exchange payload, not on the parsed
+    // position -- unlike leverage and liquidation price, which ccxt lifts to the
+    // top level. Both shapes are accepted because getPositionStructure has
+    // several fallback paths that return differently shaped objects.
+    const info = position?.info ?? position;
     const real = info?.curTermRealisedPnlRv ?? info?.cumClosedPnlRv;
     if (real !== undefined && real !== null && Number.isFinite(Number(real))) {
       return Number(real);
