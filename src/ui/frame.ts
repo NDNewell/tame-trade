@@ -255,8 +255,10 @@ const statusColor = (status: string): Color | undefined => {
   switch (status.trim().toUpperCase()) {
     case 'FILLED':
       return 'green';
+    // Active and healthy: the accent, not the warning colour.
     case 'WORKING':
     case 'TRACKING':
+      return 'cyan';
     case 'PARTIAL':
       return 'yellow';
     case 'REJECTED':
@@ -692,7 +694,11 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
     .put(col1 + 5, market.last, PRIMARY, col2);
   field(primaryRow, col2, 'Bid', market.bid, col3);
   field(primaryRow, col3, 'Ask', market.ask, col4);
-  primaryRow.put(col4, market.change, signedColor(market.change), inner);
+  if (market.change && market.change !== NO_VALUE) {
+    primaryRow
+      .put(col4, '24h', MUTED, col4 + 4)
+      .put(col4 + 4, market.change, signedColor(market.change), inner);
+  }
   lines.push(primaryRow);
 
   const secondaryRow = new Line(width);
@@ -762,7 +768,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   const oType = oPrice + 9;
   const oStatus = oType + 7;
 
-  const valueCol = 19;
+  const valueCol = 17;
   const bodyRows = Math.max(1, splitRows - 1); // first row of the block is a gap
 
   for (let row = 0; row < bodyRows; row++) {

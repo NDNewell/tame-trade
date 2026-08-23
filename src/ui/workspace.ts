@@ -29,6 +29,21 @@ const formatQuantity = (value: number): string => {
   return String(Number(value.toFixed(8)));
 };
 
+/**
+ * Position size with digit grouping and its base asset, so a four-figure size is
+ * readable at a glance and the panel says what it is holding without the reader
+ * looking back at the header. No trailing zeros are added for alignment.
+ */
+const formatPositionSize = (value: number, base?: string): string => {
+  if (!Number.isFinite(value)) return NO_VALUE;
+
+  const grouped = Number(value.toFixed(8)).toLocaleString('en-US', {
+    maximumFractionDigits: 8,
+  });
+
+  return base ? `${grouped} ${base}` : grouped;
+};
+
 const signed = (value: unknown): string => {
   if (value === undefined || value === null || value === '') return NO_VALUE;
   const numeric = Number(value);
@@ -139,13 +154,22 @@ export class Workspace {
 
       const price = await this.client.getDisplayPrice(this.market);
 
+      // Quoted prices follow the instrument's tick, so the column doesn't mix
+      // 95.1 with 94.59. Calculated values keep their own precision.
+      const tick = (value: unknown): string =>
+        value === undefined || value === null || value === ''
+          ? NO_VALUE
+          : this.client.formatPriceForDisplay(this.market, Number(value));
+
+      const base = this.client.getBaseAsset(this.market);
+
       this.screen.update({
         market: {
           symbol,
-          last: dash(price.last),
+          last: tick(price.last),
           change: price.change ?? NO_VALUE,
-          bid: dash(price.bid),
-          ask: dash(price.ask),
+          bid: tick(price.bid),
+          ask: tick(price.ask),
           mark: NO_VALUE,
           index: NO_VALUE,
           funding: dash(price.funding),
@@ -154,9 +178,14 @@ export class Workspace {
         position: position
           ? {
               side: position.side || NO_VALUE,
-              size: `${position.size}`,
-              entry: position.entry !== undefined ? position.entry.toFixed(4).replace(/0+$/, '').replace(/\.$/, '') : NO_VALUE,
-              mark: dash(price.last),
+              size: formatPositionSize(position.size, base),
+              // Average entry is a calculated value and keeps the precision
+              // needed to represent the true average, unlike a quoted price.
+              entry:
+                position.entry !== undefined
+                  ? String(Number(position.entry.toFixed(6)))
+                  : NO_VALUE,
+              mark: tick(price.last),
               unrealizedPnl:
                 position.unrealizedPnl !== undefined
                   ? `${signed(position.unrealizedPnl)}${position.currency ? ` ${position.currency}` : ''}`
@@ -196,7 +225,11 @@ export class Workspace {
             // An order covering the whole position carries a quantity of zero.
             // 'ALL' says what that means; '0' reads as an empty order.
             qty: size > 0 ? formatQuantity(size) : isTrigger ? 'ALL' : NO_VALUE,
-            price: isTrigger ? String(trigger) : String(order.price ?? NO_VALUE),
+            price: isTrigger
+              ? tick(trigger)
+              : order.price !== undefined
+              ? tick(order.price)
+              : NO_VALUE,
             type,
             status,
           };

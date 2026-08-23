@@ -669,15 +669,55 @@ export class ExchangeClient {
     }
   }
 
-  /** Rounds a price to the market's own tick, so fills don't show raw floats. */
+  /** The instrument's base asset, for labelling quantities. */
+  getBaseAsset(market: string): string | undefined {
+    const info = this.availableMarkets?.[market];
+    const base = info?.base ?? market.split('/')[0];
+    return base ? String(base) : undefined;
+  }
+
+  /**
+   * How many decimals the instrument's prices are quoted to.
+   *
+   * ccxt reports precision either as a tick size (0.01, 0.5) or as a count of
+   * decimal places, depending on the exchange, so both are handled.
+   */
+  private priceDecimals(market: string): number | undefined {
+    const tick = this.availableMarkets?.[market]?.precision?.price;
+    if (tick === undefined || tick === null) return undefined;
+
+    const value = Number(tick);
+    if (!Number.isFinite(value) || value <= 0) return undefined;
+
+    // A tick-size mode exchange reports the smallest price step.
+    if ((this.exchange as any)?.precisionMode === 4 || value < 1) {
+      const decimals = String(value).split('.')[1]?.length ?? 0;
+      return decimals;
+    }
+
+    return Math.round(value);
+  }
+
+  /**
+   * A price at the instrument's own precision, for display.
+   *
+   * priceToPrecision rounds to the tick but does not pad, so a column would
+   * otherwise mix 95.1 with 94.59. Padding to the instrument's decimals keeps
+   * quoted prices reading as one set of numbers. Display only -- no stored or
+   * calculated value is changed.
+   */
   formatPriceForDisplay(market: string, price: number): string {
     if (!Number.isFinite(price)) return String(price);
 
+    let rounded = price;
     try {
-      return this.exchange!.priceToPrecision(market, price);
+      rounded = Number(this.exchange!.priceToPrecision(market, price));
     } catch {
-      return String(Math.round(price * 10000) / 10000);
+      rounded = Math.round(price * 10000) / 10000;
     }
+
+    const decimals = this.priceDecimals(market);
+    return decimals === undefined ? String(rounded) : rounded.toFixed(decimals);
   }
 
   /**
