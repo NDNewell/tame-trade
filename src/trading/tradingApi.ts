@@ -1,6 +1,6 @@
 // src/trading/tradingApi.ts
 
-import { ExchangeClient } from '../exchange/exchangeClient';
+import { ExchangeClient } from '../exchange/exchangeClient.js';
 
 export class TradingApi {
   exchangeClient: ExchangeClient;

@@ -1,0 +1,40 @@
++------------------------------------------------------------------------------+
+| TRADING TERMINAL                                         LIVE | CONNECTED     |
+| Phemex | SOL/USDT:USDT | Perpetual                     Account: MAIN         |
++------------------------------------------------------------------------------+
+| MARKET                                                                       |
+| SOL/USDT          142.87        +1.42%       Bid 142.86       Ask 142.88      |
+| Mark 142.84       Index 142.91                Funding 0.0100%   Spread 0.02    |
++---------------------------------------+--------------------------------------+
+| POSITION                              | ACTIVE ORDERS                        |
+|                                       |                                      |
+| Side             LONG                | ID       SIDE   QTY    PRICE   STATUS |
+| Size             1.000 SOL           | 84102    SELL   1.0    142.91  WORKING|
+| Entry            142.32              |                                      |
+| Mark             142.87              |                                      |
+| Unrealized PnL   +0.55 USDT          |                                      |
+| Realized PnL     +0.00 USDT          |                                      |
+| Leverage         5x                  |                                      |
+| Liquidation      118.42              |                                      |
++---------------------------------------+--------------------------------------+
+| CHASE                                                                        |
+| SELL 1.000 SOL                                                               |
+| Target      Best Ask      Working 142.91      Reprices 14      Elapsed 00:07 |
+| Status      TRACKING                                                         |
++------------------------------------------------------------------------------+
+| ACTIVITY                                                                     |
+| 03:22:11  SYSTEM   Connected to Phemex                                       |
+| 03:22:12  MARKET   SOL/USDT selected                                         |
+| 03:23:41  ORDER    BUY  1.000 SOL | CHASE | submitted                       |
+| 03:23:42  FILL     BUY  1.000 SOL @ 142.32                                  |
+| 03:24:08  ORDER    SELL 1.000 SOL | CHASE | submitted                       |
+| 03:24:12  ORDER    Chase tracking best ask @ 142.91                         |
+|                                                                              |
+|                                                                              |
+|                                                                              |
+|                                                                              |
++------------------------------------------------------------------------------+
+| > chase sell 1_                                                             |
++------------------------------------------------------------------------------+
+| buy  sell  chase  limit  cancel  orders  positions  market  help      Ctrl+C |
++------------------------------------------------------------------------------+
