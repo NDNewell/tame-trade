@@ -381,9 +381,7 @@ export class ExchangeClient {
       leverage: Number(info.leverage) || undefined,
       effectiveLeverage: await this.getEffectiveLeverage(
         market,
-        contracts,
-        mark,
-        unrealizedPnl,
+        Math.abs(Number(position.notional ?? info.valueRv ?? NaN)),
         currency
       ),
       liquidation: Number(info.liquidationPrice) || undefined,
@@ -395,34 +393,29 @@ export class ExchangeClient {
    * Effective leverage: what the position is actually levered at right now, as
    * opposed to the leverage the account is configured for.
    *
-   * Phemex reports only the configured figure, so this is derived from the
-   * position's notional against account equity -- the standard cross-margin
-   * reading, where equity is the balance plus what the position is currently up
-   * or down. Undefined when equity can't be established, since a number that
-   * looks authoritative and isn't would be worse than an honest gap.
+   * Phemex reports only the configured figure, so this is derived: the
+   * position's notional over the wallet balance.
+   *
+   * Unrealized PnL is deliberately excluded from the denominator. Including it
+   * put the figure a few percent under what Phemex displays -- with a position
+   * showing +193 against a 3,737 balance, this read 23.82x where the exchange
+   * said 25.05x, a gap that is exactly the size of the unrealized amount. The
+   * exchange divides by wallet balance, so this does too: a figure that
+   * disagrees with the one on the exchange screen is worse than no figure.
+   *
+   * Undefined when the balance can't be established.
    */
   private async getEffectiveLeverage(
     market: string,
-    contracts: number,
-    markPrice: number | undefined,
-    unrealizedPnl: number | undefined,
+    notional: number | undefined,
     currency: string
   ): Promise<number | undefined> {
-    if (!(contracts > 0) || markPrice === undefined || !(markPrice > 0)) return undefined;
+    if (notional === undefined || !(notional > 0)) return undefined;
 
     const balance = await this.getAccountBalance(currency);
-    if (balance === undefined) return undefined;
+    if (balance === undefined || !(balance > 0)) return undefined;
 
-    const equity = balance + (unrealizedPnl ?? 0);
-    if (!(equity > 0)) return undefined;
-
-    try {
-      const { notional } = await this.calculateNotional(market, contracts, markPrice);
-      if (!(notional > 0)) return undefined;
-      return notional / equity;
-    } catch {
-      return undefined;
-    }
+    return notional / balance;
   }
 
   /**
