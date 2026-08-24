@@ -11,7 +11,7 @@
 // strings, so styling can never shift a column, and every coloured value keeps a
 // textual label so colour is never the only carrier of meaning.
 
-import { formatOutput as fo, Color } from '../utils/formatOutput.js';
+import { formatOutput as fo, Color, FontStyle } from '../utils/formatOutput.js';
 
 /** Below this the desktop composition can't hold together. */
 export const MIN_WIDTH = 72;
@@ -186,18 +186,47 @@ const ASCII_BOX: BoxChars = {
 const box: BoxChars = canRenderUnicode() ? UNICODE_BOX : ASCII_BOX;
 
 /**
- * (5) Three levels of prominence, so headings are findable without competing
- * with the numbers: muted for metadata and empty states, plain white for
- * section headings, bright for the values actually being traded on.
+ * A styling role: colour, and optionally weight.
+ *
+ * Weight is part of the vocabulary because colour alone had run out. Cyan,
+ * green, yellow and red all carry meaning here -- active, good, warning, bad --
+ * so a heading cannot take a hue without claiming one of those meanings. Bold
+ * says "this is structure, not data" without saying anything about the data.
  */
-const MUTED: Color = 'gray';
-const HEADING_COLOR: Color = 'white';
-const PRIMARY: Color = 'brightWhite';
+export type Paint = Color | { color: Color; font?: FontStyle };
+
+const asPaint = (paint: Paint): { color: Color; font?: FontStyle } =>
+  typeof paint === 'string' ? { color: paint } : paint;
+
+/**
+ * (5) The whole vocabulary. Four roles, and every piece of text on the screen
+ * takes one of them, so the same kind of thing looks the same everywhere
+ * regardless of which panel it lands in.
+ *
+ * The tiers are ordered by weight and brightness rather than by hue:
+ *
+ *   SECTION  bold, brightest   the name of a region -- MARKET, POSITION
+ *   HEADLINE bright            the one number a panel exists to show
+ *   VALUE    normal            data
+ *   LABEL    dim               the words naming that data
+ *
+ * Labels are deliberately the quietest thing on screen. They are read once to
+ * learn the layout and then skipped forever; the values beside them are read
+ * on every glance. Anything that carries meaning -- a side, a status, a signed
+ * PnL -- overrides VALUE with its semantic colour.
+ */
+const SECTION: Paint = { color: 'brightWhite', font: 'bold' };
+const HEADLINE: Paint = 'brightWhite';
+const VALUE: Paint = 'white';
+const LABEL: Paint = 'gray';
+/** Chrome: timestamps, empty states, the command hints. Quiet as labels. */
+const MUTED: Paint = 'gray';
 
 interface Span {
   col: number;
   length: number;
   color: Color;
+  font?: FontStyle;
 }
 
 class Line {
@@ -217,7 +246,7 @@ class Line {
     return this;
   }
 
-  put(col: number, text: string | undefined, color?: Color, limit?: number): this {
+  put(col: number, text: string | undefined, paint?: Paint, limit?: number): this {
     if (text === undefined || text === null) return this;
 
     const stop = Math.min(limit ?? this.width - 1, this.width);
@@ -225,17 +254,19 @@ class Line {
     const clipped = String(text).slice(0, room);
 
     for (let i = 0; i < clipped.length; i++) this.chars[col + i] = clipped[i];
-    if (color && clipped.length > 0) this.spans.push({ col, length: clipped.length, color });
+    if (paint && clipped.length > 0) {
+      this.spans.push({ col, length: clipped.length, ...asPaint(paint) });
+    }
 
     return this;
   }
 
   /** Right-aligns text so its last character sits at `end - 1`. */
-  putRight(end: number, text: string | undefined, color?: Color, floor = 1): this {
+  putRight(end: number, text: string | undefined, paint?: Paint, floor = 1): this {
     if (text === undefined || text === null) return this;
     const value = String(text);
     const col = Math.max(floor, end - value.length);
-    return this.put(col, value.slice(0, end - col), color, end);
+    return this.put(col, value.slice(0, end - col), paint, end);
   }
 
   plain(): string {
@@ -252,12 +283,48 @@ class Line {
     for (const span of ordered) {
       if (span.col < cursor) continue;
       out += this.chars.slice(cursor, span.col).join('');
-      out += fo(this.chars.slice(span.col, span.col + span.length).join(''), span.color);
+      out += fo(
+        this.chars.slice(span.col, span.col + span.length).join(''),
+        span.color,
+        span.font
+      );
       cursor = span.col + span.length;
     }
 
     return out + this.chars.slice(cursor).join('');
   }
+}
+
+/**
+ * A label and the value it names, styled as a pair.
+ *
+ * Every labelled field on the screen goes through here. That is the point: the
+ * consistency is enforced by there being one place that decides it, rather than
+ * by each panel remembering to do the same thing.
+ */
+function labelledAt(
+  line: Line,
+  col: number,
+  label: string,
+  valueCol: number,
+  value: string | undefined,
+  limit: number,
+  paint: Paint = VALUE
+): Line {
+  line.put(col, label, LABEL, Math.min(col + label.length + 1, valueCol));
+  return line.put(valueCol, value, paint, limit);
+}
+
+/** The same pair, with the value following its label directly. */
+function labelled(
+  line: Line,
+  col: number,
+  label: string,
+  value: string | undefined,
+  limit: number,
+  paint: Paint = VALUE
+): Line {
+  return labelledAt(line, col, label, col + label.length + 1, value, limit, paint);
 }
 
 const sideColor = (side: string): Color | undefined => {
@@ -366,39 +433,70 @@ export function planHeight(height: number, hasChase: boolean) {
  * The unit is printed once, on whichever figure ends up last, rather than
  * repeated on both.
  */
-function headerFunds(header: HeaderView, available: number): string {
+interface FundsPart {
+  label: string;
+  value: string;
+}
+
+/** Width of a rendered run of parts, including the gaps between them. */
+const fundsWidth = (parts: FundsPart[]): number =>
+  parts.reduce((sum, part) => sum + part.label.length + 1 + part.value.length, 0) +
+  Math.max(0, parts.length - 1) * FUNDS_GAP;
+
+const FUNDS_GAP = 3;
+
+function headerFunds(header: HeaderView, available: number): FundsPart[] {
   const has = (value: string): boolean =>
     value !== undefined && value !== '' && value !== NO_VALUE;
 
-  const balance = has(header.balance) ? `Balance ${header.balance}` : '';
-  const equity = has(header.equity) ? `Equity ${header.equity}` : '';
-  const account = has(header.account) ? `Account: ${header.account}` : '';
+  const balance: FundsPart | null = has(header.balance)
+    ? { label: 'Balance', value: header.balance }
+    : null;
+  const equity: FundsPart | null = has(header.equity)
+    ? { label: 'Equity', value: header.equity }
+    : null;
+  const account: FundsPart | null = has(header.account)
+    ? { label: 'Account', value: header.account }
+    : null;
 
   // Widest form first; each fallback drops the least actionable part still
   // present. Figures are kept separate from the account so the unit can be
   // attached to the last figure actually shown -- appending it blindly would
   // leave a bare unit standing where a missing figure should have been.
-  const forms: Array<[string[], string[]]> = [
-    [[balance, equity], [account]],
-    [[balance, equity], []],
-    [[equity], []],
-    [[balance], []],
+  const forms: Array<Array<FundsPart | null>> = [
+    [balance, equity, account],
+    [balance, equity],
+    [equity],
+    [balance],
   ];
 
-  for (const [figures, trailing] of forms) {
-    const shown = figures.filter((part) => part.length > 0);
-    if (shown.length === 0) continue;
+  for (const form of forms) {
+    const parts = form.filter((part): part is FundsPart => part !== null);
+    if (parts.length === 0) continue;
 
-    if (header.fundsCurrency) {
-      shown[shown.length - 1] = `${shown[shown.length - 1]} ${header.fundsCurrency}`;
-    }
+    const figures = parts.filter((part) => part !== account);
+    const shown = parts.map((part) =>
+      header.fundsCurrency && part === figures[figures.length - 1]
+        ? { ...part, value: `${part.value} ${header.fundsCurrency}` }
+        : { ...part }
+    );
 
-    const text = [...shown, ...trailing.filter((part) => part.length > 0)].join('   ');
-    if (text.length <= available) return text;
+    if (fundsWidth(shown) <= available) return shown;
   }
 
   // No figure fits, but the account still identifies where the operator is.
-  return account.length > 0 && account.length <= available ? account : '';
+  return account && fundsWidth([account]) <= available ? [account] : [];
+}
+
+/** Right-aligns a run of labelled figures, ending at `end`. */
+function putFunds(line: Line, end: number, parts: FundsPart[]): Line {
+  let col = end - fundsWidth(parts);
+  for (const part of parts) {
+    const width = part.label.length + 1 + part.value.length;
+    labelled(line, col, part.label, part.value, col + width);
+    col += width + FUNDS_GAP;
+  }
+  return line;
 }
 
 function confirmationBlock(
@@ -419,16 +517,12 @@ function confirmationBlock(
   };
 
   const body: Line[] = [
-    new Line(width).put(2, 'CONFIRM ORDER', 'yellow'),
+    new Line(width).put(2, 'CONFIRM ORDER', { color: 'yellow', font: 'bold' }),
     new Line(width).put(2, confirmation.action, sideColor(confirmation.action.split(' ')[0])),
     new Line(width),
-    new Line(width).put(2, 'Size', undefined, valueCol).put(valueCol, confirmation.size, undefined, inner),
-    new Line(width)
-      .put(2, 'Est. Value', undefined, valueCol)
-      .put(valueCol, confirmation.estimatedValue, undefined, inner),
-    new Line(width)
-      .put(2, 'Est. Fee', undefined, valueCol)
-      .put(valueCol, confirmation.estimatedFee, undefined, inner),
+    labelledAt(new Line(width), 2, 'Size', valueCol, confirmation.size, inner),
+    labelledAt(new Line(width), 2, 'Est. Value', valueCol, confirmation.estimatedValue, inner),
+    labelledAt(new Line(width), 2, 'Est. Fee', valueCol, confirmation.estimatedFee, inner),
     new Line(width),
     new Line(width).put(2, confirmation.warning, 'yellow', inner),
     new Line(width).put(2, confirmation.prompt, 'yellow', inner),
@@ -485,26 +579,26 @@ function activityRow(
 
   const detail = event.detail;
   if (!detail) {
-    line.put(cSide, event.message, undefined, inner);
+    line.put(cSide, event.message, VALUE, inner);
     return line;
   }
 
   if (detail.side) line.put(cSide, detail.side, sideColor(detail.side), cQty);
-  if (detail.quantity) line.putRight(cPrice - 2, detail.quantity, undefined, cQty);
-  if (detail.price) line.putRight(cStatus - 2, detail.price, undefined, cPrice);
+  if (detail.quantity) line.putRight(cPrice - 2, detail.quantity, VALUE, cQty);
+  if (detail.price) line.putRight(cStatus - 2, detail.price, VALUE, cPrice);
   if (detail.status) line.put(cStatus, detail.status, statusColor(detail.status), inner);
 
   // Anything the columns don't cover follows them rather than being lost.
   if (event.message) {
     const after = detail.status ? cStatus + detail.status.length + 2 : cStatus;
-    line.put(after, event.message, MUTED, inner);
+    line.put(after, event.message, VALUE, inner);
   }
 
   return line;
 }
 
 function activityLabel(view: TerminalView, width: number, rows: number): Line {
-  const line = new Line(width).put(2, 'ACTIVITY', HEADING_COLOR);
+  const line = new Line(width).put(2, 'ACTIVITY', SECTION);
   const offset = view.activityOffset ?? 0;
 
   if (offset > 0) {
@@ -570,7 +664,7 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
       ? position.risk
       : position.riskShort ?? position.risk
     : '';
-  const riskColor: Color | undefined = !position
+  const riskColor: Paint | undefined = !position
     ? undefined
     : position.risk === NO_VALUE || position.risk.startsWith(NO_VALUE)
     ? MUTED
@@ -578,7 +672,7 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
     ? undefined
     : 'yellow';
 
-  const positionFields: Array<[string, string, Color | undefined]> = position
+  const positionFields: Array<[string, string, Paint | undefined]> = position
     ? [
         ['Side', position.side, sideColor(position.side)],
         ['Size', position.size, undefined],
@@ -602,8 +696,8 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
   lines.push(border());
   lines.push(
     new Line(width)
-      .put(2, 'TRADING TERMINAL', undefined, inner - 22)
-      .putRight(inner - 1, `${header.environment} | ${header.connection}`, undefined, 20)
+      .put(2, 'TRADING TERMINAL', SECTION, inner - 22)
+      .putRight(inner - 1, `${header.environment} | ${header.connection}`, LABEL, 20)
       .put(
         inner - 1 - header.connection.length,
         header.connection,
@@ -612,48 +706,49 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
   );
   const identity = `${header.exchange} | ${header.symbol}`;
   const stackedFunds = headerFunds(header, inner - 3 - identity.length - 2);
-  lines.push(
-    new Line(width)
-      .put(2, identity, undefined, inner - 1 - stackedFunds.length - 2)
-      .putRight(inner - 1, stackedFunds)
+  const identityLine = new Line(width).put(
+    2,
+    identity,
+    VALUE,
+    inner - 1 - fundsWidth(stackedFunds) - 2
   );
+  lines.push(putFunds(identityLine, inner - 1, stackedFunds));
 
   lines.push(border());
-  lines.push(new Line(width).put(2, 'MARKET', HEADING_COLOR));
+  lines.push(new Line(width).put(2, 'MARKET', SECTION));
   lines.push(
     new Line(width)
-      .put(2, market.symbol, HEADING_COLOR, 16)
-      .put(16, market.last, PRIMARY, 26)
+      .put(2, market.symbol, HEADLINE, 16)
+      .put(16, market.last, HEADLINE, 26)
       .put(26, market.change, signedColor(market.change), inner)
   );
-  lines.push(
-    new Line(width)
-      .put(2, `Bid ${market.bid}`, undefined, 16)
-      .put(16, `Ask ${market.ask}`, undefined, 30)
-      .put(30, `Mark ${market.mark}`, undefined, 45)
-      .put(45, `Spread ${market.spread}`, undefined, inner)
-  );
+  const secondary = new Line(width);
+  labelled(secondary, 2, 'Bid', market.bid, 16);
+  labelled(secondary, 16, 'Ask', market.ask, 30);
+  labelled(secondary, 30, 'Mark', market.mark, 45);
+  labelled(secondary, 45, 'Spread', market.spread, inner);
+  lines.push(secondary);
 
   lines.push(border());
-  lines.push(new Line(width).put(2, 'POSITION', HEADING_COLOR));
+  lines.push(new Line(width).put(2, 'POSITION', SECTION));
   if (positionFields.length === 0) {
     lines.push(new Line(width).put(2, 'No open position', MUTED, inner));
   } else {
-    for (const [label, value, color] of positionFields) {
-      lines.push(new Line(width).put(2, label, undefined, 19).put(19, value, color, inner));
+    for (const [label, value, paint] of positionFields) {
+      lines.push(labelledAt(new Line(width), 2, label, 19, value, inner, paint ?? VALUE));
     }
   }
 
   lines.push(border());
-  lines.push(new Line(width).put(2, 'ACTIVE ORDERS', HEADING_COLOR));
+  lines.push(new Line(width).put(2, 'ACTIVE ORDERS', SECTION));
   const c1 = 2, c2 = 10, c3 = 17, c4 = 24, c5 = 33;
   lines.push(
     new Line(width)
-      .put(c1, 'ID', 'gray', c2)
-      .put(c2, 'SIDE', 'gray', c3)
-      .put(c3, 'QTY', 'gray', c4)
-      .put(c4, 'PRICE', 'gray', c5)
-      .put(c5, 'STATUS', 'gray', inner)
+      .put(c1, 'ID', LABEL, c2)
+      .put(c2, 'SIDE', LABEL, c3)
+      .put(c3, 'QTY', LABEL, c4)
+      .put(c4, 'PRICE', LABEL, c5)
+      .put(c5, 'STATUS', LABEL, inner)
   );
   if (orderRows === 0) {
     lines.push(new Line(width).put(2, 'No active orders', MUTED, inner));
@@ -661,10 +756,10 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
     for (const order of orders.slice(0, orderRows)) {
       lines.push(
         new Line(width)
-          .put(c1, order.id, undefined, c2)
+          .put(c1, order.id, VALUE, c2)
           .put(c2, order.side, sideColor(order.side), c3)
-          .put(c3, order.qty, undefined, c4)
-          .put(c4, order.price, undefined, c5)
+          .put(c3, order.qty, VALUE, c4)
+          .put(c4, order.price, VALUE, c5)
           .put(c5, order.status, statusColor(order.status), inner)
       );
     }
@@ -672,12 +767,12 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
 
   if (chase) {
     lines.push(border());
-    lines.push(new Line(width).put(2, 'CHASE', HEADING_COLOR));
-    lines.push(new Line(width).put(2, chase.side, sideColor(chase.side), 7).put(7, chase.quantity, undefined, inner));
+    lines.push(new Line(width).put(2, 'CHASE', SECTION));
+    lines.push(new Line(width).put(2, chase.side, sideColor(chase.side), 7).put(7, chase.quantity, VALUE, inner));
     const summary = `Working ${chase.working} | Reprices ${chase.reprices} | ${chase.elapsed} | `;
     lines.push(
       new Line(width)
-        .put(2, summary, undefined, inner)
+        .put(2, summary, LABEL, inner)
         .put(Math.min(2 + summary.length, inner - 1), chase.status, statusColor(chase.status), inner)
     );
   }
@@ -692,13 +787,13 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
       line
         .put(2, event.time.slice(0, 11), 'gray', 14)
         .put(14, event.category, categoryColor(event.category), 21)
-        .put(21, event.message, undefined, inner);
+        .put(21, event.message, VALUE, inner);
     }
     lines.push(line);
   }
 
   lines.push(border());
-  lines.push(new Line(width).put(2, '>', 'cyan').put(4, view.input, undefined, inner));
+  lines.push(new Line(width).put(2, '>', 'cyan').put(4, view.input, HEADLINE, inner));
 
   lines.push(border());
   lines.push(footerRow(view, width, inner));
@@ -746,8 +841,8 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   const connectionText = `${header.environment} | ${header.connection}`;
   lines.push(
     new Line(width)
-      .put(2, 'TRADING TERMINAL')
-      .putRight(inner - 1, connectionText, undefined, 20)
+      .put(2, 'TRADING TERMINAL', SECTION)
+      .putRight(inner - 1, connectionText, LABEL, 20)
       .put(
         inner - 1 - header.connection.length,
         header.connection,
@@ -760,15 +855,17 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
     .join(' | ');
   // Three columns of gap keeps the figures from reading as part of the symbol.
   const funds = headerFunds(header, inner - 3 - context.length - 3);
-  lines.push(
-    new Line(width)
-      .put(2, context, undefined, inner - 1 - funds.length - 3)
-      .putRight(inner - 1, funds)
+  const fundsLine = new Line(width).put(
+    2,
+    context,
+    VALUE,
+    inner - 1 - fundsWidth(funds) - 3
   );
+  lines.push(putFunds(fundsLine, inner - 1, funds));
 
   // --- market: symbol and last price lead, the rest supports -------------
   lines.push(border());
-  lines.push(new Line(width).put(2, 'MARKET', HEADING_COLOR));
+  lines.push(new Line(width).put(2, 'MARKET', SECTION));
 
   // Four evenly spaced columns, so the primary and secondary rows line up with
   // each other and every value keeps a fixed starting position.
@@ -779,20 +876,14 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   const col4 = col3 + span;
 
   const field = (line: Line, col: number, label: string, value: string, limit: number) =>
-    line
-      .put(col, label, MUTED, col + label.length + 1)
-      .put(col + label.length + 1, value, undefined, limit);
+    labelled(line, col, label, value, limit);
 
-  const primaryRow = new Line(width).put(2, market.symbol, HEADING_COLOR, col1);
-  primaryRow
-    .put(col1, 'Last', MUTED, col1 + 5)
-    .put(col1 + 5, market.last, PRIMARY, col2);
+  const primaryRow = new Line(width).put(2, market.symbol, HEADLINE, col1);
+  labelled(primaryRow, col1, 'Last', market.last, col2, HEADLINE);
   field(primaryRow, col2, 'Bid', market.bid, col3);
   field(primaryRow, col3, 'Ask', market.ask, col4);
   if (market.change && market.change !== NO_VALUE) {
-    primaryRow
-      .put(col4, '24h', MUTED, col4 + 4)
-      .put(col4 + 4, market.change, signedColor(market.change), inner);
+    labelled(primaryRow, col4, '24h', market.change, inner, signedColor(market.change) ?? VALUE);
   }
   lines.push(primaryRow);
 
@@ -803,16 +894,14 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   field(secondaryRow, 2, 'Mark', market.mark, col1);
   field(secondaryRow, col1, 'Index', market.index, col2);
   field(secondaryRow, col2, 'Funding', market.funding, spreadCol - 1);
-  secondaryRow
-    .put(spreadCol, 'Spread', MUTED, spreadCol + 7)
-    .put(spreadCol + 7, market.spread, undefined, inner);
+  labelled(secondaryRow, spreadCol, 'Spread', market.spread, inner);
   lines.push(secondaryRow);
 
   // --- confirmation takes the place of position/orders when pending --------
   if (view.confirmation) {
     lines.push(...confirmationBlock(view.confirmation, width, splitRows + 1));
     lines.push(border());
-    lines.push(new Line(width).put(2, 'ACTIVITY', HEADING_COLOR));
+    lines.push(new Line(width).put(2, 'ACTIVITY', SECTION));
     const pending = activity.slice(-activityRows);
     for (let row = 0; row < activityRows; row++) {
       const line = new Line(width);
@@ -821,12 +910,12 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
         line
           .put(2, event.time, 'gray', 11)
           .put(12, event.category, categoryColor(event.category), 20)
-          .put(21, event.message, undefined, inner);
+          .put(21, event.message, VALUE, inner);
       }
       lines.push(line);
     }
     lines.push(border());
-    lines.push(new Line(width).put(2, '>', 'cyan').put(4, view.input, undefined, inner));
+    lines.push(new Line(width).put(2, '>', 'cyan').put(4, view.input, HEADLINE, inner));
     lines.push(border());
     lines.push(footerRow(view, width, inner));
     lines.push(border());
@@ -836,7 +925,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   // --- position | active orders -----------------------------------------
   lines.push(border({ divider: 'down' }));
   lines.push(
-    new Line(width).divider(divider).put(2, 'POSITION', HEADING_COLOR).put(divider + 2, 'ACTIVE ORDERS', HEADING_COLOR)
+    new Line(width).divider(divider).put(2, 'POSITION', SECTION).put(divider + 2, 'ACTIVE ORDERS', SECTION)
   );
 
   // The full form is preferred; the short one is used only when the panel can't
@@ -847,7 +936,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
       ? position.risk
       : position.riskShort ?? position.risk
     : '';
-  const riskColor: Color | undefined = !position
+  const riskColor: Paint | undefined = !position
     ? undefined
     : position.risk === NO_VALUE || position.risk.startsWith(NO_VALUE)
     ? MUTED
@@ -855,7 +944,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
     ? undefined
     : 'yellow';
 
-  const positionFields: Array<[string, string, Color | undefined]> = position
+  const positionFields: Array<[string, string, Paint | undefined]> = position
     ? [
         ['Side', position.side, sideColor(position.side)],
         ['Size', position.size, undefined],
@@ -902,26 +991,28 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
     const line = new Line(width).divider(divider);
 
     if (row === 0) {
-      if (idWidth > 0) line.put(oId, 'ID', MUTED, oSide - 1);
+      if (idWidth > 0) line.put(oId, 'ID', LABEL, oSide - 1);
       line
-        .put(oSide, 'SIDE', MUTED, oQty)
-        .putRight(oPrice - 2, 'QTY', MUTED, oQty)
-        .putRight(oType - 2, 'PRICE', MUTED, oPrice)
-        .put(oType, 'TYPE', MUTED, oStatus)
-        .put(oStatus, 'STATUS', MUTED, oManaged)
-        .put(oManaged, 'MODE', MUTED, showExpiry ? oExpires : inner);
-      if (showExpiry) line.put(oExpires, 'EXPIRES', MUTED, inner);
+        .put(oSide, 'SIDE', LABEL, oQty)
+        .putRight(oPrice - 2, 'QTY', LABEL, oQty)
+        .putRight(oType - 2, 'PRICE', LABEL, oPrice)
+        .put(oType, 'TYPE', LABEL, oStatus)
+        .put(oStatus, 'STATUS', LABEL, oManaged)
+        .put(oManaged, 'MODE', LABEL, showExpiry ? oExpires : inner);
+      if (showExpiry) line.put(oExpires, 'EXPIRES', LABEL, inner);
     } else {
       const order = orders[row - 1];
       if (order) {
-        if (idWidth > 0) line.put(oId, order.id, MUTED, oSide - 1);
+        // The id stays quiet -- it identifies an order but you don't trade on
+        // it -- yet it is still a value, so it outranks the column header above.
+        if (idWidth > 0) line.put(oId, order.id, VALUE, oSide - 1);
         line
           .put(oSide, order.side, sideColor(order.side), oQty)
           // Numbers right-aligned in their column so decimals line up and a
           // changing value never shifts its neighbours.
-          .putRight(oPrice - 2, order.qty, undefined, oQty)
-          .putRight(oType - 2, order.price, undefined, oPrice)
-          .put(oType, order.type, MUTED, oStatus)
+          .putRight(oPrice - 2, order.qty, VALUE, oQty)
+          .putRight(oType - 2, order.price, VALUE, oPrice)
+          .put(oType, order.type, VALUE, oStatus)
           .put(oStatus, order.status, statusColor(order.status), oManaged)
           // An order being worked by the chase is an active state, so it takes
           // the same accent as WORKING rather than reading as metadata.
@@ -931,7 +1022,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
           // Amber near the end: a chase about to give up is worth noticing
           // before it does.
           const nearlyDone = /^00:0\d$/.test(order.expires ?? '');
-          line.put(oExpires, order.expires, nearlyDone ? 'yellow' : MUTED, inner);
+          line.put(oExpires, order.expires, nearlyDone ? 'yellow' : VALUE, inner);
         }
       } else if (row === 1 && orders.length === 0) {
         line.put(panelStart, 'No active orders', MUTED, inner);
@@ -940,7 +1031,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
 
     const field = positionFields[row];
     if (field) {
-      line.put(2, field[0], undefined, valueCol).put(valueCol, field[1], field[2], divider);
+      labelledAt(line, 2, field[0], valueCol, field[1], divider, field[2] ?? VALUE);
     } else if (row === 0 && !position) {
       line.put(2, 'No open position', MUTED, divider);
     }
@@ -951,7 +1042,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   // --- chase: only present while one is running --------------------------
   lines.push(border({ divider: 'up' }));
   if (chase) {
-    lines.push(new Line(width).put(2, 'CHASE', HEADING_COLOR));
+    lines.push(new Line(width).put(2, 'CHASE', SECTION));
     lines.push(
       new Line(width).put(2, chase.side, sideColor(chase.side), 7).put(7, chase.quantity)
     );
@@ -995,7 +1086,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
 
   // --- command entry, kept fixed so activity never moves it --------------
   lines.push(border());
-  lines.push(new Line(width).put(2, '>', 'cyan').put(4, view.input, undefined, inner));
+  lines.push(new Line(width).put(2, '>', 'cyan').put(4, view.input, HEADLINE, inner));
 
   // --- footer ------------------------------------------------------------
   lines.push(border());
