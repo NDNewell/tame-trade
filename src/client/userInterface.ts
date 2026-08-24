@@ -286,10 +286,15 @@ export class UserInterface {
    * These used to announce success unconditionally, so a filter that matched
    * nothing and a cancel that was refused both read as 'all orders cancelled'.
    */
-  private reportCancelled(what: string, result: { cancelled: number; failed: number }): void {
+  private reportCancelled(
+    noun: string,
+    result: { cancelled: number; failed: number }
+  ): void {
+    const count = (n: number) => `${n} ${noun}${n === 1 ? '' : 's'}`;
+
     if (result.failed > 0) {
       NotificationManager.notify(
-        `${result.cancelled} ${what} cancelled, ${result.failed} could NOT be cancelled — check the exchange.`,
+        `${count(result.cancelled)} cancelled, ${result.failed} could NOT be cancelled — check the exchange.`,
         NType.ERROR,
         'ERROR'
       );
@@ -298,8 +303,8 @@ export class UserInterface {
 
     NotificationManager.notify(
       result.cancelled === 0
-        ? `No ${what} to cancel.`
-        : `${result.cancelled} ${what} cancelled.`,
+        ? `No ${noun}s to cancel.`
+        : `${count(result.cancelled)} cancelled.`,
       NType.INFO,
       'ORDER'
     );
@@ -518,7 +523,7 @@ export class UserInterface {
           await this.exchangeCommand
             .getExchangeClient()
             .cancelAllOrders(this.currentMarket)
-            .then((result) => this.reportCancelled('orders', result));
+            .then((result) => this.reportCancelled('order', result));
         } catch (error: unknown) {
           this.reportFailure(error);
         }
@@ -531,7 +536,7 @@ export class UserInterface {
           await this.exchangeCommand
             .getExchangeClient()
             .cancelAllLimitOrders(this.currentMarket)
-            .then((result) => this.reportCancelled('limit orders', result));
+            .then((result) => this.reportCancelled('limit order', result));
         } catch (error: unknown) {
           this.reportFailure(error);
         }
@@ -557,7 +562,7 @@ export class UserInterface {
           await this.exchangeCommand
             .getExchangeClient()
             .cancelAllStopOrders(this.currentMarket)
-            .then((result) => this.reportCancelled('stop orders', result));
+            .then((result) => this.reportCancelled('stop order', result));
         } catch (error: unknown) {
           this.reportFailure(error);
         }
