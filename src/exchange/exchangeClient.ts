@@ -376,16 +376,32 @@ export class ExchangeClient {
    * 0.00105 where the true figure was 10.00. Anything that trusts that field
    * reports a flat account no matter how the position is doing.
    *
+   * The mark comes from the position payload rather than a price lookup, and
+   * that is the point: entry, size and mark then all describe the same instant.
+   * Valuing against a separately fetched price mixes two snapshots, which is
+   * what made the panel show a mark and an unrealized figure that could not be
+   * reconciled with each other. It also costs nothing -- the exchange sends it
+   * with the position, and it is the mark that drives the liquidation price
+   * shown beside it.
+   *
+   * Phemex marks positions to the mark price, not the last trade, so order
+   * pricing keeps using getReferencePrice: the last trade is what a taker
+   * actually pays. The two answer different questions.
+   *
    * Both the position panel and account equity come through here, so the two
    * cannot report different unrealized figures on the same screen.
    */
-  private computeUnrealizedPnl(
-    position: any,
-    market: string,
-    mark: number | undefined
-  ): number | undefined {
+  /** The mark the exchange stamped on this position, if it sent a usable one. */
+  private markPriceOf(position: any): number | undefined {
+    const mark = Number(position?.markPrice ?? NaN);
+    return Number.isFinite(mark) && mark > 0 ? mark : undefined;
+  }
+
+  private unrealizedPnlOf(position: any, market: string): number | undefined {
     const contracts = Math.abs(Number(position?.contracts ?? 0));
     if (contracts === 0) return undefined;
+
+    const mark = this.markPriceOf(position);
 
     const marketInfo = this.availableMarkets?.[market];
     const contractSize = Number(marketInfo?.contractSize ?? 1);
@@ -406,6 +422,8 @@ export class ExchangeClient {
     side: string;
     size: number;
     entry?: number;
+    /** The mark these figures were computed against, not a separate reading. */
+    mark?: number;
     unrealizedPnl?: number;
     realizedPnl?: number;
     leverage?: number;
@@ -422,14 +440,13 @@ export class ExchangeClient {
     const currency = String(marketInfo?.settle ?? marketInfo?.quote ?? '');
 
     const entry = Number(position.entryPrice ?? info.entryPrice ?? NaN);
-    const mark = await this.getReferencePrice(market);
-
-    const unrealizedPnl = this.computeUnrealizedPnl(position, market, mark);
+    const unrealizedPnl = this.unrealizedPnlOf(position, market);
 
     return {
       side: String(position.side ?? '').toUpperCase(),
       size: contracts,
       entry: Number.isFinite(entry) ? entry : undefined,
+      mark: this.markPriceOf(position),
       unrealizedPnl,
       realizedPnl: this.readRealizedPnl(info),
       leverage: Number(info.leverage) || undefined,
@@ -812,8 +829,7 @@ export class ExchangeClient {
 
         for (const position of open) {
           const symbol = String((position as any).symbol ?? '');
-          const mark = await this.getReferencePrice(symbol);
-          const value = this.computeUnrealizedPnl(position, symbol, mark);
+          const value = this.unrealizedPnlOf(position, symbol);
 
           // One position we cannot price makes the total wrong by an unknown
           // amount, and an equity figure that is quietly short is worse than
