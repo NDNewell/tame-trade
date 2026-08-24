@@ -71,7 +71,14 @@ export interface OrderRowView {
   type: string;
   /** Where it is in its life: WORKING, PARTIAL, FILLED, CANCELLED, REJECTED. */
   status: string;
-  /** What is working the order, when something is: CHASE. */
+  /**
+   * How the order is being worked, when it is being worked at all.
+   *
+   * CHASE is currently the only value: it is the only thing that keeps acting
+   * on an order after placing it. Orders from bracket or range commands are
+   * placed and then left, so they carry nothing here rather than a label that
+   * would say only where they came from.
+   */
   managed?: string;
 }
 
@@ -809,7 +816,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   // you read when deciding whether to act.
   const panelStart = divider + 2;
   const panelWidth = Math.max(20, inner - panelStart);
-  const fixed = 5 + 8 + 9 + 7 + 8 + 8; // side, qty, price, type, status, managed
+  const fixed = 5 + 8 + 9 + 7 + 8 + 7; // side, qty, price, type, status, mode
   const idWidth = Math.max(0, Math.min(10, panelWidth - fixed));
 
   const oId = panelStart;
@@ -834,7 +841,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
         .putRight(oType - 2, 'PRICE', MUTED, oPrice)
         .put(oType, 'TYPE', MUTED, oStatus)
         .put(oStatus, 'STATUS', MUTED, oManaged)
-        .put(oManaged, 'MANAGED', MUTED, inner);
+        .put(oManaged, 'MODE', MUTED, inner);
     } else {
       const order = orders[row - 1];
       if (order) {
