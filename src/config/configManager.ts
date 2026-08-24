@@ -39,13 +39,46 @@ export class ConfigManager {
     this.configFile = path.join(this.configPath, 'config.json');
 
     if (!fs.existsSync(this.configPath)) {
-      fs.mkdirSync(this.configPath);
+      fs.mkdirSync(this.configPath, { mode: 0o700 });
+    } else {
+      this.restrict(this.configPath, 0o700);
     }
+  }
+
+  /**
+   * Keeps a path readable only by its owner.
+   *
+   * This file holds API secrets in plaintext, so a default-permission write
+   * leaves them readable by every account on the machine. Best effort: a
+   * filesystem that cannot express the mode (Windows, some mounts) must not
+   * stop the config from being written, or the app cannot be used at all.
+   */
+  private restrict(target: string, mode: number): void {
+    try {
+      fs.chmodSync(target, mode);
+    } catch {
+      // Nothing to do about it here; failing the write would be worse.
+    }
+  }
+
+  /**
+   * The single path by which the profile reaches disk.
+   *
+   * `mode` on writeFile only applies when the file is created, so an existing
+   * config keeps whatever permissions it already had -- including the
+   * world-readable ones every version before this one wrote. The explicit
+   * chmod repairs those in place on the next save.
+   */
+  private async writeConfig(profile: Profile): Promise<void> {
+    await fs.promises.writeFile(this.configFile, JSON.stringify(profile), {
+      mode: 0o600,
+    });
+    this.restrict(this.configFile, 0o600);
   }
 
   async initializeProfile(): Promise<void> {
     const emptyProfile: Profile = { exchanges: [], passwordHash: '' };
-    await fs.promises.writeFile(this.configFile, JSON.stringify(emptyProfile));
+    await this.writeConfig(emptyProfile);
   }
 
   async hasProfile(): Promise<boolean> {
@@ -150,10 +183,7 @@ export class ConfigManager {
 
     currentProfile.exchanges.push(exchangeProfile);
 
-    await fs.promises.writeFile(
-      this.configFile,
-      JSON.stringify(currentProfile)
-    );
+    await this.writeConfig(currentProfile);
   }
 
   async getProfile(): Promise<Profile> {
@@ -166,7 +196,7 @@ export class ConfigManager {
   }
 
   async updateProfile(profile: Profile): Promise<void> {
-    await fs.promises.writeFile(this.configFile, JSON.stringify(profile));
+    await this.writeConfig(profile);
   }
 
   async deleteProfile(): Promise<void> {
