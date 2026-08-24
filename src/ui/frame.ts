@@ -319,6 +319,36 @@ function labelledAt(
   return line.put(valueCol, value, paint, limit);
 }
 
+/**
+ * Trims a value to the room available, dropping a trailing parenthetical
+ * rather than cutting through it.
+ *
+ * A funding rate reads '0.0100% (10.95% APR)'. Cut to fit, that becomes
+ * '0.0100% (10.95% APR' -- an unclosed bracket reads as a rendering fault, and
+ * '0.0100% (10.' reads as a different number. Dropping the aside entirely
+ * leaves the rate itself intact and obviously complete.
+ */
+function fitValue(text: string, room: number): string {
+  if (text.length <= room) return text;
+
+  const balanced = (value: string): boolean =>
+    (value.match(/\(/g) ?? []).length === (value.match(/\)/g) ?? []).length;
+
+  // Whole words only. Cutting mid-number turns 0.0100% into 0.010, which is not
+  // a shortened value but a different one, and cutting mid-bracket leaves what
+  // looks like a rendering fault.
+  const words = text.split(' ');
+  while (words.length > 1) {
+    words.pop();
+    const candidate = words.join(' ');
+    if (candidate.length <= room && balanced(candidate)) return candidate;
+  }
+
+  // Not even the leading value fits. '--' says so; anything else here would be
+  // a number the reader could act on and shouldn't.
+  return words[0].length <= room && balanced(words[0]) ? words[0] : NO_VALUE;
+}
+
 /** The same pair, with the value following its label directly. */
 function labelled(
   line: Line,
@@ -896,17 +926,25 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
 
   const secondaryRow = new Line(width);
 
-  // Spread belongs to the grid, not to the right-hand edge. Pinning it to the
-  // edge left it stranded on its own with the row's other values half a screen
-  // away; it now takes the last grid column that can hold it, so it lines up
-  // with the price above it however wide the terminal is.
-  const spreadWidth = `Spread ${market.spread}`.length;
-  const spreadCol =
-    [col4, col3].find((col) => col + spreadWidth <= inner - 1) ?? col3;
+  // Spread sits under Ask, at every width. It is the distance between bid and
+  // ask, so it reads against the prices it comes from rather than against the
+  // funding rate or the 24h change, and an alignment that moves as the terminal
+  // is resized is not an alignment.
+  //
+  // Funding yields the space instead: it is the one value here carrying an
+  // aside it can afford to lose.
+  const spreadCol = col3;
+  const fundingAt = col2 + 'Funding '.length;
 
   field(secondaryRow, 2, 'Mark', market.mark, col1);
   field(secondaryRow, col1, 'Index', market.index, col2);
-  field(secondaryRow, col2, 'Funding', market.funding, spreadCol - 1);
+  labelled(
+    secondaryRow,
+    col2,
+    'Funding',
+    fitValue(market.funding, Math.max(0, spreadCol - 1 - fundingAt)),
+    spreadCol - 1
+  );
   labelled(secondaryRow, spreadCol, 'Spread', market.spread, inner);
   lines.push(secondaryRow);
 
