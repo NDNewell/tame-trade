@@ -1834,6 +1834,11 @@ export class ExchangeClient {
     }
   }
 
+  /** The order the chase is currently working, if one is running. */
+  getCurrentChaseOrderId(): string | undefined {
+    return this.chaseLimitOrderActive ? this.currentChaseOrderId : undefined;
+  }
+
   getChaseLimitOrderStatus(): boolean {
     return this.chaseLimitOrderActive;
   }

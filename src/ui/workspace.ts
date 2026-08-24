@@ -218,6 +218,7 @@ export class Workspace {
           : this.client.formatPriceForDisplay(this.market, Number(value));
 
       const base = this.client.getBaseAsset(this.market);
+      const chaseOrderId = this.client.getCurrentChaseOrderId();
 
       this.screen.update({
         market: {
@@ -294,6 +295,8 @@ export class Workspace {
               : NO_VALUE,
             type,
             status,
+            // Only while a chase is actually running and working this order.
+            managed: chaseOrderId && order.id === chaseOrderId ? 'CHASE' : undefined,
           };
         }),
       });

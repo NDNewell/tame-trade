@@ -71,6 +71,8 @@ export interface OrderRowView {
   type: string;
   /** Where it is in its life: WORKING, PARTIAL, FILLED, CANCELLED, REJECTED. */
   status: string;
+  /** What is working the order, when something is: CHASE. */
+  managed?: string;
 }
 
 export interface ChaseView {
@@ -807,7 +809,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   // you read when deciding whether to act.
   const panelStart = divider + 2;
   const panelWidth = Math.max(20, inner - panelStart);
-  const fixed = 5 + 8 + 9 + 7 + 8; // side, qty, price, type, status
+  const fixed = 5 + 8 + 9 + 7 + 8 + 8; // side, qty, price, type, status, managed
   const idWidth = Math.max(0, Math.min(10, panelWidth - fixed));
 
   const oId = panelStart;
@@ -816,6 +818,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   const oPrice = oQty + 8;
   const oType = oPrice + 9;
   const oStatus = oType + 7;
+  const oManaged = oStatus + 8;
 
   const valueCol = 21;
   const bodyRows = Math.max(1, splitRows - 1); // first row of the block is a gap
@@ -830,7 +833,8 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
         .putRight(oPrice - 2, 'QTY', MUTED, oQty)
         .putRight(oType - 2, 'PRICE', MUTED, oPrice)
         .put(oType, 'TYPE', MUTED, oStatus)
-        .put(oStatus, 'STATUS', MUTED, inner);
+        .put(oStatus, 'STATUS', MUTED, oManaged)
+        .put(oManaged, 'MANAGED', MUTED, inner);
     } else {
       const order = orders[row - 1];
       if (order) {
@@ -842,7 +846,10 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
           .putRight(oPrice - 2, order.qty, undefined, oQty)
           .putRight(oType - 2, order.price, undefined, oPrice)
           .put(oType, order.type, MUTED, oStatus)
-          .put(oStatus, order.status, statusColor(order.status), inner);
+          .put(oStatus, order.status, statusColor(order.status), oManaged)
+          // An order being worked by the chase is an active state, so it takes
+          // the same accent as WORKING rather than reading as metadata.
+          .put(oManaged, order.managed, order.managed ? 'cyan' : undefined, inner);
       } else if (row === 1 && orders.length === 0) {
         line.put(panelStart, 'No active orders', MUTED, inner);
       }
