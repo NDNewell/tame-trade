@@ -80,6 +80,8 @@ export interface OrderRowView {
    * would say only where they came from.
    */
   managed?: string;
+  /** Time left before a decaying chase gives up, as mm:ss. */
+  expires?: string;
 }
 
 export interface ChaseView {
@@ -816,7 +818,12 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   // you read when deciding whether to act.
   const panelStart = divider + 2;
   const panelWidth = Math.max(20, inner - panelStart);
-  const fixed = 5 + 8 + 9 + 7 + 8 + 7; // side, qty, price, type, status, mode
+  const fixedWithoutExpiry = 5 + 8 + 9 + 7 + 8 + 7; // side, qty, price, type, status, mode
+  const expiryWidth = 8;
+  // Width decides this, not whether a chase happens to be running: a column that
+  // came and went with the chase would shift every other value sideways.
+  const showExpiry = panelWidth >= fixedWithoutExpiry + expiryWidth + 4;
+  const fixed = fixedWithoutExpiry + (showExpiry ? expiryWidth : 0);
   const idWidth = Math.max(0, Math.min(10, panelWidth - fixed));
 
   const oId = panelStart;
@@ -826,6 +833,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   const oType = oPrice + 9;
   const oStatus = oType + 7;
   const oManaged = oStatus + 8;
+  const oExpires = oManaged + 7;
 
   const valueCol = 21;
   const bodyRows = Math.max(1, splitRows - 1); // first row of the block is a gap
@@ -841,7 +849,8 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
         .putRight(oType - 2, 'PRICE', MUTED, oPrice)
         .put(oType, 'TYPE', MUTED, oStatus)
         .put(oStatus, 'STATUS', MUTED, oManaged)
-        .put(oManaged, 'MODE', MUTED, inner);
+        .put(oManaged, 'MODE', MUTED, showExpiry ? oExpires : inner);
+      if (showExpiry) line.put(oExpires, 'EXPIRES', MUTED, inner);
     } else {
       const order = orders[row - 1];
       if (order) {
@@ -856,7 +865,14 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
           .put(oStatus, order.status, statusColor(order.status), oManaged)
           // An order being worked by the chase is an active state, so it takes
           // the same accent as WORKING rather than reading as metadata.
-          .put(oManaged, order.managed, order.managed ? 'cyan' : undefined, inner);
+          .put(oManaged, order.managed, order.managed ? 'cyan' : undefined,
+               showExpiry ? oExpires : inner);
+        if (showExpiry) {
+          // Amber near the end: a chase about to give up is worth noticing
+          // before it does.
+          const nearlyDone = /^00:0\d$/.test(order.expires ?? '');
+          line.put(oExpires, order.expires, nearlyDone ? 'yellow' : MUTED, inner);
+        }
       } else if (row === 1 && orders.length === 0) {
         line.put(panelStart, 'No active orders', MUTED, inner);
       }
