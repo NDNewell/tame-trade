@@ -28,7 +28,11 @@ export interface HeaderView {
   environment: string;
   connection: string;
   exchange: string;
-  symbol: string;
+  /**
+   * No symbol here. The market is named once, in MARKET, where its label sits
+   * beside it -- repeating it in the header said the same thing twice and left
+   * the reader checking whether the two agreed.
+   */
   instrumentType: string;
   account: string;
   /** Wallet balance: what the exchange holds, before any open position settles. */
@@ -704,7 +708,7 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
         header.connection.toUpperCase() === 'CONNECTED' ? 'green' : 'red'
       )
   );
-  const identity = `${header.exchange} | ${header.symbol}`;
+  const identity = header.exchange;
   const stackedFunds = headerFunds(header, inner - 3 - identity.length - 2);
   const identityLine = new Line(width).put(
     2,
@@ -716,12 +720,11 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
 
   lines.push(border());
   lines.push(new Line(width).put(2, 'MARKET', SECTION));
-  lines.push(
-    new Line(width)
-      .put(2, market.symbol, HEADLINE, 16)
-      .put(16, market.last, HEADLINE, 26)
-      .put(26, market.change, signedColor(market.change), inner)
-  );
+  const marketRow = new Line(width);
+  labelled(marketRow, 2, 'Symbol', market.symbol, 24, HEADLINE);
+  labelled(marketRow, 24, 'Last', market.last, 36, HEADLINE);
+  labelled(marketRow, 36, '24h', market.change, inner, signedColor(market.change) ?? VALUE);
+  lines.push(marketRow);
   const secondary = new Line(width);
   labelled(secondary, 2, 'Bid', market.bid, 16);
   labelled(secondary, 16, 'Ask', market.ask, 30);
@@ -850,7 +853,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
       )
   );
 
-  const context = [header.exchange, header.symbol, header.instrumentType]
+  const context = [header.exchange, header.instrumentType]
     .filter((part) => part && part.length > 0)
     .join(' | ');
   // Three columns of gap keeps the figures from reading as part of the symbol.
@@ -869,8 +872,11 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
 
   // Four evenly spaced columns, so the primary and secondary rows line up with
   // each other and every value keeps a fixed starting position.
-  const span = Math.max(16, Math.floor((inner - 18) / 4));
-  const col1 = 18;
+  // The leading column carries the labelled symbol, so it takes the room that
+  // symbol actually needs rather than a fixed guess -- a fixed one wide enough
+  // for a long symbol steals a column's worth of space from every short one.
+  const col1 = Math.max(18, Math.min(26, 2 + 'Symbol '.length + market.symbol.length + 2));
+  const span = Math.max(14, Math.floor((inner - col1) / 4));
   const col2 = col1 + span;
   const col3 = col2 + span;
   const col4 = col3 + span;
@@ -878,7 +884,8 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   const field = (line: Line, col: number, label: string, value: string, limit: number) =>
     labelled(line, col, label, value, limit);
 
-  const primaryRow = new Line(width).put(2, market.symbol, HEADLINE, col1);
+  const primaryRow = new Line(width);
+  labelled(primaryRow, 2, 'Symbol', market.symbol, col1, HEADLINE);
   labelled(primaryRow, col1, 'Last', market.last, col2, HEADLINE);
   field(primaryRow, col2, 'Bid', market.bid, col3);
   field(primaryRow, col3, 'Ask', market.ask, col4);
@@ -888,8 +895,14 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   lines.push(primaryRow);
 
   const secondaryRow = new Line(width);
-  const spreadLabel = `Spread ${market.spread}`;
-  const spreadCol = Math.max(col3, inner - 1 - spreadLabel.length);
+
+  // Spread belongs to the grid, not to the right-hand edge. Pinning it to the
+  // edge left it stranded on its own with the row's other values half a screen
+  // away; it now takes the last grid column that can hold it, so it lines up
+  // with the price above it however wide the terminal is.
+  const spreadWidth = `Spread ${market.spread}`.length;
+  const spreadCol =
+    [col4, col3].find((col) => col + spreadWidth <= inner - 1) ?? col3;
 
   field(secondaryRow, 2, 'Mark', market.mark, col1);
   field(secondaryRow, col1, 'Index', market.index, col2);

@@ -77,7 +77,6 @@ export function emptyView(): TerminalView {
       environment: 'LIVE',
       connection: 'CONNECTING',
       exchange: NO_VALUE,
-      symbol: NO_VALUE,
       instrumentType: '',
       account: NO_VALUE,
       balance: NO_VALUE,
@@ -170,7 +169,6 @@ export class Workspace {
 
     const view = emptyView();
     view.header.exchange = this.client.getSelectedExchangeName() ?? NO_VALUE;
-    view.header.symbol = market;
     view.header.connection = 'CONNECTED';
 
     this.screen = new Screen(view, this.onCommand, this.onQuit);
@@ -193,7 +191,6 @@ export class Workspace {
     return {
       ...emptyView().header,
       exchange: this.client.getSelectedExchangeName() ?? NO_VALUE,
-      symbol: this.market,
       connection: 'CONNECTED',
       account: this.accountLabel ?? NO_VALUE,
       balance: formatMoney(this.funds.balance),
@@ -253,9 +250,9 @@ export class Workspace {
   private async refresh(): Promise<void> {
     if (!this.screen || !this.market) return;
 
-    // 'SOL/USDT' rather than 'SOL/USDT:USDT': the settlement suffix is exchange
-    // notation and adds nothing once the market is named in the header.
-    const symbol = this.market.split(':')[0];
+    // The full form, settlement suffix included. It is the only place the
+    // market is named now, so it names it completely.
+    const symbol = this.market;
 
     try {
       const [position, orders, risk, funds] = await Promise.all([
