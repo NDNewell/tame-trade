@@ -2321,13 +2321,28 @@ export class ExchangeClient {
     let filled: number | undefined;
     let price: number | undefined;
 
-    try {
-      const order = await this.exchange!.fetchOrder(orderId, market);
-      filled = Number(order?.filled ?? 0);
-      const raw = order?.average ?? order?.price;
-      price = raw === undefined ? undefined : Number(raw);
-    } catch {
-      // The order is gone from the live book and not yet in history.
+    // The order has just left the live book, and on USDT markets this lookup
+    // goes to the historical API, which trails it by a second or so and answers
+    // in the meantime with an empty record. Asking once and believing the answer
+    // reports a filled order as unfilled.
+    for (let attempt = 0; attempt < 3 && filled === undefined; attempt++) {
+      if (attempt > 0) await this.sleep(750);
+
+      try {
+        const order = await this.exchange!.fetchOrder(orderId, market);
+        const reported = Number(order?.filled ?? NaN);
+        const status = String(order?.status ?? '');
+
+        // Only a record that says something is allowed to decide the outcome.
+        // Zero filled with no status is 'not known yet', not 'nothing filled'.
+        if (Number.isFinite(reported) && (reported > 0 || status !== '')) {
+          filled = reported;
+          const raw = order?.average ?? order?.price;
+          price = raw === undefined ? undefined : Number(raw);
+        }
+      } catch {
+        // Not visible to the history API yet either; try again.
+      }
     }
 
     if (filled !== undefined && filled > 0) {
@@ -2346,7 +2361,8 @@ export class ExchangeClient {
       remainder !== undefined && remainder > 1e-9
         ? `Chase ended with ${this.formatQuantity(remainder)} unfilled.`
         : filled === undefined
-        ? 'Chase ended: the order is no longer on the exchange.'
+        ? // Never assert it didn't fill on a lookup that never answered.
+          'Chase ended — the exchange has not reported the outcome yet. Check your position.'
         : ''
     );
   }
