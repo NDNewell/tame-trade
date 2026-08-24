@@ -95,6 +95,15 @@ can never open a position in the opposite direction.
 
 `trigger buy [size] [price] or trigger sell [size] [price]`: Place a non-reduce-only stop order.
 
+`trail [distance]` / `trail [percent]%`: Place a trailing stop covering the whole
+position. `trail 1.5` trails 1.50 behind the best price; `trail 2%` trails 2%.
+The stop starts one trail-width away from the current price.
+
+The exchange maintains the trail, not Tame, so it keeps working whether or not
+this application is running. That is deliberate: a trail maintained locally would
+freeze wherever it happened to be if the process stopped, while still looking
+like it was following the price.
+
 `bump + [value] or bump - [value]`: Bump all orders by the specified value.
 
 `cancel all`: Cancel all resting orders, including stops.

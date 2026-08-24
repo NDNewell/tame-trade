@@ -14,6 +14,7 @@ const FOOTER = [
   'sell',
   'chase',
   'limit',
+  'trail',
   'cancel',
   'orders',
   'positions',

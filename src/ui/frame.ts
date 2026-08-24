@@ -464,7 +464,7 @@ function activityLabel(view: TerminalView, width: number, rows: number): Line {
 }
 
 /** Commands that place or withdraw orders, as opposed to ones that only look. */
-const EXECUTION_COMMANDS = new Set(['buy', 'sell', 'chase', 'limit', 'cancel']);
+const EXECUTION_COMMANDS = new Set(['buy', 'sell', 'chase', 'limit', 'trail', 'cancel']);
 
 function footerRow(view: TerminalView, width: number, inner: number): Line {
   const line = new Line(width);
