@@ -60,6 +60,7 @@ export class ExchangeClient {
   // than remember the id the chase started with — otherwise it cancels an order
   // that is already gone and leaves the live one resting.
   private currentChaseOrderId: string | undefined = undefined;
+  private chaseDeadline: number | undefined = undefined;
   private tickerStreams = new Map<
     string,
     { price: number | undefined; at: number; running: boolean }
@@ -1834,6 +1835,11 @@ export class ExchangeClient {
     }
   }
 
+  /** When the running chase expires, if it was given a decay. */
+  getChaseDeadline(): number | undefined {
+    return this.chaseLimitOrderActive ? this.chaseDeadline : undefined;
+  }
+
   /** The order the chase is currently working, if one is running. */
   getCurrentChaseOrderId(): string | undefined {
     return this.chaseLimitOrderActive ? this.currentChaseOrderId : undefined;
@@ -2369,6 +2375,11 @@ export class ExchangeClient {
 
     if (decay) {
       const decayTime = parseDecayTime(decay);
+      // Recorded so the interface can count it down. Read through
+      // getChaseDeadline, which returns nothing once the chase has ended, so a
+      // finished chase can't leave a countdown running on screen.
+      this.chaseDeadline = Date.now() + decayTime;
+
       setTimeout(() => {
         if (this.chaseLimitOrderActive) {
           // Pass params to cancelChaseOrder
