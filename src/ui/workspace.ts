@@ -306,7 +306,11 @@ export class Workspace {
                 position.entry !== undefined
                   ? String(Number(position.entry.toFixed(6)))
                   : NO_VALUE,
-              mark: tick(price.mark ?? price.last),
+              // The mark the position was valued at, so entry, mark and
+              // unrealized on this panel all describe the same instant and can
+              // be checked against each other. The MARKET panel's mark is a
+              // separate, fresher reading of the same thing.
+              mark: tick(position.mark),
               unrealizedPnl:
                 position.unrealizedPnl !== undefined
                   ? `${signed(position.unrealizedPnl)}${position.currency ? ` ${position.currency}` : ''}`
