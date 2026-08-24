@@ -311,6 +311,14 @@ export class Workspace {
             ? 'STOP'
             : String(order.type ?? 'LIMIT').toUpperCase();
 
+          // A trailing stop is a stop the exchange keeps moving. Without this
+          // it is indistinguishable from a fixed one in the panel, so there is
+          // no way to tell from the screen whether the trail actually took.
+          const peg = Number(info.pegOffsetValueRp ?? info.pegOffsetValueEp ?? 0);
+          const isTrailing =
+            peg !== 0 &&
+            String(info.pegPriceType ?? '').toLowerCase().includes('trailing');
+
           const filled = Number(order.filled ?? 0);
           const status = isTrigger
             ? 'WORKING'
@@ -334,7 +342,14 @@ export class Workspace {
             type,
             status,
             // Only while a chase is actually running and working this order.
-            managed: chaseOrderId && order.id === chaseOrderId ? 'CHASE' : undefined,
+            // CHASE is checked first: it means this process is working the
+            // order, which is a stronger claim than the exchange trailing it.
+            managed:
+              chaseOrderId && order.id === chaseOrderId
+                ? 'CHASE'
+                : isTrailing
+                ? 'TRAIL'
+                : undefined,
             expires:
               chaseOrderId && order.id === chaseOrderId && chaseDeadline
                 ? countdown(chaseDeadline)
