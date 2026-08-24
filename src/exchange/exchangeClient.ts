@@ -3131,6 +3131,17 @@ export class ExchangeClient {
           params.triggerType = 'ByLastPrice';
 
           if (trailOffset !== undefined && trailOffset > 0) {
+            // A trail follows the price, so the price it follows matters more
+            // than for a fixed stop. Last price is what a wick moves: a spike
+            // on this venue ratchets the trail up behind it, and when price
+            // comes back the stop is left sitting near the market and takes the
+            // position out on a move that never really happened.
+            //
+            // Mark price is derived from the index, so a wick that doesn't move
+            // the wider market barely moves it. Costs nothing and keeps working
+            // while disconnected, which monitoring cannot.
+            params.triggerType = 'ByMarkPrice';
+
             // The exchange maintains the trail from here, so it keeps working
             // whether or not this process does.
             //
