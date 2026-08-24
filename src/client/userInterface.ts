@@ -280,6 +280,31 @@ export class UserInterface {
   //
   // Covers the whole position, like a stop, and is maintained by the exchange
   // rather than by this process.
+  /**
+   * Reports what a cancel actually did.
+   *
+   * These used to announce success unconditionally, so a filter that matched
+   * nothing and a cancel that was refused both read as 'all orders cancelled'.
+   */
+  private reportCancelled(what: string, result: { cancelled: number; failed: number }): void {
+    if (result.failed > 0) {
+      NotificationManager.notify(
+        `${result.cancelled} ${what} cancelled, ${result.failed} could NOT be cancelled — check the exchange.`,
+        NType.ERROR,
+        'ERROR'
+      );
+      return;
+    }
+
+    NotificationManager.notify(
+      result.cancelled === 0
+        ? `No ${what} to cancel.`
+        : `${result.cancelled} ${what} cancelled.`,
+      NType.INFO,
+      'ORDER'
+    );
+  }
+
   private async handleTrailCommand(command: string): Promise<void> {
     const arg = command.slice('trail'.length).trim();
 
@@ -492,8 +517,8 @@ export class UserInterface {
         try {
           await this.exchangeCommand
             .getExchangeClient()
-            .cancelAllOrders(this.currentMarket);
-          console.log('All orders cancelled for market:', this.currentMarket);
+            .cancelAllOrders(this.currentMarket)
+            .then((result) => this.reportCancelled('orders', result));
         } catch (error: unknown) {
           this.reportFailure(error);
         }
@@ -505,8 +530,8 @@ export class UserInterface {
         try {
           await this.exchangeCommand
             .getExchangeClient()
-            .cancelAllLimitOrders(this.currentMarket);
-          console.log('All limit orders have been cancelled.');
+            .cancelAllLimitOrders(this.currentMarket)
+            .then((result) => this.reportCancelled('limit orders', result));
         } catch (error: unknown) {
           this.reportFailure(error);
         }
@@ -531,8 +556,8 @@ export class UserInterface {
         try {
           await this.exchangeCommand
             .getExchangeClient()
-            .cancelAllStopOrders(this.currentMarket);
-          console.log('All stop orders have been cancelled.');
+            .cancelAllStopOrders(this.currentMarket)
+            .then((result) => this.reportCancelled('stop orders', result));
         } catch (error: unknown) {
           this.reportFailure(error);
         }
