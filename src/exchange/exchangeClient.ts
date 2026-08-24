@@ -19,6 +19,14 @@ import { describeExchangeError, isMissingOrderError } from '../utils/exchangeErr
 import { NotificationManager } from '../utils/notificationManager.js';
 import { NType } from '../utils/notificationManager.js';
 
+/** How an order ended: the one shape every caller reads. */
+export interface OrderOutcome {
+  status: string;
+  filled: number;
+  average?: number;
+  at: number;
+}
+
 // Define a more flexible Position interface to handle ccxt's types
 interface Position {
   symbol: string;
@@ -76,6 +84,15 @@ export class ExchangeClient {
     {
       orders: Map<string, Order>;
       filledSoFar: Map<string, number>;
+      /**
+       * How orders ended, as the feed reported it.
+       *
+       * The stream says an order closed, for how much and at what price, at the
+       * moment it happens. Discarding that and then asking the REST history API
+       * the same question is what made filled orders report as unfilled: that
+       * API trails the book and answers with an empty record in between.
+       */
+      finished: Map<string, OrderOutcome>;
       running: boolean;
       healthy: boolean;
       syncedAt: number;
@@ -543,6 +560,57 @@ export class ExchangeClient {
     });
   }
 
+  /**
+   * How an order ended, from the feed if it saw it and from the exchange if not.
+   *
+   * One place decides what "finished" means, so the rule that an empty record is
+   * 'not known yet' rather than 'nothing filled' is written once instead of at
+   * every call site -- which is how filled orders came to be reported as
+   * unfilled in three separate places.
+   *
+   * The feed is asked first because it already knows, and again between each
+   * fallback attempt, since the event may arrive while the REST lookup is being
+   * waited on.
+   */
+  async getOrderOutcome(
+    market: string,
+    orderId: string
+  ): Promise<OrderOutcome | undefined> {
+    const fromStream = () => this.orderStreams.get(market)?.finished.get(orderId);
+
+    const streamed = fromStream();
+    if (streamed) return streamed;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) {
+        await this.sleep(750);
+        const late = fromStream();
+        if (late) return late;
+      }
+
+      try {
+        const order = await this.exchange!.fetchOrder(orderId, market);
+        const filled = Number(order?.filled ?? NaN);
+        const status = String(order?.status ?? '');
+
+        // Only a record that says something is allowed to decide the outcome.
+        if (Number.isFinite(filled) && (filled > 0 || status !== '')) {
+          const average = Number(order?.average ?? order?.price ?? NaN);
+          return {
+            status,
+            filled,
+            average: Number.isFinite(average) ? average : undefined,
+            at: Date.now(),
+          };
+        }
+      } catch {
+        // Not in the history API yet either; the next pass re-checks the feed.
+      }
+    }
+
+    return undefined;
+  }
+
   /** Open orders for display. Uses the live view; completeness isn't critical. */
   async getOpenOrdersForDisplay(market: string): Promise<Order[]> {
     try {
@@ -842,6 +910,7 @@ export class ExchangeClient {
     const state = {
       orders: new Map<string, Order>(),
       filledSoFar: new Map<string, number>(),
+      finished: new Map<string, OrderOutcome>(),
       running: true,
       healthy: false,
       syncedAt: 0,
@@ -886,6 +955,21 @@ export class ExchangeClient {
             this.announceOrderUpdate(market, update, state);
 
             if (done) {
+              const average = Number(update.average ?? update.price ?? NaN);
+              state.finished.set(update.id, {
+                status,
+                filled: Number(update.filled ?? 0),
+                average: Number.isFinite(average) ? average : undefined,
+                at: Date.now(),
+              });
+
+              // Bounded: this is a short memory for orders just closed, not a
+              // history of the account.
+              if (state.finished.size > 200) {
+                const oldest = state.finished.keys().next().value;
+                if (oldest !== undefined) state.finished.delete(oldest);
+              }
+
               state.orders.delete(update.id);
               state.filledSoFar.delete(update.id);
             } else {
@@ -2091,33 +2175,20 @@ export class ExchangeClient {
           // meantime with an empty record. An empty record is 'not yet known',
           // never 'did not fill', so only a record that actually says something
           // is allowed to decide the outcome.
-          let outcome: string | undefined;
+          const result = await this.getOrderOutcome(market, orderId);
 
-          for (let attempt = 0; attempt < 3 && outcome === undefined; attempt++) {
-            if (attempt > 0) {
-              await this.sleep(750);
-            }
-
-            try {
-              const finalOrder = await this.exchange!.fetchOrder(orderId, market, params);
-              const filled = Number(finalOrder?.filled ?? 0);
-              const status = String(finalOrder?.status ?? '');
-
-              if (status === 'closed' || filled >= amount) {
-                outcome = `filled for ${filled || amount}`;
-              } else if (status === 'canceled' || status === 'rejected') {
-                outcome =
-                  filled > 0
-                    ? `${status} after filling ${filled} of ${amount}`
-                    : `${status} without filling`;
-              } else if (filled > 0) {
-                outcome = `ended with ${filled} of ${amount} filled`;
-              }
-              // Anything else is an unpopulated record: try again.
-            } catch {
-              // Not visible to the history API yet either; try again.
-            }
-          }
+          const outcome =
+            result === undefined
+              ? undefined
+              : result.status === 'closed' || result.filled >= amount
+              ? `filled for ${result.filled || amount}`
+              : result.status === 'canceled' || result.status === 'rejected'
+              ? result.filled > 0
+                ? `${result.status} after filling ${result.filled} of ${amount}`
+                : `${result.status} without filling`
+              : result.filled > 0
+              ? `ended with ${result.filled} of ${amount} filled`
+              : undefined;
 
           finishChase(
             outcome !== undefined
@@ -2318,32 +2389,9 @@ export class ExchangeClient {
     requested: number,
     finish: (message: string) => void
   ): Promise<void> {
-    let filled: number | undefined;
-    let price: number | undefined;
-
-    // The order has just left the live book, and on USDT markets this lookup
-    // goes to the historical API, which trails it by a second or so and answers
-    // in the meantime with an empty record. Asking once and believing the answer
-    // reports a filled order as unfilled.
-    for (let attempt = 0; attempt < 3 && filled === undefined; attempt++) {
-      if (attempt > 0) await this.sleep(750);
-
-      try {
-        const order = await this.exchange!.fetchOrder(orderId, market);
-        const reported = Number(order?.filled ?? NaN);
-        const status = String(order?.status ?? '');
-
-        // Only a record that says something is allowed to decide the outcome.
-        // Zero filled with no status is 'not known yet', not 'nothing filled'.
-        if (Number.isFinite(reported) && (reported > 0 || status !== '')) {
-          filled = reported;
-          const raw = order?.average ?? order?.price;
-          price = raw === undefined ? undefined : Number(raw);
-        }
-      } catch {
-        // Not visible to the history API yet either; try again.
-      }
-    }
+    const outcome = await this.getOrderOutcome(market, orderId);
+    const filled = outcome?.filled;
+    const price = outcome?.average;
 
     if (filled !== undefined && filled > 0) {
       NotificationManager.notify('', NType.SUCCESS, 'FILL', undefined, {
