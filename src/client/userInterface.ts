@@ -275,6 +275,57 @@ export class UserInterface {
     NotificationManager.notify(failure.summary, NType.ERROR, 'ERROR');
   }
 
+  // trail <distance>   trail that many in price behind the best price
+  // trail <percent>%    trail that percentage behind
+  //
+  // Covers the whole position, like a stop, and is maintained by the exchange
+  // rather than by this process.
+  private async handleTrailCommand(command: string): Promise<void> {
+    const arg = command.slice('trail'.length).trim();
+
+    if (arg === '') {
+      NotificationManager.notify(
+        'Usage: trail <distance> or trail <percent>%',
+        NType.INFO,
+        'SYSTEM'
+      );
+      return;
+    }
+
+    if (!this.currentMarket) {
+      NotificationManager.notify('No market selected.', NType.ERROR, 'ERROR');
+      return;
+    }
+
+    const percent = arg.endsWith('%');
+    const value = Number(percent ? arg.slice(0, -1).trim() : arg);
+
+    if (!Number.isFinite(value) || value <= 0) {
+      NotificationManager.notify(
+        `Invalid trail '${arg}'. Give a distance greater than 0, or a percentage such as 2%.`,
+        NType.ERROR,
+        'ERROR'
+      );
+      return;
+    }
+
+    try {
+      const order = await this.exchangeCommand
+        .getExchangeClient()
+        .createTrailingStopOrder(this.currentMarket, value, percent);
+
+      if (!order) {
+        NotificationManager.notify(
+          'Trailing stop was NOT placed.',
+          NType.ERROR,
+          'ERROR'
+        );
+      }
+    } catch (error) {
+      this.reportFailure(error);
+    }
+  }
+
   private async handleFatFingerCommand(command: string): Promise<void> {
     const exchangeClient = this.exchangeCommand.getExchangeClient();
     const arg = command.slice('fatfinger'.length).trim();
@@ -379,6 +430,8 @@ export class UserInterface {
     }
     if (command === 'list methods') {
       this.displayAvailableMethods();
+    } else if (command === 'trail' || command.startsWith('trail ')) {
+      await this.handleTrailCommand(command);
     } else if (command === 'fatfinger' || command.startsWith('fatfinger ')) {
       await this.handleFatFingerCommand(command);
     } else if (command.startsWith('market')) {

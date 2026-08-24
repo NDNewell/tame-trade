@@ -862,7 +862,7 @@ export class ExchangeClient {
   // from a stream rather than a request removes a round trip from paths that are
   // typed in a hurry.
   private startTickerStream(market: string): void {
-    if (!this.exchange?.has['watchTicker']) return;
+    if (!this.exchange?.has?.['watchTicker']) return;
     if (this.tickerStreams.get(market)?.running) return;
 
     const state = { price: undefined as number | undefined, at: 0, running: true };
@@ -905,7 +905,7 @@ export class ExchangeClient {
     params?: Record<string, any>,
     snapshot?: Order[]
   ): void {
-    if (!this.exchange?.has['watchOrders']) return;
+    if (!this.exchange?.has?.['watchOrders']) return;
     if (this.orderStreams.get(market)?.running) return;
 
     const state = {
@@ -2338,8 +2338,8 @@ export class ExchangeClient {
     // port). A chase that polls is worse than one that streams, but far better
     // than one that doesn't run.
     const canStream =
-      Boolean(this.exchange.has['watchOrderBook']) &&
-      Boolean(this.exchange.has['watchOrders']);
+      Boolean(this.exchange.has?.['watchOrderBook']) &&
+      Boolean(this.exchange.has?.['watchOrders']);
 
     if (canStream) {
       this.runStreamingChase({
@@ -2979,7 +2979,9 @@ export class ExchangeClient {
     price: number,
     quantity?: number,
     suppressLog?: boolean,
-    enforceFatFinger: boolean = true
+    enforceFatFinger: boolean = true,
+    /** Absolute price distance the exchange should trail the stop by. */
+    trailOffset?: number
   ): Promise<Order | undefined> {
     // A size we work out from the position isn't something the user typed, so it
     // isn't subject to the fatfinger limit — a stop must always be placeable.
@@ -3120,6 +3122,20 @@ export class ExchangeClient {
           // The UI triggers on last price; ccxt defaults to mark price, and the
           // two diverge. 'trigger' was the wrong key and never took effect.
           params.triggerType = 'ByLastPrice';
+
+          if (trailOffset !== undefined && trailOffset > 0) {
+            // The exchange maintains the trail from here, so it keeps working
+            // whether or not this process does.
+            //
+            // Sign follows the position: negative closing a long, positive
+            // closing a short. And the trigger price above is what makes this a
+            // Stop -- a peg sent without one becomes a plain market order and
+            // closes the position immediately, which is not a failure anyone
+            // would want to discover live.
+            params.pegOffsetValueRp =
+              side === 'sell' ? -Math.abs(trailOffset) : Math.abs(trailOffset);
+            params.pegPriceType = 'TrailingStopPeg';
+          }
         }
 
         // If the reduce-only feature is supported by the exchange, add the corresponding property to the parameters object
@@ -3205,6 +3221,57 @@ export class ExchangeClient {
       });
       return undefined; // Return undefined on error
     }
+  }
+
+  /**
+   * A stop the exchange trails behind the best price.
+   *
+   * The distance is fixed once and maintained by Phemex, which is the whole
+   * point: a trail that this process maintained would stop trailing the moment
+   * it died, leaving a stop frozen wherever it happened to be while looking
+   * like it was still working.
+   *
+   * `percent` treats the value as a percentage of the current price rather than
+   * an absolute distance.
+   */
+  async createTrailingStopOrder(
+    market: string,
+    value: number,
+    percent = false
+  ): Promise<Order | undefined> {
+    if (!(value > 0) || !Number.isFinite(value)) {
+      throw new Error(`Invalid trail value '${value}'. Give a distance greater than 0.`);
+    }
+
+    const position = await this.getPositionView(market);
+    if (!position || !(position.size > 0)) {
+      throw new Error('No open position to trail.');
+    }
+
+    const reference = await this.getReferencePrice(market);
+    if (reference === undefined) {
+      throw new Error(
+        `No price available for ${market}, so the trail cannot be placed.`
+      );
+    }
+
+    const distance = percent ? (reference * value) / 100 : value;
+    if (!(distance > 0)) {
+      throw new Error('That trail works out to zero distance.');
+    }
+
+    const isLong = position.side.toUpperCase() === 'LONG';
+    // Starts one trail-width away, as a trailing stop does, and the exchange
+    // moves it from there.
+    const start = isLong ? reference - distance : reference + distance;
+
+    if (!(start > 0)) {
+      throw new Error(
+        `A trail of ${distance} puts the stop at or below zero from ${reference}.`
+      );
+    }
+
+    return this.createStopOrder(market, start, undefined, false, true, distance);
   }
 
   async updateStopOrder(
