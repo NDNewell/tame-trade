@@ -14,6 +14,7 @@ const FOOTER = [
   'sell',
   'chase',
   'limit',
+  'trail',
   'cancel',
   'orders',
   'positions',
@@ -43,6 +44,15 @@ const formatPositionSize = (value: number, base?: string): string => {
   });
 
   return base ? `${grouped} ${base}` : grouped;
+};
+
+/** Time remaining as mm:ss, floored at zero. */
+const countdown = (deadline: number): string => {
+  const remaining = Math.max(0, deadline - Date.now());
+  const total = Math.ceil(remaining / 1000);
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 };
 
 const signed = (value: unknown): string => {
@@ -123,6 +133,8 @@ export class Workspace {
   private market = '';
   private accountLabel: string | undefined;
   private refreshTimer: NodeJS.Timeout | null = null;
+  private tickTimer: NodeJS.Timeout | null = null;
+  private lastOrders: TerminalView['orders'] = [];
 
   constructor(
     private client: ExchangeClient,
@@ -157,6 +169,7 @@ export class Workspace {
     // The feeds push prices and order events; this refresh covers what only REST
     // can tell us, chiefly the position.
     this.refreshTimer = setInterval(() => void this.refresh(), 2000);
+    this.tickTimer = setInterval(() => this.tickCountdown(), 1000);
     void this.refresh();
   }
 
@@ -189,9 +202,32 @@ export class Workspace {
 
   stop(): void {
     if (this.refreshTimer) clearInterval(this.refreshTimer);
+    if (this.tickTimer) clearInterval(this.tickTimer);
     this.refreshTimer = null;
+    this.tickTimer = null;
     this.screen?.stop();
     this.screen = null;
+  }
+
+  /**
+   * Advances the countdown between data refreshes.
+   *
+   * Only repaints while a decaying chase is running, and only rewrites the
+   * countdown from what is already known -- a clock is not worth an API call a
+   * second, and repainting a static screen every second is not worth it either.
+   */
+  private tickCountdown(): void {
+    const deadline = this.client.getChaseDeadline();
+    const chaseOrderId = this.client.getCurrentChaseOrderId();
+    if (!deadline || !chaseOrderId || !this.screen) return;
+
+    this.screen.update({
+      orders: this.lastOrders.map((order) =>
+        order.managed === 'CHASE'
+          ? { ...order, expires: countdown(deadline) }
+          : order
+      ),
+    });
   }
 
   private async refresh(): Promise<void> {
@@ -218,8 +254,11 @@ export class Workspace {
           : this.client.formatPriceForDisplay(this.market, Number(value));
 
       const base = this.client.getBaseAsset(this.market);
+      const chaseOrderId = this.client.getCurrentChaseOrderId();
+      const chaseDeadline = this.client.getChaseDeadline();
 
       this.screen.update({
+        header: this.header(),
         market: {
           symbol,
           last: tick(price.last),
@@ -260,7 +299,7 @@ export class Workspace {
               liquidation: dash(position.liquidation),
             }
           : null,
-        orders: orders.map((order) => {
+        orders: (this.lastOrders = orders.map((order) => {
           const info = (order as any).info ?? {};
           const trigger = (order as any).triggerPrice ?? info.stopPxRp ?? info.stopPxEp;
           const size = Number(order.remaining ?? order.amount ?? 0);
@@ -271,6 +310,14 @@ export class Workspace {
           const type = isTrigger
             ? 'STOP'
             : String(order.type ?? 'LIMIT').toUpperCase();
+
+          // A trailing stop is a stop the exchange keeps moving. Without this
+          // it is indistinguishable from a fixed one in the panel, so there is
+          // no way to tell from the screen whether the trail actually took.
+          const peg = Number(info.pegOffsetValueRp ?? info.pegOffsetValueEp ?? 0);
+          const isTrailing =
+            peg !== 0 &&
+            String(info.pegPriceType ?? '').toLowerCase().includes('trailing');
 
           const filled = Number(order.filled ?? 0);
           const status = isTrigger
@@ -294,8 +341,21 @@ export class Workspace {
               : NO_VALUE,
             type,
             status,
+            // Only while a chase is actually running and working this order.
+            // CHASE is checked first: it means this process is working the
+            // order, which is a stronger claim than the exchange trailing it.
+            managed:
+              chaseOrderId && order.id === chaseOrderId
+                ? 'CHASE'
+                : isTrailing
+                ? 'TRAIL'
+                : undefined,
+            expires:
+              chaseOrderId && order.id === chaseOrderId && chaseDeadline
+                ? countdown(chaseDeadline)
+                : undefined,
           };
-        }),
+        })),
       });
     } catch (error) {
       ActivityLog.getInstance().add('WARNING', `Could not refresh: ${(error as Error).message}`);

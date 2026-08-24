@@ -95,4 +95,36 @@ export function describeLockHolder(holder: LockHolder): string {
   return `Tame is already running (pid ${holder.pid}, started ${when}).`;
 }
 
+/**
+ * Stops the instance holding the lock and waits for it to actually go.
+ *
+ * SIGTERM first, then SIGKILL if it hasn't gone: the aim is for it to stop, not
+ * to be polite about it. Returns false if it is still alive afterwards, so the
+ * caller never takes a lock that another running process still holds.
+ */
+export async function stopHolder(pid: number, timeoutMs = 4000): Promise<boolean> {
+  if (!isRunning(pid)) return true;
+
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch {
+    return !isRunning(pid);
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isRunning(pid)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch {
+    // Already gone between the check and the signal.
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  return !isRunning(pid);
+}
+
 export const LOCK_FILE_PATH = LOCK_FILE;

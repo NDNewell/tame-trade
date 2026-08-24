@@ -95,6 +95,22 @@ can never open a position in the opposite direction.
 
 `trigger buy [size] [price] or trigger sell [size] [price]`: Place a non-reduce-only stop order.
 
+`trail [distance]` / `trail [percent]%`: Place a trailing stop covering the whole
+position. `trail 1.5` trails 1.50 behind the best price; `trail 2%` trails 2%.
+The stop starts one trail-width away from the current price.
+
+The exchange maintains the trail, not Tame, so it keeps working whether or not
+this application is running. That is deliberate: a trail maintained locally would
+freeze wherever it happened to be if the process stopped, while still looking
+like it was following the price.
+
+Trails follow the **mark price** rather than the last traded price. Last price is
+what a wick moves: a spike on this venue ratchets the trail up behind it, and
+when price returns the stop is left near the market and closes the position on a
+move that never really happened. Mark price comes from the index, so a wick that
+does not move the wider market barely moves the trail. Fixed stops still trigger
+on last price, matching the exchange UI.
+
 `bump + [value] or bump - [value]`: Bump all orders by the specified value.
 
 `cancel all`: Cancel all resting orders, including stops.

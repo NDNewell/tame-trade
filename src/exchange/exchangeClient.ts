@@ -19,6 +19,20 @@ import { describeExchangeError, isMissingOrderError } from '../utils/exchangeErr
 import { NotificationManager } from '../utils/notificationManager.js';
 import { NType } from '../utils/notificationManager.js';
 
+/** How an order ended: the one shape every caller reads. */
+/** How many orders a cancel actually removed, and how many refused. */
+export interface CancelResult {
+  cancelled: number;
+  failed: number;
+}
+
+export interface OrderOutcome {
+  status: string;
+  filled: number;
+  average?: number;
+  at: number;
+}
+
 // Define a more flexible Position interface to handle ccxt's types
 interface Position {
   symbol: string;
@@ -52,6 +66,7 @@ export class ExchangeClient {
   // than remember the id the chase started with — otherwise it cancels an order
   // that is already gone and leaves the live one resting.
   private currentChaseOrderId: string | undefined = undefined;
+  private chaseDeadline: number | undefined = undefined;
   private tickerStreams = new Map<
     string,
     { price: number | undefined; at: number; running: boolean }
@@ -76,6 +91,15 @@ export class ExchangeClient {
     {
       orders: Map<string, Order>;
       filledSoFar: Map<string, number>;
+      /**
+       * How orders ended, as the feed reported it.
+       *
+       * The stream says an order closed, for how much and at what price, at the
+       * moment it happens. Discarding that and then asking the REST history API
+       * the same question is what made filled orders report as unfilled: that
+       * API trails the book and answers with an empty record in between.
+       */
+      finished: Map<string, OrderOutcome>;
       running: boolean;
       healthy: boolean;
       syncedAt: number;
@@ -182,7 +206,9 @@ export class ExchangeClient {
     try {
       this.availableMarkets = await this.exchange.loadMarkets();
     } catch (error) {
-      console.error(`[ExchangeClient] Failed to fetch markets:`, error);
+      const failure = describeExchangeError(error);
+      NotificationManager.diagnostic(`[loadMarkets] ${failure.raw}`);
+      NotificationManager.notify(`Could not load markets: ${failure.summary}`, NType.ERROR, 'ERROR');
     }
   }
 
@@ -541,6 +567,57 @@ export class ExchangeClient {
     });
   }
 
+  /**
+   * How an order ended, from the feed if it saw it and from the exchange if not.
+   *
+   * One place decides what "finished" means, so the rule that an empty record is
+   * 'not known yet' rather than 'nothing filled' is written once instead of at
+   * every call site -- which is how filled orders came to be reported as
+   * unfilled in three separate places.
+   *
+   * The feed is asked first because it already knows, and again between each
+   * fallback attempt, since the event may arrive while the REST lookup is being
+   * waited on.
+   */
+  async getOrderOutcome(
+    market: string,
+    orderId: string
+  ): Promise<OrderOutcome | undefined> {
+    const fromStream = () => this.orderStreams.get(market)?.finished.get(orderId);
+
+    const streamed = fromStream();
+    if (streamed) return streamed;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) {
+        await this.sleep(750);
+        const late = fromStream();
+        if (late) return late;
+      }
+
+      try {
+        const order = await this.exchange!.fetchOrder(orderId, market);
+        const filled = Number(order?.filled ?? NaN);
+        const status = String(order?.status ?? '');
+
+        // Only a record that says something is allowed to decide the outcome.
+        if (Number.isFinite(filled) && (filled > 0 || status !== '')) {
+          const average = Number(order?.average ?? order?.price ?? NaN);
+          return {
+            status,
+            filled,
+            average: Number.isFinite(average) ? average : undefined,
+            at: Date.now(),
+          };
+        }
+      } catch {
+        // Not in the history API yet either; the next pass re-checks the feed.
+      }
+    }
+
+    return undefined;
+  }
+
   /** Open orders for display. Uses the live view; completeness isn't critical. */
   async getOpenOrdersForDisplay(market: string): Promise<Order[]> {
     try {
@@ -791,7 +868,7 @@ export class ExchangeClient {
   // from a stream rather than a request removes a round trip from paths that are
   // typed in a hurry.
   private startTickerStream(market: string): void {
-    if (!this.exchange?.has['watchTicker']) return;
+    if (!this.exchange?.has?.['watchTicker']) return;
     if (this.tickerStreams.get(market)?.running) return;
 
     const state = { price: undefined as number | undefined, at: 0, running: true };
@@ -834,12 +911,13 @@ export class ExchangeClient {
     params?: Record<string, any>,
     snapshot?: Order[]
   ): void {
-    if (!this.exchange?.has['watchOrders']) return;
+    if (!this.exchange?.has?.['watchOrders']) return;
     if (this.orderStreams.get(market)?.running) return;
 
     const state = {
       orders: new Map<string, Order>(),
       filledSoFar: new Map<string, number>(),
+      finished: new Map<string, OrderOutcome>(),
       running: true,
       healthy: false,
       syncedAt: 0,
@@ -884,6 +962,21 @@ export class ExchangeClient {
             this.announceOrderUpdate(market, update, state);
 
             if (done) {
+              const average = Number(update.average ?? update.price ?? NaN);
+              state.finished.set(update.id, {
+                status,
+                filled: Number(update.filled ?? 0),
+                average: Number.isFinite(average) ? average : undefined,
+                at: Date.now(),
+              });
+
+              // Bounded: this is a short memory for orders just closed, not a
+              // history of the account.
+              if (state.finished.size > 200) {
+                const oldest = state.finished.keys().next().value;
+                if (oldest !== undefined) state.finished.delete(oldest);
+              }
+
               state.orders.delete(update.id);
               state.filledSoFar.delete(update.id);
             } else {
@@ -1317,6 +1410,13 @@ export class ExchangeClient {
         const side = order?.side ? `${this.capitalise(String(order.side))} ` : '';
         const amount = order?.amount !== undefined ? this.trimAmount(parseFloat(order.amount)) : '';
         const trigger = order?.triggerPrice ?? order?.stopPrice;
+
+        // Stops announce themselves, and with better wording -- 'STOP WORKING'
+        // rather than a bare 'STOP'. Announcing here too gave one order two rows.
+        if (trigger !== undefined) {
+          return order;
+        }
+
         const at =
           trigger !== undefined
             ? ` triggering at ${trigger}`
@@ -1327,7 +1427,12 @@ export class ExchangeClient {
         NotificationManager.notify('', NType.INFO, 'ORDER', undefined, {
           side: order?.side ? String(order.side).toUpperCase() : undefined,
           quantity: this.formatQuantity(Number(order?.amount)),
-          price: trigger !== undefined ? String(trigger) : order?.price ? String(order.price) : undefined,
+          price:
+            trigger !== undefined
+              ? this.formatPriceForDisplay(market, Number(trigger))
+              : order?.price
+              ? this.formatPriceForDisplay(market, Number(order.price))
+              : undefined,
           status: trigger !== undefined ? 'STOP' : 'ACCEPTED',
         });
       } catch {
@@ -1620,12 +1725,48 @@ export class ExchangeClient {
     }
   }
 
-  async cancelAllOrders(symbol: string): Promise<void> {
-    this.cancelAllStopOrders(symbol);
-    this.cancelAllLimitOrders(symbol);
+  /**
+   * Any order resting until a trigger price is reached.
+   *
+   * Detected by carrying a trigger price rather than by an order-type string.
+   * ccxt leaves Phemex's 'Stop' unmapped, so order.type is 'Stop' and a test for
+   * 'stop' matches nothing -- which is how 'cancel stops' came to cancel nothing
+   * while reporting success.
+   */
+  private isTriggerOrder(order: Order): boolean {
+    const info = (order as any).info ?? {};
+    const trigger = Number(
+      (order as any).triggerPrice ?? info.stopPxRp ?? info.stopPxEp ?? 0
+    );
+    if (trigger > 0) return true;
+
+    const type = String(
+      info.ordType ?? info.orderType ?? order.type ?? ''
+    ).toLowerCase();
+
+    return type.includes('stop') || type.includes('trigger') || info.isTrigger === true;
   }
 
-  async cancelAllLimitOrders(symbol: string): Promise<void> {
+  /**
+   * Cancels everything, and waits for it.
+   *
+   * Both calls were previously left unawaited, so this returned before anything
+   * had been cancelled and the caller reported success on work that had not
+   * happened -- or had failed.
+   */
+  async cancelAllOrders(symbol: string): Promise<CancelResult> {
+    const [stops, limits] = await Promise.all([
+      this.cancelAllStopOrders(symbol),
+      this.cancelAllLimitOrders(symbol),
+    ]);
+
+    return {
+      cancelled: stops.cancelled + limits.cancelled,
+      failed: stops.failed + limits.failed,
+    };
+  }
+
+  async cancelAllLimitOrders(symbol: string): Promise<CancelResult> {
     try {
       // Get public wallet address from exchange config for Hyperliquid
       const walletAddress = this.exchange?.id === 'hyperliquid' ?
@@ -1648,27 +1789,37 @@ export class ExchangeClient {
                                order.info?.orderType !== 'StopMarket';
           return isBasicLimit && isNotTrigger;
         }
-        return order.type === 'limit';
+        return order.type === 'limit' && !this.isTriggerOrder(order);
       });
 
-      // If there are no limit orders, simply return without doing anything further
-      if (limitOrders.length === 0) {
-        console.log('No open limit orders to cancel.');
-        return;
+      if (limitOrders.length === 0) return { cancelled: 0, failed: 0 };
+
+      const results = await Promise.allSettled(
+        limitOrders.map((order) =>
+          // The wallet parameter was omitted here while the fetch above used it.
+          this.exchange!.cancelOrder(order.id, symbol, walletAddress ? { user: walletAddress } : undefined)
+        )
+      );
+
+      const failed = results.filter((r) => r.status === 'rejected').length;
+      for (const result of results) {
+        if (result.status === 'rejected') {
+          NotificationManager.diagnostic(
+            `[cancelAllLimitOrders] ${describeExchangeError(result.reason).raw}`
+          );
+        }
       }
 
-      // If there are limit orders, proceed with canceling them
-      const cancelPromises = limitOrders.map((order) =>
-        this.exchange!.cancelOrder(order.id, symbol)
-      );
-      // Wait for all cancellations to complete
-      await Promise.all(cancelPromises);
+      return { cancelled: results.length - failed, failed };
     } catch (error) {
-      console.error('Error cancelling limit orders:', error);
+      const failure = describeExchangeError(error);
+      NotificationManager.diagnostic(`[cancelAllLimitOrders] ${failure.raw}`);
+      NotificationManager.notify(`Limit orders NOT cancelled: ${failure.summary}`, NType.ERROR, 'ERROR');
+      return { cancelled: 0, failed: 0 };
     }
   }
 
-  async cancelAllStopOrders(symbol: string): Promise<void> {
+  async cancelAllStopOrders(symbol: string): Promise<CancelResult> {
     try {
       // Get public wallet address from exchange config for Hyperliquid
       const walletAddress = this.exchange?.id === 'hyperliquid' ?
@@ -1680,36 +1831,31 @@ export class ExchangeClient {
       // Fetch open orders with wallet address for Hyperliquid
       const openOrders = await this.exchange!.fetchOpenOrders(symbol, undefined, undefined, params);
 
-      let stopOrders = [];
+      const stopOrders = openOrders.filter((order) => this.isTriggerOrder(order));
 
-      // For Hyperliquid, check for both standard stop orders and Hyperliquid's specific stop order types
-      if (this.exchange!.id === 'hyperliquid') {
-        stopOrders = openOrders.filter(
-          (order) => {
-            return order.type === 'stop' ||
-                   order.info?.orderType === 'Stop Limit' ||
-                   order.info?.orderType === 'Trigger' ||
-                   order.info?.orderType === 'StopMarket' ||
-                   (order.info?.isTrigger === true);
-          }
-        );
-      } else {
-        // For other exchanges, use standard stop order detection
-        stopOrders = openOrders.filter(
-          (order) =>
-            order.type === 'stop' ||
-            order.info?.order_type === 'stop_market'
-        );
+      if (stopOrders.length === 0) return { cancelled: 0, failed: 0 };
+
+      // Settled rather than all: one refusal should not discard the outcome of
+      // the others, and the caller needs to know how many actually went.
+      const results = await Promise.allSettled(
+        stopOrders.map((order) => this.exchange!.cancelOrder(order.id, symbol, params))
+      );
+
+      const failed = results.filter((r) => r.status === 'rejected').length;
+      for (const result of results) {
+        if (result.status === 'rejected') {
+          NotificationManager.diagnostic(
+            `[cancelAllStopOrders] ${describeExchangeError(result.reason).raw}`
+          );
+        }
       }
 
-      if (stopOrders.length > 0) {
-        const cancelPromises = stopOrders.map((order) =>
-          this.exchange!.cancelOrder(order.id, symbol, params)
-        );
-        await Promise.all(cancelPromises);
-      }
+      return { cancelled: results.length - failed, failed };
     } catch (error) {
-      console.error('Error cancelling stop orders:', error);
+      const failure = describeExchangeError(error);
+      NotificationManager.diagnostic(`[cancelAllStopOrders] ${failure.raw}`);
+      NotificationManager.notify(`Stop orders NOT cancelled: ${failure.summary}`, NType.ERROR, 'ERROR');
+      return { cancelled: 0, failed: 0 };
     }
   }
 
@@ -1737,11 +1883,21 @@ export class ExchangeClient {
             // console.warn(`[cancelChaseOrder] Attempted to cancel chase order ${orderId}, but it was likely already finalized.`);
         } else {
             // Log other errors as actual problems
-            console.error('Error cancelling chase order:', error);
+            NotificationManager.diagnostic(`[cancelChaseOrder] ${(error as Error).message}`);
             // Optionally re-throw if needed downstream
             // throw error;
         }
     }
+  }
+
+  /** When the running chase expires, if it was given a decay. */
+  getChaseDeadline(): number | undefined {
+    return this.chaseLimitOrderActive ? this.chaseDeadline : undefined;
+  }
+
+  /** The order the chase is currently working, if one is running. */
+  getCurrentChaseOrderId(): string | undefined {
+    return this.chaseLimitOrderActive ? this.currentChaseOrderId : undefined;
   }
 
   getChaseLimitOrderStatus(): boolean {
@@ -1861,7 +2017,7 @@ export class ExchangeClient {
         const failure = describeExchangeError(error);
         // The raw payload is kept as a diagnostic rather than printed across
         // the activity row.
-        console.error(`[ExchangeClient/chase] ${failure.raw}`);
+        NotificationManager.diagnostic(`[chase] ${failure.raw}`);
 
         consecutiveErrors++;
         this.logAndReplace(
@@ -2085,33 +2241,20 @@ export class ExchangeClient {
           // meantime with an empty record. An empty record is 'not yet known',
           // never 'did not fill', so only a record that actually says something
           // is allowed to decide the outcome.
-          let outcome: string | undefined;
+          const result = await this.getOrderOutcome(market, orderId);
 
-          for (let attempt = 0; attempt < 3 && outcome === undefined; attempt++) {
-            if (attempt > 0) {
-              await this.sleep(750);
-            }
-
-            try {
-              const finalOrder = await this.exchange!.fetchOrder(orderId, market, params);
-              const filled = Number(finalOrder?.filled ?? 0);
-              const status = String(finalOrder?.status ?? '');
-
-              if (status === 'closed' || filled >= amount) {
-                outcome = `filled for ${filled || amount}`;
-              } else if (status === 'canceled' || status === 'rejected') {
-                outcome =
-                  filled > 0
-                    ? `${status} after filling ${filled} of ${amount}`
-                    : `${status} without filling`;
-              } else if (filled > 0) {
-                outcome = `ended with ${filled} of ${amount} filled`;
-              }
-              // Anything else is an unpopulated record: try again.
-            } catch {
-              // Not visible to the history API yet either; try again.
-            }
-          }
+          const outcome =
+            result === undefined
+              ? undefined
+              : result.status === 'closed' || result.filled >= amount
+              ? `filled for ${result.filled || amount}`
+              : result.status === 'canceled' || result.status === 'rejected'
+              ? result.filled > 0
+                ? `${result.status} after filling ${result.filled} of ${amount}`
+                : `${result.status} without filling`
+              : result.filled > 0
+              ? `ended with ${result.filled} of ${amount} filled`
+              : undefined;
 
           finishChase(
             outcome !== undefined
@@ -2245,8 +2388,8 @@ export class ExchangeClient {
     // port). A chase that polls is worse than one that streams, but far better
     // than one that doesn't run.
     const canStream =
-      Boolean(this.exchange.has['watchOrderBook']) &&
-      Boolean(this.exchange.has['watchOrders']);
+      Boolean(this.exchange.has?.['watchOrderBook']) &&
+      Boolean(this.exchange.has?.['watchOrders']);
 
     if (canStream) {
       this.runStreamingChase({
@@ -2287,6 +2430,11 @@ export class ExchangeClient {
 
     if (decay) {
       const decayTime = parseDecayTime(decay);
+      // Recorded so the interface can count it down. Read through
+      // getChaseDeadline, which returns nothing once the chase has ended, so a
+      // finished chase can't leave a countdown running on screen.
+      this.chaseDeadline = Date.now() + decayTime;
+
       setTimeout(() => {
         if (this.chaseLimitOrderActive) {
           // Pass params to cancelChaseOrder
@@ -2312,17 +2460,9 @@ export class ExchangeClient {
     requested: number,
     finish: (message: string) => void
   ): Promise<void> {
-    let filled: number | undefined;
-    let price: number | undefined;
-
-    try {
-      const order = await this.exchange!.fetchOrder(orderId, market);
-      filled = Number(order?.filled ?? 0);
-      const raw = order?.average ?? order?.price;
-      price = raw === undefined ? undefined : Number(raw);
-    } catch {
-      // The order is gone from the live book and not yet in history.
-    }
+    const outcome = await this.getOrderOutcome(market, orderId);
+    const filled = outcome?.filled;
+    const price = outcome?.average;
 
     if (filled !== undefined && filled > 0) {
       NotificationManager.notify('', NType.SUCCESS, 'FILL', undefined, {
@@ -2340,7 +2480,8 @@ export class ExchangeClient {
       remainder !== undefined && remainder > 1e-9
         ? `Chase ended with ${this.formatQuantity(remainder)} unfilled.`
         : filled === undefined
-        ? 'Chase ended: the order is no longer on the exchange.'
+        ? // Never assert it didn't fill on a lookup that never answered.
+          'Chase ended — the exchange has not reported the outcome yet. Check your position.'
         : ''
     );
   }
@@ -2798,7 +2939,7 @@ export class ExchangeClient {
             const newOrderId = await this.updateStopOrder(symbol, undefined, newStopPrice);
             return newOrderId;
         } catch (error) {
-            console.error(`[ExchangeClient] Failed to update stop order for Hyperliquid via editCurrentStopOrder:`, error);
+            NotificationManager.diagnostic(`[editCurrentStopOrder] ${(error as Error).message}`);
             // Re-throw or return undefined based on desired error handling
             throw error;
         }
@@ -2888,7 +3029,9 @@ export class ExchangeClient {
     price: number,
     quantity?: number,
     suppressLog?: boolean,
-    enforceFatFinger: boolean = true
+    enforceFatFinger: boolean = true,
+    /** Absolute price distance the exchange should trail the stop by. */
+    trailOffset?: number
   ): Promise<Order | undefined> {
     // A size we work out from the position isn't something the user typed, so it
     // isn't subject to the fatfinger limit — a stop must always be placeable.
@@ -3029,6 +3172,31 @@ export class ExchangeClient {
           // The UI triggers on last price; ccxt defaults to mark price, and the
           // two diverge. 'trigger' was the wrong key and never took effect.
           params.triggerType = 'ByLastPrice';
+
+          if (trailOffset !== undefined && trailOffset > 0) {
+            // A trail follows the price, so the price it follows matters more
+            // than for a fixed stop. Last price is what a wick moves: a spike
+            // on this venue ratchets the trail up behind it, and when price
+            // comes back the stop is left sitting near the market and takes the
+            // position out on a move that never really happened.
+            //
+            // Mark price is derived from the index, so a wick that doesn't move
+            // the wider market barely moves it. Costs nothing and keeps working
+            // while disconnected, which monitoring cannot.
+            params.triggerType = 'ByMarkPrice';
+
+            // The exchange maintains the trail from here, so it keeps working
+            // whether or not this process does.
+            //
+            // Sign follows the position: negative closing a long, positive
+            // closing a short. And the trigger price above is what makes this a
+            // Stop -- a peg sent without one becomes a plain market order and
+            // closes the position immediately, which is not a failure anyone
+            // would want to discover live.
+            params.pegOffsetValueRp =
+              side === 'sell' ? -Math.abs(trailOffset) : Math.abs(trailOffset);
+            params.pegPriceType = 'TrailingStopPeg';
+          }
         }
 
         // If the reduce-only feature is supported by the exchange, add the corresponding property to the parameters object
@@ -3106,7 +3274,7 @@ export class ExchangeClient {
       const failure = describeExchangeError(error);
       // The full response stays available, marked as diagnostic so it doesn't
       // run across the activity row.
-      console.error(`[ExchangeClient/createStopOrder] ${failure.raw}`);
+      NotificationManager.diagnostic(`[createStopOrder] ${failure.raw}`);
 
       NotificationManager.notify(failure.summary, NType.ERROR, 'ERROR', undefined, {
         side: 'STOP',
@@ -3114,6 +3282,57 @@ export class ExchangeClient {
       });
       return undefined; // Return undefined on error
     }
+  }
+
+  /**
+   * A stop the exchange trails behind the best price.
+   *
+   * The distance is fixed once and maintained by Phemex, which is the whole
+   * point: a trail that this process maintained would stop trailing the moment
+   * it died, leaving a stop frozen wherever it happened to be while looking
+   * like it was still working.
+   *
+   * `percent` treats the value as a percentage of the current price rather than
+   * an absolute distance.
+   */
+  async createTrailingStopOrder(
+    market: string,
+    value: number,
+    percent = false
+  ): Promise<Order | undefined> {
+    if (!(value > 0) || !Number.isFinite(value)) {
+      throw new Error(`Invalid trail value '${value}'. Give a distance greater than 0.`);
+    }
+
+    const position = await this.getPositionView(market);
+    if (!position || !(position.size > 0)) {
+      throw new Error('No open position to trail.');
+    }
+
+    const reference = await this.getReferencePrice(market);
+    if (reference === undefined) {
+      throw new Error(
+        `No price available for ${market}, so the trail cannot be placed.`
+      );
+    }
+
+    const distance = percent ? (reference * value) / 100 : value;
+    if (!(distance > 0)) {
+      throw new Error('That trail works out to zero distance.');
+    }
+
+    const isLong = position.side.toUpperCase() === 'LONG';
+    // Starts one trail-width away, as a trailing stop does, and the exchange
+    // moves it from there.
+    const start = isLong ? reference - distance : reference + distance;
+
+    if (!(start > 0)) {
+      throw new Error(
+        `A trail of ${distance} puts the stop at or below zero from ${reference}.`
+      );
+    }
+
+    return this.createStopOrder(market, start, undefined, false, true, distance);
   }
 
   async updateStopOrder(
@@ -3234,7 +3453,9 @@ export class ExchangeClient {
         if (error.message && error.message.includes('Order not found')) {
             console.warn(`[ExchangeClient] Attempted to update stop order ${market}, but it might have been filled or cancelled.`);
         } else {
-            console.error(`[ExchangeClient] Failed to update stop order for ${market}:`, error);
+            const failure = describeExchangeError(error);
+      NotificationManager.diagnostic(`[updateStopOrder] ${failure.raw}`);
+      NotificationManager.notify(`Stop NOT updated: ${failure.summary}`, NType.ERROR, 'ERROR');
             // Potentially re-throw or handle specific errors differently
              throw error;
         }
@@ -3272,7 +3493,7 @@ export class ExchangeClient {
         console.log(`No need to synchronize time. Time difference: ${timeDifference} ms`);
       }
     } catch (error) {
-      console.error(`[ExchangeClient] Failed to synchronize time with exchange:`, error);
+      NotificationManager.diagnostic(`[synchronizeTime] ${(error as Error).message}`);
     }
   }
 
