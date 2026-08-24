@@ -82,7 +82,9 @@ export class ExchangeClient {
   >();
   /** Looked up once per session; it does not change while connected. */
   private accountLabel: string | undefined;
-  private equityCache: { at: number; currency: string; equity?: number } | undefined;
+  private equityCache:
+    | { at: number; currency: string; balance?: number; equity?: number }
+    | undefined;
   private accountLookupDone = false;
   /** The market being followed, so account lookups know which wallet to ask for. */
   private lastFollowedMarket: string | undefined;
@@ -366,10 +368,62 @@ export class ExchangeClient {
    * fallback paths that return differently shaped objects, so the field is not
    * dependable; entry, mark and size are, and the arithmetic is not in doubt.
    */
+  /**
+   * Unrealized on one position, derived from entry and mark.
+   *
+   * It is derived rather than read because ccxt's parsed `unrealizedPnl` is
+   * not usable on Phemex: on a 250-lot sitting 0.04 above entry it returned
+   * 0.00105 where the true figure was 10.00. Anything that trusts that field
+   * reports a flat account no matter how the position is doing.
+   *
+   * The mark comes from the position payload rather than a price lookup, and
+   * that is the point: entry, size and mark then all describe the same instant.
+   * Valuing against a separately fetched price mixes two snapshots, which is
+   * what made the panel show a mark and an unrealized figure that could not be
+   * reconciled with each other. It also costs nothing -- the exchange sends it
+   * with the position, and it is the mark that drives the liquidation price
+   * shown beside it.
+   *
+   * Phemex marks positions to the mark price, not the last trade, so order
+   * pricing keeps using getReferencePrice: the last trade is what a taker
+   * actually pays. The two answer different questions.
+   *
+   * Both the position panel and account equity come through here, so the two
+   * cannot report different unrealized figures on the same screen.
+   */
+  /** The mark the exchange stamped on this position, if it sent a usable one. */
+  private markPriceOf(position: any): number | undefined {
+    const mark = Number(position?.markPrice ?? NaN);
+    return Number.isFinite(mark) && mark > 0 ? mark : undefined;
+  }
+
+  private unrealizedPnlOf(position: any, market: string): number | undefined {
+    const contracts = Math.abs(Number(position?.contracts ?? 0));
+    if (contracts === 0) return undefined;
+
+    const mark = this.markPriceOf(position);
+
+    const marketInfo = this.availableMarkets?.[market];
+    const contractSize = Number(marketInfo?.contractSize ?? 1);
+    const entry = Number(position?.entryPrice ?? NaN);
+
+    if (!Number.isFinite(entry) || entry <= 0) return undefined;
+    if (mark === undefined || !Number.isFinite(mark) || mark <= 0) return undefined;
+
+    const direction =
+      String(position?.side ?? '').toLowerCase() === 'long' ? 1 : -1;
+
+    return marketInfo?.inverse
+      ? contracts * contractSize * (1 / entry - 1 / mark) * direction
+      : contracts * contractSize * (mark - entry) * direction;
+  }
+
   async getPositionView(market: string): Promise<{
     side: string;
     size: number;
     entry?: number;
+    /** The mark these figures were computed against, not a separate reading. */
+    mark?: number;
     unrealizedPnl?: number;
     realizedPnl?: number;
     leverage?: number;
@@ -383,25 +437,16 @@ export class ExchangeClient {
 
     const info = position as any;
     const marketInfo = this.availableMarkets?.[market];
-    const contractSize = Number(marketInfo?.contractSize ?? 1);
     const currency = String(marketInfo?.settle ?? marketInfo?.quote ?? '');
 
     const entry = Number(position.entryPrice ?? info.entryPrice ?? NaN);
-    const mark = await this.getReferencePrice(market);
-    const isLong = String(position.side ?? '').toLowerCase() === 'long';
-
-    let unrealizedPnl: number | undefined;
-    if (Number.isFinite(entry) && mark !== undefined && entry > 0) {
-      const direction = isLong ? 1 : -1;
-      unrealizedPnl = marketInfo?.inverse
-        ? contracts * contractSize * (1 / entry - 1 / mark) * direction
-        : contracts * contractSize * (mark - entry) * direction;
-    }
+    const unrealizedPnl = this.unrealizedPnlOf(position, market);
 
     return {
       side: String(position.side ?? '').toUpperCase(),
       size: contracts,
       entry: Number.isFinite(entry) ? entry : undefined,
+      mark: this.markPriceOf(position),
       unrealizedPnl,
       realizedPnl: this.readRealizedPnl(info),
       leverage: Number(info.leverage) || undefined,
@@ -732,27 +777,97 @@ export class ExchangeClient {
    * Effective leverage needs account equity, and the balance call is
    * authenticated, so it is not made on every repaint.
    */
-  private async getAccountBalance(currency: string): Promise<number | undefined> {
+  /**
+   * Wallet balance and account equity, cached together.
+   *
+   * Balance is what the exchange holds; equity is that plus what every open
+   * position is currently up or down. They differ by exactly the unrealized
+   * amount, which is the number that decides whether the account can take
+   * another position -- so both are worth showing rather than one.
+   *
+   * Unrealized is summed across all positions, not just the market on screen:
+   * equity is an account-level figure and counting only the visible position
+   * would overstate it whenever anything else is open.
+   */
+  private async getAccountSummary(currency: string): Promise<{
+    balance?: number;
+    equity?: number;
+  }> {
     const cached = this.equityCache;
     if (
       cached &&
       cached.currency === currency &&
       Date.now() - cached.at <= ExchangeClient.EQUITY_CACHE_MS
     ) {
-      return cached.equity;
+      return { balance: cached.balance, equity: cached.equity };
     }
 
+    let balance: number | undefined;
     let equity: number | undefined;
+
     try {
-      const balance: any = await this.fetchAccountSnapshot(currency);
-      const total = balance?.total?.[currency];
-      equity = Number.isFinite(Number(total)) ? Number(total) : undefined;
+      const snapshot: any = await this.fetchAccountSnapshot(currency);
+      const total = snapshot?.total?.[currency];
+      balance = Number.isFinite(Number(total)) ? Number(total) : undefined;
     } catch {
-      equity = undefined;
+      balance = undefined;
     }
 
-    this.equityCache = { at: Date.now(), currency, equity };
-    return equity;
+    if (balance !== undefined) {
+      try {
+        const positions = await this.exchange!.fetchPositions(undefined, {
+          type: 'swap',
+          code: currency,
+        });
+
+        const open = positions.filter(
+          (position) => Math.abs(Number((position as any).contracts ?? 0)) > 0
+        );
+
+        let unrealized = 0;
+        let complete = true;
+
+        for (const position of open) {
+          const symbol = String((position as any).symbol ?? '');
+          const value = this.unrealizedPnlOf(position, symbol);
+
+          // One position we cannot price makes the total wrong by an unknown
+          // amount, and an equity figure that is quietly short is worse than
+          // no equity figure at all -- it reads as a real number.
+          if (value === undefined || !Number.isFinite(value)) {
+            complete = false;
+            break;
+          }
+
+          unrealized += value;
+        }
+
+        equity = complete ? balance + unrealized : undefined;
+      } catch {
+        // Without positions there is no honest equity figure; balance stands
+        // on its own rather than being presented as equity.
+        equity = undefined;
+      }
+    }
+
+    this.equityCache = { at: Date.now(), currency, balance, equity };
+    return { balance, equity };
+  }
+
+  private async getAccountBalance(currency: string): Promise<number | undefined> {
+    return (await this.getAccountSummary(currency)).balance;
+  }
+
+  /** Wallet balance and equity for display. */
+  async getAccountFunds(market: string): Promise<{
+    balance?: number;
+    equity?: number;
+    currency: string;
+  }> {
+    const info = this.availableMarkets?.[market];
+    const currency = String(info?.settle ?? info?.quote ?? 'USDT');
+    const { balance, equity } = await this.getAccountSummary(currency);
+    return { balance, equity, currency };
   }
 
   /** The market values the workspace shows, taken from the feeds where possible. */

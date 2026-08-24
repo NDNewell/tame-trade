@@ -55,6 +55,15 @@ const countdown = (deadline: number): string => {
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 };
 
+/** Two decimals with digit grouping, so a four-figure balance stays readable. */
+const formatMoney = (value: number | undefined): string => {
+  if (value === undefined || !Number.isFinite(value)) return NO_VALUE;
+  return value.toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+};
+
 const signed = (value: unknown): string => {
   if (value === undefined || value === null || value === '') return NO_VALUE;
   const numeric = Number(value);
@@ -71,6 +80,9 @@ export function emptyView(): TerminalView {
       symbol: NO_VALUE,
       instrumentType: '',
       account: NO_VALUE,
+      balance: NO_VALUE,
+      equity: NO_VALUE,
+      fundsCurrency: '',
     },
     market: {
       symbol: NO_VALUE,
@@ -132,6 +144,9 @@ export class Workspace {
   private screen: Screen | null = null;
   private market = '';
   private accountLabel: string | undefined;
+  private funds: { balance?: number; equity?: number; currency: string } = {
+    currency: '',
+  };
   private refreshTimer: NodeJS.Timeout | null = null;
   private tickTimer: NodeJS.Timeout | null = null;
   private lastOrders: TerminalView['orders'] = [];
@@ -181,14 +196,19 @@ export class Workspace {
       symbol: this.market,
       connection: 'CONNECTED',
       account: this.accountLabel ?? NO_VALUE,
+      balance: formatMoney(this.funds.balance),
+      equity: formatMoney(this.funds.equity),
+      fundsCurrency: this.funds.currency,
     };
   }
 
   setMarket(market: string): void {
     this.market = market;
-    this.screen?.update({
-      header: { ...emptyView().header, exchange: this.client.getSelectedExchangeName() ?? NO_VALUE, symbol: market, connection: 'CONNECTED' },
-    });
+    // The figures are account-level but their unit follows the market's
+    // settlement currency, so they are cleared until the next refresh rather
+    // than shown against the previous market's unit.
+    this.funds = { currency: '' };
+    this.screen?.update({ header: this.header() });
     void this.refresh();
   }
 
@@ -238,11 +258,17 @@ export class Workspace {
     const symbol = this.market.split(':')[0];
 
     try {
-      const [position, orders, risk] = await Promise.all([
+      const [position, orders, risk, funds] = await Promise.all([
         this.client.getPositionView(this.market).catch(() => null),
         this.client.getOpenOrdersForDisplay(this.market).catch(() => []),
         this.client.getPositionRisk(this.market).catch(() => undefined),
+        this.client.getAccountFunds(this.market).catch(() => undefined),
       ]);
+
+      // A failed read leaves the last known figures in place rather than
+      // blanking them: a momentary gap in the balance endpoint is not news,
+      // and a flickering equity figure invites misreading.
+      if (funds) this.funds = funds;
 
       const price = await this.client.getDisplayPrice(this.market);
 
@@ -280,7 +306,11 @@ export class Workspace {
                 position.entry !== undefined
                   ? String(Number(position.entry.toFixed(6)))
                   : NO_VALUE,
-              mark: tick(price.mark ?? price.last),
+              // The mark the position was valued at, so entry, mark and
+              // unrealized on this panel all describe the same instant and can
+              // be checked against each other. The MARKET panel's mark is a
+              // separate, fresher reading of the same thing.
+              mark: tick(position.mark),
               unrealizedPnl:
                 position.unrealizedPnl !== undefined
                   ? `${signed(position.unrealizedPnl)}${position.currency ? ` ${position.currency}` : ''}`
