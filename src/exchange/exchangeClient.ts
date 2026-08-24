@@ -20,6 +20,12 @@ import { NotificationManager } from '../utils/notificationManager.js';
 import { NType } from '../utils/notificationManager.js';
 
 /** How an order ended: the one shape every caller reads. */
+/** How many orders a cancel actually removed, and how many refused. */
+export interface CancelResult {
+  cancelled: number;
+  failed: number;
+}
+
 export interface OrderOutcome {
   status: string;
   filled: number;
@@ -1719,12 +1725,48 @@ export class ExchangeClient {
     }
   }
 
-  async cancelAllOrders(symbol: string): Promise<void> {
-    this.cancelAllStopOrders(symbol);
-    this.cancelAllLimitOrders(symbol);
+  /**
+   * Any order resting until a trigger price is reached.
+   *
+   * Detected by carrying a trigger price rather than by an order-type string.
+   * ccxt leaves Phemex's 'Stop' unmapped, so order.type is 'Stop' and a test for
+   * 'stop' matches nothing -- which is how 'cancel stops' came to cancel nothing
+   * while reporting success.
+   */
+  private isTriggerOrder(order: Order): boolean {
+    const info = (order as any).info ?? {};
+    const trigger = Number(
+      (order as any).triggerPrice ?? info.stopPxRp ?? info.stopPxEp ?? 0
+    );
+    if (trigger > 0) return true;
+
+    const type = String(
+      info.ordType ?? info.orderType ?? order.type ?? ''
+    ).toLowerCase();
+
+    return type.includes('stop') || type.includes('trigger') || info.isTrigger === true;
   }
 
-  async cancelAllLimitOrders(symbol: string): Promise<void> {
+  /**
+   * Cancels everything, and waits for it.
+   *
+   * Both calls were previously left unawaited, so this returned before anything
+   * had been cancelled and the caller reported success on work that had not
+   * happened -- or had failed.
+   */
+  async cancelAllOrders(symbol: string): Promise<CancelResult> {
+    const [stops, limits] = await Promise.all([
+      this.cancelAllStopOrders(symbol),
+      this.cancelAllLimitOrders(symbol),
+    ]);
+
+    return {
+      cancelled: stops.cancelled + limits.cancelled,
+      failed: stops.failed + limits.failed,
+    };
+  }
+
+  async cancelAllLimitOrders(symbol: string): Promise<CancelResult> {
     try {
       // Get public wallet address from exchange config for Hyperliquid
       const walletAddress = this.exchange?.id === 'hyperliquid' ?
@@ -1747,29 +1789,37 @@ export class ExchangeClient {
                                order.info?.orderType !== 'StopMarket';
           return isBasicLimit && isNotTrigger;
         }
-        return order.type === 'limit';
+        return order.type === 'limit' && !this.isTriggerOrder(order);
       });
 
-      // If there are no limit orders, simply return without doing anything further
-      if (limitOrders.length === 0) {
-        console.log('No open limit orders to cancel.');
-        return;
+      if (limitOrders.length === 0) return { cancelled: 0, failed: 0 };
+
+      const results = await Promise.allSettled(
+        limitOrders.map((order) =>
+          // The wallet parameter was omitted here while the fetch above used it.
+          this.exchange!.cancelOrder(order.id, symbol, walletAddress ? { user: walletAddress } : undefined)
+        )
+      );
+
+      const failed = results.filter((r) => r.status === 'rejected').length;
+      for (const result of results) {
+        if (result.status === 'rejected') {
+          NotificationManager.diagnostic(
+            `[cancelAllLimitOrders] ${describeExchangeError(result.reason).raw}`
+          );
+        }
       }
 
-      // If there are limit orders, proceed with canceling them
-      const cancelPromises = limitOrders.map((order) =>
-        this.exchange!.cancelOrder(order.id, symbol)
-      );
-      // Wait for all cancellations to complete
-      await Promise.all(cancelPromises);
+      return { cancelled: results.length - failed, failed };
     } catch (error) {
       const failure = describeExchangeError(error);
       NotificationManager.diagnostic(`[cancelAllLimitOrders] ${failure.raw}`);
       NotificationManager.notify(`Limit orders NOT cancelled: ${failure.summary}`, NType.ERROR, 'ERROR');
+      return { cancelled: 0, failed: 0 };
     }
   }
 
-  async cancelAllStopOrders(symbol: string): Promise<void> {
+  async cancelAllStopOrders(symbol: string): Promise<CancelResult> {
     try {
       // Get public wallet address from exchange config for Hyperliquid
       const walletAddress = this.exchange?.id === 'hyperliquid' ?
@@ -1781,38 +1831,31 @@ export class ExchangeClient {
       // Fetch open orders with wallet address for Hyperliquid
       const openOrders = await this.exchange!.fetchOpenOrders(symbol, undefined, undefined, params);
 
-      let stopOrders = [];
+      const stopOrders = openOrders.filter((order) => this.isTriggerOrder(order));
 
-      // For Hyperliquid, check for both standard stop orders and Hyperliquid's specific stop order types
-      if (this.exchange!.id === 'hyperliquid') {
-        stopOrders = openOrders.filter(
-          (order) => {
-            return order.type === 'stop' ||
-                   order.info?.orderType === 'Stop Limit' ||
-                   order.info?.orderType === 'Trigger' ||
-                   order.info?.orderType === 'StopMarket' ||
-                   (order.info?.isTrigger === true);
-          }
-        );
-      } else {
-        // For other exchanges, use standard stop order detection
-        stopOrders = openOrders.filter(
-          (order) =>
-            order.type === 'stop' ||
-            order.info?.order_type === 'stop_market'
-        );
+      if (stopOrders.length === 0) return { cancelled: 0, failed: 0 };
+
+      // Settled rather than all: one refusal should not discard the outcome of
+      // the others, and the caller needs to know how many actually went.
+      const results = await Promise.allSettled(
+        stopOrders.map((order) => this.exchange!.cancelOrder(order.id, symbol, params))
+      );
+
+      const failed = results.filter((r) => r.status === 'rejected').length;
+      for (const result of results) {
+        if (result.status === 'rejected') {
+          NotificationManager.diagnostic(
+            `[cancelAllStopOrders] ${describeExchangeError(result.reason).raw}`
+          );
+        }
       }
 
-      if (stopOrders.length > 0) {
-        const cancelPromises = stopOrders.map((order) =>
-          this.exchange!.cancelOrder(order.id, symbol, params)
-        );
-        await Promise.all(cancelPromises);
-      }
+      return { cancelled: results.length - failed, failed };
     } catch (error) {
       const failure = describeExchangeError(error);
       NotificationManager.diagnostic(`[cancelAllStopOrders] ${failure.raw}`);
       NotificationManager.notify(`Stop orders NOT cancelled: ${failure.summary}`, NType.ERROR, 'ERROR');
+      return { cancelled: 0, failed: 0 };
     }
   }
 
