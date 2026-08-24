@@ -1414,7 +1414,12 @@ export class ExchangeClient {
         NotificationManager.notify('', NType.INFO, 'ORDER', undefined, {
           side: order?.side ? String(order.side).toUpperCase() : undefined,
           quantity: this.formatQuantity(Number(order?.amount)),
-          price: trigger !== undefined ? String(trigger) : order?.price ? String(order.price) : undefined,
+          price:
+            trigger !== undefined
+              ? this.formatPriceForDisplay(market, Number(trigger))
+              : order?.price
+              ? this.formatPriceForDisplay(market, Number(order.price))
+              : undefined,
           status: trigger !== undefined ? 'STOP' : 'ACCEPTED',
         });
       } catch {

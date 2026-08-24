@@ -257,6 +257,7 @@ export class Workspace {
       const chaseDeadline = this.client.getChaseDeadline();
 
       this.screen.update({
+        header: this.header(),
         market: {
           symbol,
           last: tick(price.last),
