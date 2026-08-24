@@ -368,6 +368,40 @@ export class ExchangeClient {
    * fallback paths that return differently shaped objects, so the field is not
    * dependable; entry, mark and size are, and the arithmetic is not in doubt.
    */
+  /**
+   * Unrealized on one position, derived from entry and mark.
+   *
+   * It is derived rather than read because ccxt's parsed `unrealizedPnl` is
+   * not usable on Phemex: on a 250-lot sitting 0.04 above entry it returned
+   * 0.00105 where the true figure was 10.00. Anything that trusts that field
+   * reports a flat account no matter how the position is doing.
+   *
+   * Both the position panel and account equity come through here, so the two
+   * cannot report different unrealized figures on the same screen.
+   */
+  private computeUnrealizedPnl(
+    position: any,
+    market: string,
+    mark: number | undefined
+  ): number | undefined {
+    const contracts = Math.abs(Number(position?.contracts ?? 0));
+    if (contracts === 0) return undefined;
+
+    const marketInfo = this.availableMarkets?.[market];
+    const contractSize = Number(marketInfo?.contractSize ?? 1);
+    const entry = Number(position?.entryPrice ?? NaN);
+
+    if (!Number.isFinite(entry) || entry <= 0) return undefined;
+    if (mark === undefined || !Number.isFinite(mark) || mark <= 0) return undefined;
+
+    const direction =
+      String(position?.side ?? '').toLowerCase() === 'long' ? 1 : -1;
+
+    return marketInfo?.inverse
+      ? contracts * contractSize * (1 / entry - 1 / mark) * direction
+      : contracts * contractSize * (mark - entry) * direction;
+  }
+
   async getPositionView(market: string): Promise<{
     side: string;
     size: number;
@@ -385,20 +419,12 @@ export class ExchangeClient {
 
     const info = position as any;
     const marketInfo = this.availableMarkets?.[market];
-    const contractSize = Number(marketInfo?.contractSize ?? 1);
     const currency = String(marketInfo?.settle ?? marketInfo?.quote ?? '');
 
     const entry = Number(position.entryPrice ?? info.entryPrice ?? NaN);
     const mark = await this.getReferencePrice(market);
-    const isLong = String(position.side ?? '').toLowerCase() === 'long';
 
-    let unrealizedPnl: number | undefined;
-    if (Number.isFinite(entry) && mark !== undefined && entry > 0) {
-      const direction = isLong ? 1 : -1;
-      unrealizedPnl = marketInfo?.inverse
-        ? contracts * contractSize * (1 / entry - 1 / mark) * direction
-        : contracts * contractSize * (mark - entry) * direction;
-    }
+    const unrealizedPnl = this.computeUnrealizedPnl(position, market, mark);
 
     return {
       side: String(position.side ?? '').toUpperCase(),
@@ -777,12 +803,30 @@ export class ExchangeClient {
           code: currency,
         });
 
-        const unrealized = positions.reduce((total, position) => {
-          const value = Number((position as any).unrealizedPnl ?? 0);
-          return Number.isFinite(value) ? total + value : total;
-        }, 0);
+        const open = positions.filter(
+          (position) => Math.abs(Number((position as any).contracts ?? 0)) > 0
+        );
 
-        equity = balance + unrealized;
+        let unrealized = 0;
+        let complete = true;
+
+        for (const position of open) {
+          const symbol = String((position as any).symbol ?? '');
+          const mark = await this.getReferencePrice(symbol);
+          const value = this.computeUnrealizedPnl(position, symbol, mark);
+
+          // One position we cannot price makes the total wrong by an unknown
+          // amount, and an equity figure that is quietly short is worse than
+          // no equity figure at all -- it reads as a real number.
+          if (value === undefined || !Number.isFinite(value)) {
+            complete = false;
+            break;
+          }
+
+          unrealized += value;
+        }
+
+        equity = complete ? balance + unrealized : undefined;
       } catch {
         // Without positions there is no honest equity figure; balance stands
         // on its own rather than being presented as equity.
