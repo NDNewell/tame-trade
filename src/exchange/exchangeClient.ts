@@ -1404,6 +1404,13 @@ export class ExchangeClient {
         const side = order?.side ? `${this.capitalise(String(order.side))} ` : '';
         const amount = order?.amount !== undefined ? this.trimAmount(parseFloat(order.amount)) : '';
         const trigger = order?.triggerPrice ?? order?.stopPrice;
+
+        // Stops announce themselves, and with better wording -- 'STOP WORKING'
+        // rather than a bare 'STOP'. Announcing here too gave one order two rows.
+        if (trigger !== undefined) {
+          return order;
+        }
+
         const at =
           trigger !== undefined
             ? ` triggering at ${trigger}`
