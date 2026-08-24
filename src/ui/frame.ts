@@ -31,6 +31,12 @@ export interface HeaderView {
   symbol: string;
   instrumentType: string;
   account: string;
+  /** Wallet balance: what the exchange holds, before any open position settles. */
+  balance: string;
+  /** Balance plus unrealized on every open position -- the account closed out here. */
+  equity: string;
+  /** Unit for both, carried separately so it can be printed once. */
+  fundsCurrency: string;
 }
 
 export interface MarketView {
@@ -349,6 +355,52 @@ export function planHeight(height: number, hasChase: boolean) {
  * Labels sit left, values at a common column so the numbers line up and the size
  * can be compared against the value at a glance.
  */
+/**
+ * The account figures for the identity row, widest form first.
+ *
+ * These share the row with the market identity, so at narrow widths something
+ * has to go. Account number goes first -- it names which account, which the
+ * operator already knows and cannot act on. Balance goes next: equity is the
+ * figure that moves when a position does, so it is the last one standing.
+ *
+ * The unit is printed once, on whichever figure ends up last, rather than
+ * repeated on both.
+ */
+function headerFunds(header: HeaderView, available: number): string {
+  const has = (value: string): boolean =>
+    value !== undefined && value !== '' && value !== NO_VALUE;
+
+  const balance = has(header.balance) ? `Balance ${header.balance}` : '';
+  const equity = has(header.equity) ? `Equity ${header.equity}` : '';
+  const account = has(header.account) ? `Account: ${header.account}` : '';
+
+  // Widest form first; each fallback drops the least actionable part still
+  // present. Figures are kept separate from the account so the unit can be
+  // attached to the last figure actually shown -- appending it blindly would
+  // leave a bare unit standing where a missing figure should have been.
+  const forms: Array<[string[], string[]]> = [
+    [[balance, equity], [account]],
+    [[balance, equity], []],
+    [[equity], []],
+    [[balance], []],
+  ];
+
+  for (const [figures, trailing] of forms) {
+    const shown = figures.filter((part) => part.length > 0);
+    if (shown.length === 0) continue;
+
+    if (header.fundsCurrency) {
+      shown[shown.length - 1] = `${shown[shown.length - 1]} ${header.fundsCurrency}`;
+    }
+
+    const text = [...shown, ...trailing.filter((part) => part.length > 0)].join('   ');
+    if (text.length <= available) return text;
+  }
+
+  // No figure fits, but the account still identifies where the operator is.
+  return account.length > 0 && account.length <= available ? account : '';
+}
+
 function confirmationBlock(
   confirmation: ConfirmationView,
   width: number,
@@ -558,7 +610,13 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
         header.connection.toUpperCase() === 'CONNECTED' ? 'green' : 'red'
       )
   );
-  lines.push(new Line(width).put(2, `${header.exchange} | ${header.symbol}`, undefined, inner));
+  const identity = `${header.exchange} | ${header.symbol}`;
+  const stackedFunds = headerFunds(header, inner - 3 - identity.length - 2);
+  lines.push(
+    new Line(width)
+      .put(2, identity, undefined, inner - 1 - stackedFunds.length - 2)
+      .putRight(inner - 1, stackedFunds)
+  );
 
   lines.push(border());
   lines.push(new Line(width).put(2, 'MARKET', HEADING_COLOR));
@@ -700,10 +758,12 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   const context = [header.exchange, header.symbol, header.instrumentType]
     .filter((part) => part && part.length > 0)
     .join(' | ');
+  // Three columns of gap keeps the figures from reading as part of the symbol.
+  const funds = headerFunds(header, inner - 3 - context.length - 3);
   lines.push(
     new Line(width)
-      .put(2, context, undefined, inner - 20)
-      .putRight(inner - 1, `Account: ${header.account}`, undefined, inner - 20)
+      .put(2, context, undefined, inner - 1 - funds.length - 3)
+      .putRight(inner - 1, funds)
   );
 
   // --- market: symbol and last price lead, the rest supports -------------

@@ -82,7 +82,9 @@ export class ExchangeClient {
   >();
   /** Looked up once per session; it does not change while connected. */
   private accountLabel: string | undefined;
-  private equityCache: { at: number; currency: string; equity?: number } | undefined;
+  private equityCache:
+    | { at: number; currency: string; balance?: number; equity?: number }
+    | undefined;
   private accountLookupDone = false;
   /** The market being followed, so account lookups know which wallet to ask for. */
   private lastFollowedMarket: string | undefined;
@@ -732,27 +734,80 @@ export class ExchangeClient {
    * Effective leverage needs account equity, and the balance call is
    * authenticated, so it is not made on every repaint.
    */
-  private async getAccountBalance(currency: string): Promise<number | undefined> {
+  /**
+   * Wallet balance and account equity, cached together.
+   *
+   * Balance is what the exchange holds; equity is that plus what every open
+   * position is currently up or down. They differ by exactly the unrealized
+   * amount, which is the number that decides whether the account can take
+   * another position -- so both are worth showing rather than one.
+   *
+   * Unrealized is summed across all positions, not just the market on screen:
+   * equity is an account-level figure and counting only the visible position
+   * would overstate it whenever anything else is open.
+   */
+  private async getAccountSummary(currency: string): Promise<{
+    balance?: number;
+    equity?: number;
+  }> {
     const cached = this.equityCache;
     if (
       cached &&
       cached.currency === currency &&
       Date.now() - cached.at <= ExchangeClient.EQUITY_CACHE_MS
     ) {
-      return cached.equity;
+      return { balance: cached.balance, equity: cached.equity };
     }
 
+    let balance: number | undefined;
     let equity: number | undefined;
+
     try {
-      const balance: any = await this.fetchAccountSnapshot(currency);
-      const total = balance?.total?.[currency];
-      equity = Number.isFinite(Number(total)) ? Number(total) : undefined;
+      const snapshot: any = await this.fetchAccountSnapshot(currency);
+      const total = snapshot?.total?.[currency];
+      balance = Number.isFinite(Number(total)) ? Number(total) : undefined;
     } catch {
-      equity = undefined;
+      balance = undefined;
     }
 
-    this.equityCache = { at: Date.now(), currency, equity };
-    return equity;
+    if (balance !== undefined) {
+      try {
+        const positions = await this.exchange!.fetchPositions(undefined, {
+          type: 'swap',
+          code: currency,
+        });
+
+        const unrealized = positions.reduce((total, position) => {
+          const value = Number((position as any).unrealizedPnl ?? 0);
+          return Number.isFinite(value) ? total + value : total;
+        }, 0);
+
+        equity = balance + unrealized;
+      } catch {
+        // Without positions there is no honest equity figure; balance stands
+        // on its own rather than being presented as equity.
+        equity = undefined;
+      }
+    }
+
+    this.equityCache = { at: Date.now(), currency, balance, equity };
+    return { balance, equity };
+  }
+
+  private async getAccountBalance(currency: string): Promise<number | undefined> {
+    return (await this.getAccountSummary(currency)).balance;
+  }
+
+  /** Wallet balance and equity for display. */
+  async getAccountFunds(market: string): Promise<{
+    balance?: number;
+    equity?: number;
+    currency: string;
+  }> {
+    const info = this.availableMarkets?.[market];
+    const currency = String(info?.settle ?? info?.quote ?? 'USDT');
+    const { balance, equity } = await this.getAccountSummary(currency);
+    return { balance, equity, currency };
   }
 
   /** The market values the workspace shows, taken from the feeds where possible. */
