@@ -284,10 +284,11 @@ export class Workspace {
 
       this.screen.update({
         header: this.header(),
-        ranges: ranges.map(({ label, high, low }) => ({
+        ranges: ranges.map(({ label, high, low, atr }) => ({
           label,
           high: tick(high),
           low: tick(low),
+          atr: tick(atr),
         })),
         market: {
           symbol,

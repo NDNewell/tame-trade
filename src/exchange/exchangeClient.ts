@@ -41,6 +41,8 @@ export interface PriceRangeView {
   label: string;
   high?: number;
   low?: number;
+  /** What a bar of this period typically covers. */
+  atr?: number;
 }
 
 export interface OrderOutcome {
@@ -713,6 +715,8 @@ export class ExchangeClient {
    * separately on every read.
    */
   private static readonly RANGE_CACHE_MS = 15000;
+  /** The period ATR is quoted at essentially everywhere. */
+  private static readonly RANGE_ATR_PERIOD = 14;
   private static readonly CANDLE_CACHE_MIN_MS = 15000;
   private static readonly CANDLE_CACHE_MAX_MS = 300000;
 
@@ -807,10 +811,22 @@ export class ExchangeClient {
     );
 
     const now = Date.now();
-    const ranges = RANGE_WINDOWS.map(({ label, minutes, source }) => {
-      const range = rangeOver(series.get(source) ?? [], minutes * 60_000, now, latest);
-      return { label, high: range?.high, low: range?.low };
-    });
+
+    // getAtr rather than a second measurement here: it already reads closed
+    // candles only, caches until the next one closes, and shares the candle
+    // cache with the fetches above.
+    const ranges = await Promise.all(
+      RANGE_WINDOWS.map(async ({ label, minutes, source, atrTimeframe }) => {
+        const range = rangeOver(series.get(source) ?? [], minutes * 60_000, now, latest);
+        const atr = await this.getAtr(
+          market,
+          ExchangeClient.RANGE_ATR_PERIOD,
+          atrTimeframe
+        ).catch(() => undefined);
+
+        return { label, high: range?.high, low: range?.low, atr };
+      })
+    );
 
     this.rangeCache.set(market, { at: now, ranges });
     return ranges;

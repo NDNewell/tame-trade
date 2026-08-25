@@ -179,6 +179,16 @@ export interface RangeWindow {
    * same thing at all.
    */
   source: string;
+  /**
+   * The candle size ATR is measured on for this column, which is the column's
+   * own period.
+   *
+   * Note that the two rows answer related but different questions. High and low
+   * are the extremes over the last five minutes; ATR is what a five-minute bar
+   * typically covers. Read together they say whether the range right now is
+   * ordinary for this timeframe or not, which neither says alone.
+   */
+  atrTimeframe: string;
 }
 
 /**
@@ -189,14 +199,15 @@ export interface RangeWindow {
  * Monday or the first of the month.
  */
 export const RANGE_WINDOWS: RangeWindow[] = [
-  { label: '5m', minutes: 5, source: '1m' },
-  { label: '15m', minutes: 15, source: '1m' },
-  { label: '30m', minutes: 30, source: '1m' },
-  { label: '1h', minutes: 60, source: '1m' },
-  { label: '4h', minutes: 240, source: '15m' },
-  { label: '1d', minutes: 1440, source: '15m' },
-  { label: '1w', minutes: 7 * 1440, source: '4h' },
-  { label: '1mo', minutes: 30 * 1440, source: '1d' },
+  { label: '5m', minutes: 5, source: '1m', atrTimeframe: '5m' },
+  { label: '15m', minutes: 15, source: '1m', atrTimeframe: '15m' },
+  { label: '30m', minutes: 30, source: '1m', atrTimeframe: '30m' },
+  { label: '1h', minutes: 60, source: '1m', atrTimeframe: '1h' },
+  { label: '4h', minutes: 240, source: '15m', atrTimeframe: '4h' },
+  { label: '1d', minutes: 1440, source: '15m', atrTimeframe: '1d' },
+  { label: '1w', minutes: 7 * 1440, source: '4h', atrTimeframe: '1w' },
+  // The exchange spells a monthly candle '1M'; '1m' is a minute.
+  { label: '1mo', minutes: 30 * 1440, source: '1d', atrTimeframe: '1M' },
 ];
 
 export interface PriceRange {
