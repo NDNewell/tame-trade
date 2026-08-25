@@ -4303,7 +4303,6 @@ export class ExchangeClient {
     // price, so arming is sticky: once reached it stays reached, and a pullback
     // cannot un-arm a trail that has already begun.
     if (tag.armPrice !== undefined) {
-      const direction = side === 'long' ? 1 : -1;
       if (direction * (high - tag.armPrice) < 0) return;
 
       if (!this.armedTrails.has(id)) {
@@ -4319,9 +4318,25 @@ export class ExchangeClient {
       // A fixed distance has nothing left to recalculate, so from here the
       // exchange runs it and keeps running it whether or not this process does.
       // An ATR trail stays with us, because its distance keeps changing.
+      //
+      // But only while price is at its high. The exchange begins trailing from
+      // wherever price is when the order is placed, and knows nothing of any
+      // extreme before that -- so handing over during a pullback would set the
+      // stop a full distance below the current price rather than below the high
+      // it should be measured from. That is not hypothetical: a trail that
+      // armed while Tame was closed is discovered on restart, quite possibly
+      // after a retrace, and the high we just reconstructed would be discarded
+      // in the act of using it.
+      //
+      // So it stays managed here until price returns to its high-water mark, at
+      // which point the two agree and the hand-over costs nothing. Until then
+      // it trails from here, which is the same protection by a different means.
       if (tag.kind === 'fixed') {
-        await this.handOverToExchangeTrail(market, order, tag.value, side);
-        return;
+        const room = Math.max(tick, 1e-8);
+        if (direction * (mark - high) >= -room) {
+          await this.handOverToExchangeTrail(market, order, tag.value, side);
+          return;
+        }
       }
 
     }
