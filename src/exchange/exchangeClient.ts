@@ -15,6 +15,13 @@ import {
   PositionRiskResult,
   ProtectiveStopTranche,
 } from '../trading/positionRisk.js';
+import {
+  Candle,
+  averageTrueRange,
+  closedCandles,
+  atrTrailOffset,
+} from '../trading/volatility.js';
+import { TrailSpec, describeTrailSpec } from '../trading/trailSpec.js';
 import { describeExchangeError, isMissingOrderError } from '../utils/exchangeErrors.js';
 import { NotificationManager } from '../utils/notificationManager.js';
 import { NType } from '../utils/notificationManager.js';
@@ -80,6 +87,8 @@ export class ExchangeClient {
     string,
     { at: number; mark?: number; index?: number; funding?: number }
   >();
+  /** Keyed by market, timeframe and period; valid until the next candle closes. */
+  private atrCache = new Map<string, { until: number; value?: number }>();
   /** Looked up once per session; it does not change while connected. */
   private accountLabel: string | undefined;
   private equityCache:
@@ -673,8 +682,79 @@ export class ExchangeClient {
   }
 
   private static readonly FUNDING_CACHE_MS = 15000;
+  /**
+   * Phemex's kline endpoint accepts only certain limits -- 60 is rejected
+   * outright, 100 is not -- so this is a value the exchange allows rather than
+   * the smallest that would serve. 100 candles covers any ATR period worth
+   * quoting with room to spare.
+   */
+  private static readonly CANDLE_LIMIT = 100;
+  /** How long to hold a failed volatility read before trying again. */
+  private static readonly ATR_RETRY_MS = 30000;
 
   /** Mark price, index price and funding rate, refreshed at a sensible interval. */
+  /**
+   * Average true range for a market, in price units.
+   *
+   * Cached until the next candle closes, because that is exactly how long the
+   * answer can stay the same: ATR is computed from closed candles only, so
+   * asking again within the same period returns the same number and costs a
+   * request for it.
+   *
+   * A failed read is held far more briefly. The value is undefined either way,
+   * but caching "we don't know" for an hour would leave an adaptive trail
+   * unadjusted long after the feed recovered.
+   */
+  async getAtr(
+    market: string,
+    period: number,
+    timeframe: string
+  ): Promise<number | undefined> {
+    const key = `${market}|${timeframe}|${period}`;
+    const cached = this.atrCache.get(key);
+    if (cached && Date.now() < cached.until) return cached.value;
+
+    const intervalMs = this.exchange!.parseTimeframe(timeframe) * 1000;
+    let value: number | undefined;
+    let until = Date.now() + ExchangeClient.ATR_RETRY_MS;
+
+    try {
+      const raw = await this.exchange!.fetchOHLCV(
+        market,
+        timeframe,
+        undefined,
+        ExchangeClient.CANDLE_LIMIT
+      );
+
+      const candles: Candle[] = raw.map((row: any) => ({
+        timestamp: Number(row[0]),
+        high: Number(row[2]),
+        low: Number(row[3]),
+        close: Number(row[4]),
+      }));
+
+      const closed = closedCandles(candles, Date.now(), intervalMs);
+      value = averageTrueRange(closed, period);
+
+      const last = closed[closed.length - 1];
+      // Constant until the candle following the last closed one has itself
+      // closed; there is nothing new to measure before then.
+      if (last !== undefined && value !== undefined) {
+        until = last.timestamp + 2 * intervalMs;
+      }
+    } catch (error) {
+      console.warn(
+        `[ExchangeClient] Could not measure volatility for ${market}: ${
+          (error as Error).message
+        }`
+      );
+      value = undefined;
+    }
+
+    this.atrCache.set(key, { until, value });
+    return value;
+  }
+
   private async getFundingSnapshot(market: string) {
     const cached = this.fundingCache.get(market);
     if (cached && Date.now() - cached.at <= ExchangeClient.FUNDING_CACHE_MS) {
@@ -3410,15 +3490,42 @@ export class ExchangeClient {
    * `percent` treats the value as a percentage of the current price rather than
    * an absolute distance.
    */
+  /**
+   * What a trail spec works out to right now, in price units.
+   *
+   * The one place a spec becomes a distance. Placement and any later adjustment
+   * both come through here, so an adaptive trail cannot end up being sized one
+   * way when it is placed and another way when it is revised.
+   */
+  async resolveTrailDistance(
+    market: string,
+    spec: TrailSpec,
+    reference: number
+  ): Promise<number | undefined> {
+    switch (spec.kind) {
+      case 'absolute':
+        return spec.distance;
+
+      case 'percent':
+        return (reference * spec.percent) / 100;
+
+      case 'atr': {
+        const atr = await this.getAtr(market, spec.period, spec.timeframe);
+        // A trail finer than the tick cannot be expressed as a price, so the
+        // tick is the floor whatever a very quiet market measures.
+        const tick = await this.getMarketPrecision(market).catch(() => 0);
+        return atrTrailOffset(atr, {
+          multiple: spec.multiple,
+          minimumOffset: tick > 0 ? tick : undefined,
+        });
+      }
+    }
+  }
+
   async createTrailingStopOrder(
     market: string,
-    value: number,
-    percent = false
+    spec: TrailSpec
   ): Promise<Order | undefined> {
-    if (!(value > 0) || !Number.isFinite(value)) {
-      throw new Error(`Invalid trail value '${value}'. Give a distance greater than 0.`);
-    }
-
     const position = await this.getPositionView(market);
     if (!position || !(position.size > 0)) {
       throw new Error('No open position to trail.');
@@ -3431,7 +3538,18 @@ export class ExchangeClient {
       );
     }
 
-    const distance = percent ? (reference * value) / 100 : value;
+    const distance = await this.resolveTrailDistance(market, spec, reference);
+
+    if (distance === undefined) {
+      // Only an ATR trail can fail to resolve, and only because volatility
+      // could not be measured. Saying so beats a generic zero-distance error.
+      throw new Error(
+        spec.kind === 'atr'
+          ? `Could not measure ATR(${spec.period}) on ${spec.timeframe} for ${market}, so the trail has no width. No order was placed.`
+          : 'That trail works out to zero distance.'
+      );
+    }
+
     if (!(distance > 0)) {
       throw new Error('That trail works out to zero distance.');
     }
@@ -3446,6 +3564,15 @@ export class ExchangeClient {
         `A trail of ${distance} puts the stop at or below zero from ${reference}.`
       );
     }
+
+    NotificationManager.notify(
+      `Trailing ${describeTrailSpec(spec)} = ${this.formatPriceForDisplay(
+        market,
+        distance
+      )} behind ${this.formatPriceForDisplay(market, reference)}`,
+      NType.INFO,
+      'ORDER'
+    );
 
     return this.createStopOrder(market, start, undefined, false, true, distance);
   }
