@@ -3780,11 +3780,15 @@ export class ExchangeClient {
       );
     }
 
+    // Says the distance, and says it is fixed. The exchange trails a price
+    // offset, not a rule: '2%' and '3atr' are ways of arriving at a number
+    // once, and the number is what the order carries from then on. Reporting
+    // only '2%' invites the reader to assume it stays two percent of a rising
+    // price, which it does not.
     NotificationManager.notify(
-      `Trailing ${describeTrailSpec(spec)} = ${this.formatPriceForDisplay(
-        market,
-        distance
-      )} behind ${this.formatPriceForDisplay(market, reference)}`,
+      `Trailing ${this.formatPriceForDisplay(market, distance)} behind ` +
+        `${this.formatPriceForDisplay(market, reference)} ` +
+        `(${describeTrailSpec(spec)}, fixed once placed)`,
       NType.INFO,
       'ORDER'
     );
