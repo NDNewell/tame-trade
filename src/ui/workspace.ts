@@ -8,6 +8,7 @@ import { ActivityLog } from './activityLog.js';
 import { Screen } from './screen.js';
 import { NO_VALUE, TerminalView } from './frame.js';
 import { PositionRiskResult } from '../trading/positionRisk.js';
+import { readTrailTag } from '../trading/trailTag.js';
 
 const FOOTER = [
   'buy',
@@ -182,6 +183,10 @@ export class Workspace {
 
     // The feeds push prices and order events; this refresh covers what only REST
     // can tell us, chiefly the position.
+    // Adaptive trails are the exchange's to run and ours to adjust; the monitor
+    // reconsiders them as candles close.
+    this.client.startTrailMonitor();
+
     this.refreshTimer = setInterval(() => void this.refresh(), 2000);
     this.tickTimer = setInterval(() => this.tickCountdown(), 1000);
     void this.refresh();
@@ -223,6 +228,7 @@ export class Workspace {
     if (this.tickTimer) clearInterval(this.tickTimer);
     this.refreshTimer = null;
     this.tickTimer = null;
+    this.client.stopTrailMonitor();
     this.screen?.stop();
     this.screen = null;
   }
@@ -354,6 +360,13 @@ export class Workspace {
             peg !== 0 &&
             String(info.pegPriceType ?? '').toLowerCase().includes('trailing');
 
+          // A trail Tame is sizing from volatility, as opposed to one the
+          // exchange is simply running at a fixed distance. The distinction
+          // matters: only one of them will move on its own.
+          const adaptive =
+            isTrailing &&
+            readTrailTag((order as any).clientOrderId ?? info.clOrdID) !== undefined;
+
           const filled = Number(order.filled ?? 0);
           const status = isTrigger
             ? 'WORKING'
@@ -382,6 +395,8 @@ export class Workspace {
             managed:
               chaseOrderId && order.id === chaseOrderId
                 ? 'CHASE'
+                : adaptive
+                ? 'ATR'
                 : isTrailing
                 ? 'TRAIL'
                 : undefined,
