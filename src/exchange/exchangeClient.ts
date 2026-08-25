@@ -4057,12 +4057,16 @@ export class ExchangeClient {
     if (plan.action === 'hold') return;
 
     try {
-      // The quantity is passed back exactly as the order carries it. A trail
-      // covering the whole position carries zero, which is the marker for that
-      // rather than a size, so it must survive the amendment unchanged.
+      // A trail covering the whole position carries a quantity of zero, which
+      // is the marker for "all" and not a size. Passing it back is rejected
+      // before the request is even sent -- amountToPrecision refuses anything
+      // under the minimum tradeable amount -- so it is omitted instead, and the
+      // exchange keeps whatever the order already had. A sized trail does pass
+      // its quantity, so an amendment cannot silently change it.
       const quantity = Number(info.orderQtyRq ?? 0);
+      const amount = quantity > 0 ? quantity : undefined;
 
-      await this.exchange!.editOrder(id, market, 'Stop', String(order.side), quantity, undefined, {
+      await this.exchange!.editOrder(id, market, 'Stop', String(order.side), amount, undefined, {
         triggerPrice: plan.stop,
         posSide: 'Merged',
       } as any);
@@ -4098,7 +4102,8 @@ export class ExchangeClient {
         // inferred from the absence of messages.
         NotificationManager.notify(
           `Trail ${id.slice(0, 8)} could not be moved after ${failures} attempts and is no longer being managed. ` +
-            `The stop is still resting at ${this.formatPriceForDisplay(market, stop)}. Last error: ${(error as Error).message}`,
+            `The stop is still resting at ${this.formatPriceForDisplay(market, stop)} and will not advance. ` +
+            `Restart to resume managing it. Last error: ${(error as Error).message}`,
           NType.ERROR,
           'ERROR'
         );
