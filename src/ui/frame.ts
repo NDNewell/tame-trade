@@ -830,7 +830,7 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
   // so the narrow layout carries the shortest, an hour, and the day. Dropping
   // the panel entirely would lose more than dropping three of its columns.
   const narrowRanges = showRanges
-    ? view.ranges.filter((range) => ['5m', '1h', '1d'].includes(range.label))
+    ? view.ranges.filter((range) => ['5m', '1h', '1d', '1w', '1mo'].includes(range.label))
     : [];
   if (narrowRanges.length > 0) {
     lines.push(border());

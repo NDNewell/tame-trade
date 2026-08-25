@@ -100,6 +100,7 @@ export class ExchangeClient {
   /** Keyed by market, timeframe and period; valid until the next candle closes. */
   private atrCache = new Map<string, { until: number; value?: number }>();
   private rangeCache = new Map<string, { at: number; ranges: PriceRangeView[] }>();
+  private candleCache = new Map<string, { until: number; candles: Candle[] }>();
   /** Looked up once per session; it does not change while connected. */
   private accountLabel: string | undefined;
   private equityCache:
@@ -712,6 +713,8 @@ export class ExchangeClient {
    * separately on every read.
    */
   private static readonly RANGE_CACHE_MS = 15000;
+  private static readonly CANDLE_CACHE_MIN_MS = 15000;
+  private static readonly CANDLE_CACHE_MAX_MS = 300000;
 
   /** Mark price, index price and funding rate, refreshed at a sensible interval. */
   /**
@@ -726,8 +729,21 @@ export class ExchangeClient {
    * but caching "we don't know" for an hour would leave an adaptive trail
    * unadjusted long after the feed recovered.
    */
-  /** Candles for a market, in the shape the measurements take. */
-  private async fetchCandles(market: string, timeframe: string): Promise<Candle[]> {
+  /**
+   * Candles for a market, in the shape the measurements take.
+   *
+   * Cached for a fraction of the candle size, so a panel reading eight windows
+   * off four candle sizes does not make four requests every time it repaints.
+   * Daily candles change once a day; asking for them every fifteen seconds
+   * spends the rate limit to be told the same thing. What actually moves
+   * between closes is the current price, and that is read separately and folded
+   * in fresh.
+   */
+  private async getCandles(market: string, timeframe: string): Promise<Candle[]> {
+    const key = `${market}|${timeframe}`;
+    const cached = this.candleCache.get(key);
+    if (cached && Date.now() < cached.until) return cached.candles;
+
     const raw = await this.exchange!.fetchOHLCV(
       market,
       timeframe,
@@ -735,12 +751,21 @@ export class ExchangeClient {
       ExchangeClient.CANDLE_LIMIT
     );
 
-    return raw.map((row: any) => ({
+    const candles = raw.map((row: any) => ({
       timestamp: Number(row[0]),
       high: Number(row[2]),
       low: Number(row[3]),
       close: Number(row[4]),
     }));
+
+    const intervalMs = this.exchange!.parseTimeframe(timeframe) * 1000;
+    const ttl = Math.min(
+      ExchangeClient.CANDLE_CACHE_MAX_MS,
+      Math.max(ExchangeClient.CANDLE_CACHE_MIN_MS, intervalMs / 4)
+    );
+
+    this.candleCache.set(key, { until: Date.now() + ttl, candles });
+    return candles;
   }
 
   /**
@@ -760,26 +785,30 @@ export class ExchangeClient {
 
     const latest = await this.getReferencePrice(market);
 
-    let fine: Candle[] = [];
-    let coarse: Candle[] = [];
-    try {
-      [fine, coarse] = await Promise.all([
-        this.fetchCandles(market, '1m'),
-        this.fetchCandles(market, '15m'),
-      ]);
-    } catch (error) {
-      console.warn(
-        `[ExchangeClient] Could not read ranges for ${market}: ${
-          (error as Error).message
-        }`
-      );
-      // The current price alone still gives an honest, if narrow, range.
-    }
+    // Each candle size is fetched once however many windows read from it, and
+    // separately, so a failure on one leaves the windows it feeds empty rather
+    // than blanking the whole panel.
+    const timeframes = Array.from(new Set(RANGE_WINDOWS.map((w) => w.source)));
+    const series = new Map<string, Candle[]>();
+
+    await Promise.all(
+      timeframes.map(async (timeframe) => {
+        try {
+          series.set(timeframe, await this.getCandles(market, timeframe));
+        } catch (error) {
+          console.warn(
+            `[ExchangeClient] Could not read ${timeframe} candles for ${market}: ${
+              (error as Error).message
+            }`
+          );
+          series.set(timeframe, []);
+        }
+      })
+    );
 
     const now = Date.now();
-    const ranges = RANGE_WINDOWS.map(({ label, minutes }) => {
-      const source = minutes <= 60 ? fine : coarse;
-      const range = rangeOver(source, minutes * 60_000, now, latest);
+    const ranges = RANGE_WINDOWS.map(({ label, minutes, source }) => {
+      const range = rangeOver(series.get(source) ?? [], minutes * 60_000, now, latest);
       return { label, high: range?.high, low: range?.low };
     });
 
@@ -801,7 +830,7 @@ export class ExchangeClient {
     let until = Date.now() + ExchangeClient.ATR_RETRY_MS;
 
     try {
-      const candles = await this.fetchCandles(market, timeframe);
+      const candles = await this.getCandles(market, timeframe);
       const closed = closedCandles(candles, Date.now(), intervalMs);
       value = averageTrueRange(closed, period);
 
