@@ -48,6 +48,8 @@ export interface RangeColumnView {
   label: string;
   high: string;
   low: string;
+  /** Typical bar range for this period, against which high/low can be judged. */
+  atr: string;
 }
 
 export interface MarketView {
@@ -432,15 +434,19 @@ const categoryColor = (category: string): Color | undefined => {
  * log share whatever is left, because those are the two that genuinely benefit
  * from more room.
  */
+/** Border, label row, high, low, atr. */
+const RANGE_ROWS = 5;
+/** The split block and the activity area cannot go below these. */
+const MIN_SPLIT_ROWS = 4;
+const MIN_ACTIVITY_ROWS = 1;
+
 export function planHeight(height: number, hasChase: boolean) {
   const chaseRows = hasChase ? 4 : 0; // label + three rows
-  const fixed =
+  const base =
     1 + // top border
     2 + // header
     1 + // border
     3 + // market label + two rows
-    1 + // border
-    3 + // range label row + high + low
     1 + // border
     1 + // border under the split block
     (hasChase ? chaseRows + 1 : 0) + // chase + its border
@@ -450,14 +456,21 @@ export function planHeight(height: number, hasChase: boolean) {
     1 + // footer
     1; // bottom border
 
+  // Range is the panel that yields when the terminal is short. It is a
+  // reference rather than something an order depends on, and the alternative is
+  // a frame taller than the screen, which pushes the command line off it.
+  const showRanges =
+    height - base - 1 - MIN_SPLIT_ROWS - MIN_ACTIVITY_ROWS >= RANGE_ROWS;
+
+  const fixed = base + (showRanges ? RANGE_ROWS : 0);
   const flexible = Math.max(0, height - fixed);
 
   // The position panel wants ten rows (label, gap, eight fields). Give it that
   // when there's room, and let activity take the remainder.
-  const splitRows = Math.max(4, Math.min(12, flexible - 4));
-  const activityRows = Math.max(1, flexible - splitRows - 1); // -1 for its label
+  const splitRows = Math.max(MIN_SPLIT_ROWS, Math.min(12, flexible - 4));
+  const activityRows = Math.max(MIN_ACTIVITY_ROWS, flexible - splitRows - 1); // -1 for its label
 
-  return { splitRows, activityRows };
+  return { splitRows, activityRows, showRanges };
 }
 
 /**
@@ -546,11 +559,16 @@ function putFunds(line: Line, end: number, parts: FundsPart[]): Line {
 /**
  * The high/low grid.
  *
- * Three rows, the same shape as MARKET: the section name occupies the column
- * that labels the rows beneath it, which is exactly what it is doing, so the
- * panel costs no more height than the two rows of data it carries.
+ * The section name occupies the column that labels the rows beneath it, which
+ * is exactly what it is doing, so the panel costs no more height than the rows
+ * of data it carries.
  *
- * Each period's label and its two values share a column and a left edge, so a
+ * High and low are where price has been over that period; ATR is what a bar of
+ * that period typically covers. The pairing is the point -- a 1h range far
+ * wider than the 1h ATR says this hour is not an ordinary one, which neither
+ * row says by itself.
+ *
+ * Each period's label and its values share a column and a left edge, so a
  * column reads as one period top to bottom.
  */
 function rangeBlock(
@@ -558,7 +576,9 @@ function rangeBlock(
   width: number,
   inner: number
 ): Line[] {
-  const labelWidth = 7;
+  // Eight, not seven: 'ATR(14)' is itself seven characters and would sit flush
+  // against the first value with no gap to separate them.
+  const labelWidth = 8;
   const start = 2 + labelWidth;
   const columns = Math.max(1, ranges.length);
   // Capped, not merely divided. Spreading six short prices across a wide
@@ -571,6 +591,8 @@ function rangeBlock(
   const heading = new Line(width).put(2, 'RANGE', SECTION, start);
   const high = new Line(width).put(2, 'High', LABEL, start);
   const low = new Line(width).put(2, 'Low', LABEL, start);
+  // Named with its period so it cannot be mistaken for a range of 14 anything.
+  const atr = new Line(width).put(2, 'ATR(14)', LABEL, start);
 
   ranges.forEach((range, index) => {
     const col = start + index * span;
@@ -580,9 +602,10 @@ function rangeBlock(
     heading.put(col, range.label, LABEL, limit);
     high.put(col, range.high, VALUE, limit);
     low.put(col, range.low, VALUE, limit);
+    atr.put(col, range.atr, VALUE, limit);
   });
 
-  return [heading, high, low];
+  return [heading, high, low, atr];
 }
 
 function confirmationBlock(
@@ -782,9 +805,8 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
   // Range is the panel that yields when the terminal is short. It is a
   // reference, not something an order depends on, and a block that renders
   // past the bottom of the screen would take the command line with it.
-  const RANGE_ROWS = 4; // border, label row, high, low
   const showRanges =
-    view.ranges.length > 0 && available - fixed - 1 - RANGE_ROWS >= 1;
+    view.ranges.length > 0 && available - fixed - 1 - RANGE_ROWS >= MIN_ACTIVITY_ROWS;
 
   const activityRows = Math.max(
     1,
@@ -938,7 +960,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
     return line;
   };
 
-  const { splitRows, activityRows } = planHeight(
+  const { splitRows, activityRows, showRanges } = planHeight(
     Math.max(MIN_HEIGHT, size.height),
     chase !== null
   );
@@ -1024,8 +1046,10 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   lines.push(secondaryRow);
 
   // --- range: where price has been over each period ----------------------
-  lines.push(border());
-  lines.push(...rangeBlock(view.ranges, width, inner));
+  if (showRanges && view.ranges.length > 0) {
+    lines.push(border());
+    lines.push(...rangeBlock(view.ranges, width, inner));
+  }
 
   // --- confirmation takes the place of position/orders when pending --------
   if (view.confirmation) {
