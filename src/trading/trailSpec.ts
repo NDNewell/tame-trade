@@ -16,6 +16,7 @@ export const TRAIL_TIMEFRAMES = [
   '6h',
   '12h',
   '1d',
+  '1w',
 ] as const;
 
 export type TrailTimeframe = (typeof TRAIL_TIMEFRAMES)[number];
@@ -48,6 +49,24 @@ const isTimeframe = (value: string): value is TrailTimeframe =>
   (TRAIL_TIMEFRAMES as readonly string[]).includes(value);
 
 /**
+ * Case is folded, except where folding it would change the meaning.
+ *
+ * '4H' plainly means four hours and is worth accepting. '1M' is a different
+ * matter: lower case m is minutes and upper case M is months by long
+ * convention, so folding them together turned a request for a monthly trail
+ * into a one-minute one -- about ten times tighter than asked for, with no
+ * error. Anything ending in an upper-case M is refused rather than guessed at.
+ */
+function canonicalTimeframe(raw: string): TrailTimeframe | undefined {
+  const trimmed = raw.trim();
+  if (isTimeframe(trimmed)) return trimmed;
+  if (/M$/.test(trimmed)) return undefined;
+
+  const lowered = trimmed.toLowerCase();
+  return isTimeframe(lowered) ? lowered : undefined;
+}
+
+/**
  * Reads a trail argument.
  *
  *   trail 2            two price units behind the extreme
@@ -61,7 +80,7 @@ const isTimeframe = (value: string): value is TrailTimeframe =>
  * misread argument is not a cosmetic problem.
  */
 export function parseTrailSpec(argument: string): TrailSpec | TrailSpecError {
-  const text = argument.trim().toLowerCase();
+  const text = argument.trim();
   if (text === '') return { error: 'Give a trail distance.' };
 
   const words = text.split(/\s+/);
@@ -69,7 +88,11 @@ export function parseTrailSpec(argument: string): TrailSpec | TrailSpecError {
     return { error: `Too many arguments in '${argument.trim()}'.` };
   }
 
-  const [first, second] = words;
+  const [rawFirst, rawSecond] = words;
+  // The distance is case-insensitive; the timeframe is not entirely, so it is
+  // handled by canonicalTimeframe rather than folded here.
+  const first = rawFirst.toLowerCase();
+  const second = rawSecond;
 
   // --- ATR forms ----------------------------------------------------------
   // '3atr', '3 atr' (as two words), 'atr', and any of those with a timeframe.
@@ -84,12 +107,15 @@ export function parseTrailSpec(argument: string): TrailSpec | TrailSpecError {
 
     let timeframe: TrailTimeframe = DEFAULT_TRAIL_TIMEFRAME;
     if (second !== undefined) {
-      if (!isTimeframe(second)) {
+      const canonical = canonicalTimeframe(second);
+      if (!canonical) {
         return {
-          error: `'${second}' is not a timeframe. Use one of ${TRAIL_TIMEFRAMES.join(', ')}.`,
+          error: /M$/.test(second.trim())
+            ? `'${second}' is ambiguous: 'm' is minutes and 'M' is months. Write '${second.trim().slice(0, -1)}m' for minutes; monthly trails are not offered.`
+            : `'${second}' is not a timeframe. Use one of ${TRAIL_TIMEFRAMES.join(', ')}.`,
         };
       }
-      timeframe = second;
+      timeframe = canonical;
     }
 
     return { kind: 'atr', multiple, timeframe, period: DEFAULT_ATR_PERIOD };
@@ -98,7 +124,12 @@ export function parseTrailSpec(argument: string): TrailSpec | TrailSpecError {
   // A timeframe only makes sense with ATR; anything else with two words is a
   // typo worth naming rather than silently ignoring.
   if (second !== undefined) {
-    return { error: `'${second}' only applies to an ATR trail, as in 'trail 3atr ${second}'.` };
+    return {
+      error:
+        second.toLowerCase() === 'atr'
+          ? `Write the multiple and 'atr' as one word: 'trail ${first}atr'.`
+          : `'${second}' only applies to an ATR trail, as in 'trail 3atr ${second}'.`,
+    };
   }
 
   // --- fixed forms --------------------------------------------------------

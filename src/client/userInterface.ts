@@ -316,7 +316,8 @@ export class UserInterface {
 
     if (arg === '') {
       NotificationManager.notify(
-        'Usage: trail <distance>, trail <percent>%, or trail <multiple>atr [timeframe]',
+        'Usage: trail 2 | trail 2% | trail 3atr [timeframe]   ' +
+          'e.g. trail 3atr 15m. Timeframes: 1m 3m 5m 15m 30m 1h 2h 4h 6h 12h 1d 1w',
         NType.INFO,
         'SYSTEM'
       );
