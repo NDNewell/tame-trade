@@ -30,7 +30,7 @@ import {
   advanceHighWaterMark,
   TrailSide,
 } from '../trading/adaptiveTrail.js';
-import { buildTrailTag, readTrailTag } from '../trading/trailTag.js';
+import { buildTrailTag, readTrailTag, TrailTag } from '../trading/trailTag.js';
 import { describeExchangeError, isMissingOrderError } from '../utils/exchangeErrors.js';
 import { classifyOrderStatus, staleOrderIds } from './orderCacheRules.js';
 import { NotificationManager } from '../utils/notificationManager.js';
@@ -129,6 +129,8 @@ export class ExchangeClient {
   private trailReviewRunning = false;
   /** Trails already announced as resumed, so a restart says so once. */
   private trailResumeAnnounced = new Set<string>();
+  /** Delayed trails that have reached their arming price and begun trailing. */
+  private armedTrails = new Set<string>();
   /** Looked up once per session; it does not change while connected. */
   private accountLabel: string | undefined;
   private equityCache:
@@ -3824,6 +3826,11 @@ export class ExchangeClient {
     this.trailTimer.unref?.();
   }
 
+  /** Whether a delayed trail has reached its arming price. */
+  isTrailArmed(orderId: string): boolean {
+    return this.armedTrails.has(orderId);
+  }
+
   stopTrailMonitor(): void {
     if (this.trailTimer) clearInterval(this.trailTimer);
     this.trailTimer = null;
@@ -3854,6 +3861,7 @@ export class ExchangeClient {
             this.trailFailures.delete(id);
             this.abandonedTrails.delete(id);
             this.trailResumeAnnounced.delete(id);
+            this.armedTrails.delete(id);
           }
         }
 
@@ -4038,6 +4046,83 @@ export class ExchangeClient {
     }
   }
 
+  /**
+   * Replaces a managed stop with an exchange-run trailing stop.
+   *
+   * The new order goes on before the old one comes off. Two stops for a moment
+   * is harmless -- both close the whole position, so the second finds nothing
+   * to do -- whereas a gap between them is a moment with no protection at all,
+   * which is not a trade worth making to keep the panel tidy.
+   *
+   * The extreme the exchange starts from is the current price, and that is
+   * right here: arming happens because price has just reached the arming level,
+   * so there is no earlier high to carry across.
+   */
+  private async handOverToExchangeTrail(
+    market: string,
+    order: Order,
+    distance: number,
+    side: TrailSide
+  ): Promise<void> {
+    const id = String(order.id ?? '');
+    const info: any = (order as any).info ?? {};
+    const quantity = Number(info.orderQtyRq ?? 0);
+
+    const reference = await this.getMarkPriceForTrail(market);
+    if (reference === undefined) return;
+
+    const start = side === 'long' ? reference - distance : reference + distance;
+
+    try {
+      const replacement = await this.createStopOrder(
+        market,
+        start,
+        quantity > 0 ? quantity : undefined,
+        true,
+        false,
+        distance
+      );
+
+      if (!replacement?.id) throw new Error('the exchange did not return an order');
+
+      await this.exchange!.cancelOrder(id, market).catch((error: unknown) => {
+        // The trail is running; the old stop is the leftover. Say so plainly
+        // rather than leaving two stops on the book unexplained.
+        NotificationManager.notify(
+          `The exchange trail is running, but the original stop ${id.slice(0, 8)} could not be cancelled: ` +
+            `${(error as Error).message}. Cancel it manually.`,
+          NType.ERROR,
+          'ERROR'
+        );
+      });
+
+      this.trailHighWater.delete(id);
+      this.trailFailures.delete(id);
+
+      NotificationManager.notify(
+        `Handed to the exchange: trailing ${this.formatPriceForDisplay(market, distance)} ` +
+          `behind, from ${this.formatPriceForDisplay(market, start)}. ` +
+          `It keeps trailing whether or not Tame is running.`,
+        NType.SUCCESS,
+        'ORDER'
+      );
+    } catch (error) {
+      NotificationManager.notify(
+        `Could not hand trail ${id.slice(0, 8)} to the exchange: ${(error as Error).message}. ` +
+          `The original stop is still resting and unchanged.`,
+        NType.ERROR,
+        'ERROR'
+      );
+    }
+  }
+
+  /** How a trail's terms read in a message. */
+  private describeTrailTag(tag: TrailTag): string {
+    return tag.kind === 'atr'
+      ? `${tag.value}x ATR(${ExchangeClient.RANGE_ATR_PERIOD}) ${tag.timeframe}`
+      : `${tag.value} fixed`;
+  }
+
   private async reviewTrail(market: string, order: Order): Promise<void> {
     const id = String(order.id ?? '');
     if (!id || this.abandonedTrails.has(id)) return;
@@ -4052,13 +4137,19 @@ export class ExchangeClient {
     const mark = await this.getMarkPriceForTrail(market);
     if (mark === undefined) return;
 
-    const [atr, tick] = await Promise.all([
-      this.getAtr(market, ExchangeClient.RANGE_ATR_PERIOD, tag.timeframe).catch(() => undefined),
-      this.getMarketPrecision(market).catch(() => 0),
-    ]);
-    if (atr === undefined) return;
+    const tick = await this.getMarketPrecision(market).catch(() => 0);
 
-    const cushion = atr * tag.multiple;
+    // A fixed trail's distance is on the order; an ATR one is measured now.
+    let cushion: number | undefined = tag.kind === 'fixed' ? tag.value : undefined;
+    if (tag.kind === 'atr' && tag.timeframe) {
+      const atr = await this.getAtr(
+        market,
+        ExchangeClient.RANGE_ATR_PERIOD,
+        tag.timeframe
+      ).catch(() => undefined);
+      cushion = atr === undefined ? undefined : atr * tag.value;
+    }
+    if (cushion === undefined || !(cushion > 0)) return;
     const direction = side === 'long' ? 1 : -1;
 
     let high = this.trailHighWater.get(id);
@@ -4098,6 +4189,34 @@ export class ExchangeClient {
     high = advanceHighWaterMark(side, high, mark);
     if (high === undefined) return;
     this.trailHighWater.set(id, high);
+
+    // A delayed trail does nothing until the position has moved far enough to
+    // arm it. The test is against the high-water mark rather than the current
+    // price, so arming is sticky: once reached it stays reached, and a pullback
+    // cannot un-arm a trail that has already begun.
+    if (tag.armPrice !== undefined) {
+      const direction = side === 'long' ? 1 : -1;
+      if (direction * (high - tag.armPrice) < 0) return;
+
+      if (!this.armedTrails.has(id)) {
+        this.armedTrails.add(id);
+        NotificationManager.notify(
+          `Trail armed at ${this.formatPriceForDisplay(market, tag.armPrice)} ` +
+            `(${this.describeTrailTag(tag)})`,
+          NType.SUCCESS,
+          'ORDER'
+        );
+      }
+
+      // A fixed distance has nothing left to recalculate, so from here the
+      // exchange runs it and keeps running it whether or not this process does.
+      // An ATR trail stays with us, because its distance keeps changing.
+      if (tag.kind === 'fixed') {
+        await this.handOverToExchangeTrail(market, order, tag.value, side);
+        return;
+      }
+
+    }
 
     const plan = planTrailStop(
       { side, highWaterMark: high, stop, mark },
@@ -4140,8 +4259,7 @@ export class ExchangeClient {
       NotificationManager.notify(
         `Trail raised ${this.formatPriceForDisplay(market, stop)} -> ` +
           `${this.formatPriceForDisplay(market, plan.stop)} ` +
-          `(${tag.multiple}x ATR(${ExchangeClient.RANGE_ATR_PERIOD}) ${tag.timeframe} ` +
-          `= ${this.formatPriceForDisplay(market, atr * tag.multiple)} behind ` +
+          `(${this.describeTrailTag(tag)} = ${this.formatPriceForDisplay(market, cushion)} behind ` +
           `${this.formatPriceForDisplay(market, high)})`,
         NType.SUCCESS,
         'ORDER'
@@ -4193,6 +4311,100 @@ export class ExchangeClient {
     return orders.filter((order) =>
       readTrailTag((order as any).clientOrderId ?? (order as any).info?.clOrdID)
     );
+  }
+
+  /**
+   * A stop now, which becomes a trail once the position has proved itself.
+   *
+   * The arming price is the entry plus the trail's distance, which has a
+   * property worth knowing: at the moment it arms, the trail's first level is
+   * exactly the entry price. So the order reads as "risk this much until the
+   * trade has moved, then breakeven, then trail" -- with no jump at the
+   * changeover, because the two meet at the same number.
+   *
+   * The distance and the arming price are both fixed at placement. Recomputing
+   * either later would move the arming price after the fact: adding to a
+   * position changes its average entry, and an ATR cushion changes every
+   * candle.
+   */
+  async createDelayedTrailOrder(
+    market: string,
+    stopPrice: number,
+    size: number | undefined,
+    spec: TrailSpec
+  ): Promise<Order | undefined> {
+    const position = await this.getPositionView(market);
+    if (!position || !(position.size > 0)) {
+      throw new Error('No open position to trail.');
+    }
+    if (position.entry === undefined || !(position.entry > 0)) {
+      throw new Error(
+        'The position has no usable entry price, so there is nothing to arm against.'
+      );
+    }
+
+    const existing = await this.findAdaptiveTrails(market);
+    if (existing.length > 0) {
+      throw new Error(
+        `A managed trail is already running on ${market} (${String(existing[0].id).slice(0, 8)}). ` +
+          `Cancel it first. No order was placed.`
+      );
+    }
+
+    const reference =
+      (await this.getMarkPriceForTrail(market)) ?? (await this.getReferencePrice(market));
+    if (reference === undefined) {
+      throw new Error(`No price available for ${market}, so the trail cannot be placed.`);
+    }
+
+    const distance = await this.resolveTrailDistance(market, spec, reference);
+    if (distance === undefined || !(distance > 0)) {
+      throw new Error(
+        spec.kind === 'atr'
+          ? `Could not measure ATR(${spec.period}) on ${spec.timeframe} for ${market}. No order was placed.`
+          : 'That trail works out to zero distance.'
+      );
+    }
+
+    const isLong = position.side.toUpperCase() === 'LONG';
+    const armPrice = isLong ? position.entry + distance : position.entry - distance;
+
+    const clientOrderId = buildTrailTag(
+      spec.kind === 'atr'
+        ? { kind: 'atr', value: spec.multiple, timeframe: spec.timeframe, armPrice }
+        : { kind: 'fixed', value: distance, armPrice }
+    );
+
+    const order = await this.createStopOrder(
+      market,
+      stopPrice,
+      size,
+      false,
+      true,
+      undefined,
+      clientOrderId,
+      true
+    );
+
+    if (order?.id) {
+      this.adaptiveMarkets.add(market);
+      this.trailHighWater.set(String(order.id), reference);
+    }
+
+    const already = isLong ? reference >= armPrice : reference <= armPrice;
+
+    NotificationManager.notify(
+      `Stop at ${this.formatPriceForDisplay(market, stopPrice)}; ` +
+        `trails ${describeTrailSpec(spec)} once price reaches ` +
+        `${this.formatPriceForDisplay(market, armPrice)} ` +
+        `(entry ${this.formatPriceForDisplay(market, position.entry)} ` +
+        `+ ${this.formatPriceForDisplay(market, distance)})` +
+        (already ? '. Price is already there, so it arms on the next check.' : ''),
+      NType.INFO,
+      'ORDER'
+    );
+
+    return order;
   }
 
   async createTrailingStopOrder(
@@ -4305,7 +4517,8 @@ export class ExchangeClient {
     }
 
     const clientOrderId = buildTrailTag({
-      multiple: spec.multiple,
+      kind: 'atr',
+      value: spec.multiple,
       timeframe: spec.timeframe,
     });
 

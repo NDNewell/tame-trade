@@ -8,7 +8,11 @@ import { formatOutput as fo } from '../utils/formatOutput.js';
 import { ExchangeProfile } from '../config/configManager.js';
 import { ExchangeCommand, OrderType } from '../commands/exchangeCommand.js';
 import { StateManager } from '../config/stateManager.js';
-import { parseTrailSpec, isTrailSpecError } from '../trading/trailSpec.js';
+import {
+  parseTrailSpec,
+  isTrailSpecError,
+  parseDelayedTrail,
+} from '../trading/trailSpec.js';
 import { NotificationManager, NType } from '../utils/notificationManager.js';
 import { describeExchangeError } from '../utils/exchangeErrors.js';
 import { Workspace } from '../ui/workspace.js';
@@ -311,13 +315,45 @@ export class UserInterface {
     );
   }
 
+  private async handleDelayedTrailCommand(command: string): Promise<void> {
+    if (!this.currentMarket) {
+      NotificationManager.notify('No market selected.', NType.ERROR, 'ERROR');
+      return;
+    }
+
+    const parsed = parseDelayedTrail(command);
+    if (parsed === undefined) return;
+    if (isTrailSpecError(parsed)) {
+      NotificationManager.notify(parsed.error, NType.ERROR, 'ERROR');
+      return;
+    }
+
+    try {
+      const order = await this.exchangeCommand
+        .getExchangeClient()
+        .createDelayedTrailOrder(
+          this.currentMarket,
+          parsed.stopPrice,
+          parsed.size,
+          parsed.trail
+        );
+
+      if (!order) {
+        NotificationManager.notify('Stop was NOT placed.', NType.ERROR, 'ERROR');
+      }
+    } catch (error) {
+      this.reportFailure(error);
+    }
+  }
+
   private async handleTrailCommand(command: string): Promise<void> {
     const arg = command.slice('trail'.length).trim();
 
     if (arg === '') {
       NotificationManager.notify(
         'Usage: trail 2 | trail 2% | trail 3atr [timeframe]   ' +
-          'e.g. trail 3atr 15m. Timeframes: 1m 3m 5m 15m 30m 1h 2h 4h 6h 12h 1d 1w',
+          'Delayed: stop <price> [size] trail <spec>, e.g. stop 97 trail 10   ' +
+          'Timeframes: 1m 3m 5m 15m 30m 1h 2h 4h 6h 12h 1d 1w',
         NType.INFO,
         'SYSTEM'
       );
@@ -456,6 +492,8 @@ export class UserInterface {
     }
     if (command === 'list methods') {
       this.displayAvailableMethods();
+    } else if (command.startsWith('stop ') && / trail\b/.test(command)) {
+      await this.handleDelayedTrailCommand(command);
     } else if (command === 'trail' || command.startsWith('trail ')) {
       await this.handleTrailCommand(command);
     } else if (command === 'fatfinger' || command.startsWith('fatfinger ')) {
