@@ -6,6 +6,7 @@ import {
   closedCandles,
   atrTrailOffset,
   nextTrailOffset,
+  rangeOver,
 } from './volatility.js';
 
 let failures = 0;
@@ -188,6 +189,58 @@ check(
   'V  a nonsense current offset is not amended from',
   nextTrailOffset({ current: 0, candidate: 5 }) === undefined,
   'current 0 -> undefined'
+);
+
+// --- rolling ranges ---------------------------------------------------------
+
+const now = 1_000_000;
+const min = 60_000;
+// One candle per minute for the last 10 minutes, widening as it goes back.
+const recent: Candle[] = Array.from({ length: 10 }, (_, i) => {
+  const age = 9 - i; // 9 minutes ago ... 0 minutes ago
+  return candle(100 + age, 100 - age, 100, now - age * min);
+});
+
+let r = rangeOver(recent, 5 * min, now);
+check(
+  'W  a rolling window only sees candles inside it',
+  r !== undefined && r.high === 105 && r.low === 95,
+  `5m -> ${JSON.stringify(r)} (the 9-minute-old 109/91 candle is excluded)`
+);
+
+r = rangeOver(recent, 10 * min, now);
+check(
+  'X  a wider window reaches further back',
+  r !== undefined && r.high === 109 && r.low === 91,
+  `10m -> ${JSON.stringify(r)}`
+);
+
+// The reason this exists: exchanges publish closed candles only, so a new high
+// would otherwise sit outside the range that should contain it.
+r = rangeOver(recent, 5 * min, now, 112);
+check(
+  'Y  the current price is folded in, so the range always contains it',
+  r !== undefined && r.high === 112 && r.low === 95,
+  `price 112 above a 105 candle high -> ${JSON.stringify(r)}`
+);
+
+r = rangeOver(recent, 5 * min, now, 88);
+check(
+  'Z  and below, for a new low',
+  r !== undefined && r.low === 88 && r.high === 105,
+  `price 88 -> ${JSON.stringify(r)}`
+);
+
+check(
+  'AA no candles in the window and no price yields nothing',
+  rangeOver([], 5 * min, now) === undefined,
+  'empty -> undefined'
+);
+
+check(
+  'AB a price alone is still a range',
+  JSON.stringify(rangeOver([], 5 * min, now, 100)) === JSON.stringify({ high: 100, low: 100 }),
+  `-> ${JSON.stringify(rangeOver([], 5 * min, now, 100))}`
 );
 
 console.log(`\n${failures === 0 ? 'PASS: all volatility cases' : `FAIL: ${failures} case(s)`}\n`);
