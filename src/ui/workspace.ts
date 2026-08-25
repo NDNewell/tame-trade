@@ -365,8 +365,13 @@ export class Workspace {
           // is an ordinary stop -- so the tag is the only thing that
           // distinguishes it, and the distinction matters: only one of the two
           // adjusts itself.
-          const adaptive =
-            readTrailTag((order as any).clientOrderId ?? info.clOrdID) !== undefined;
+          // A trail this application is responsible for. Before it arms it is
+          // an ordinary stop that will become a trail; after, it is one being
+          // moved. Those are different enough to show differently, since only
+          // one of them is going anywhere.
+          const tag = readTrailTag((order as any).clientOrderId ?? info.clOrdID);
+          const waiting =
+            tag?.armPrice !== undefined && !this.client.isTrailArmed(String(order.id));
 
           const filled = Number(order.filled ?? 0);
           const status = isTrigger
@@ -396,9 +401,11 @@ export class Workspace {
             managed:
               chaseOrderId && order.id === chaseOrderId
                 ? 'CHASE'
-                : adaptive
+                : waiting
+                ? 'ARM'
+                : tag?.kind === 'atr'
                 ? 'ATR'
-                : isTrailing
+                : tag !== undefined || isTrailing
                 ? 'TRAIL'
                 : undefined,
             expires:
