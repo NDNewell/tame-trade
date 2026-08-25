@@ -11,6 +11,12 @@ const parsed = (input: string): TrailSpec | undefined => {
   const result = parseTrailSpec(input);
   return isTrailSpecError(result) ? undefined : result;
 };
+
+/** The timeframe, for the ATR forms that have one. */
+const timeframeOf = (input: string): string | undefined => {
+  const result = parsed(input);
+  return result?.kind === 'atr' ? result.timeframe : undefined;
+};
 const errored = (input: string): string | undefined => {
   const result = parseTrailSpec(input);
   return isTrailSpecError(result) ? result.error : undefined;
@@ -114,7 +120,7 @@ check('T  and the refusal explains which is which',
   `3atr 15M -> "${errored('3atr 15M')}"`);
 
 check('U  unambiguous case is still folded',
-  parsed('3atr 4H')?.timeframe === '4h' && parsed('3ATR')?.kind === 'atr',
+  timeframeOf('3atr 4H') === '4h' && parsed('3ATR')?.kind === 'atr',
   '4H -> 4h, 3ATR -> atr');
 
 check('V  the two-word form is explained rather than rejected blankly',
