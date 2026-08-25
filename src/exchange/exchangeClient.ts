@@ -23,6 +23,7 @@ import {
 } from '../trading/volatility.js';
 import { TrailSpec, describeTrailSpec } from '../trading/trailSpec.js';
 import { describeExchangeError, isMissingOrderError } from '../utils/exchangeErrors.js';
+import { classifyOrderStatus, staleOrderIds } from './orderCacheRules.js';
 import { NotificationManager } from '../utils/notificationManager.js';
 import { NType } from '../utils/notificationManager.js';
 
@@ -113,7 +114,10 @@ export class ExchangeClient {
       finished: Map<string, OrderOutcome>;
       running: boolean;
       healthy: boolean;
+      /** When the feed last delivered anything. */
       syncedAt: number;
+      /** When the cache was last rebuilt from the exchange's own list. */
+      snapshotAt: number;
     }
   >();
 
@@ -1093,6 +1097,13 @@ export class ExchangeClient {
   // A resynced snapshot older than this is not trusted, on the theory that a
   // feed which has gone quiet for a minute may have missed something.
   private static readonly ORDER_CACHE_MAX_AGE_MS = 60000;
+  /**
+   * How long the cached order list may go without being checked against the
+   * exchange's own list. The feed reports changes rather than the whole set, so
+   * anything it fails to report persists until something asks outright.
+   */
+  private static readonly ORDER_RESYNC_MS = 20000;
+
 
   // Keeps a live view of open orders for a market: a REST snapshot to start,
   // then updates applied from the order feed as they arrive.
@@ -1116,6 +1127,7 @@ export class ExchangeClient {
       running: true,
       healthy: false,
       syncedAt: 0,
+      snapshotAt: 0,
     };
     this.orderStreams.set(market, state);
 
@@ -1137,6 +1149,7 @@ export class ExchangeClient {
 
         state.healthy = true;
         state.syncedAt = Date.now();
+        state.snapshotAt = Date.now();
       } catch {
         state.running = false;
         return;
@@ -1150,13 +1163,20 @@ export class ExchangeClient {
             if (!update.id) continue;
 
             const status = String(update.status ?? '');
-            const done =
-              status === 'closed' || status === 'canceled' || status === 'rejected';
+            const disposition = classifyOrderStatus(status);
 
             // Report what the exchange says happened, before updating the view.
             this.announceOrderUpdate(market, update, state);
 
-            if (done) {
+            // An order is shown as working only on a status that says so.
+            // Treating anything unrecognised as "still open" is what left a
+            // cancelled chase order on screen for a whole session: the replace
+            // emitted an update this did not match, so the order was neither
+            // removed nor questioned. When the status means nothing to us the
+            // cache is left alone and the next snapshot decides.
+            if (disposition === 'unknown') continue;
+
+            if (disposition === 'finished') {
               const average = Number(update.average ?? update.price ?? NaN);
               state.finished.set(update.id, {
                 status,
@@ -1381,9 +1401,14 @@ export class ExchangeClient {
     mustBeComplete = false
   ): Promise<Order[]> {
     const state = this.orderStreams.get(market);
+    const now = Date.now();
     const fresh =
       state?.healthy === true &&
-      Date.now() - state.syncedAt <= ExchangeClient.ORDER_CACHE_MAX_AGE_MS;
+      now - state.syncedAt <= ExchangeClient.ORDER_CACHE_MAX_AGE_MS &&
+      // Feed activity alone is not evidence the cache is right: syncedAt moves
+      // on every event about any order, so a chatty feed kept the cache
+      // permanently "fresh" and the exchange was never asked again.
+      now - state.snapshotAt <= ExchangeClient.ORDER_RESYNC_MS;
 
     if (!mustBeComplete && fresh) {
       return Array.from(state!.orders.values());
@@ -1399,7 +1424,56 @@ export class ExchangeClient {
     // Seed the feed from this snapshot so the next call can be served from it.
     this.startOrderStream(market, params, orders);
 
+    const existing = this.orderStreams.get(market);
+    if (existing) this.reconcileOrderCache(existing, orders, params);
+
     return orders;
+  }
+
+  /**
+   * Makes the cached order list agree with the exchange's.
+   *
+   * The feed reports changes, not the whole set, so anything it fails to report
+   * -- a cancellation carrying a status we don't recognise, an event missed
+   * while reconnecting -- leaves an order on screen the exchange has no record
+   * of. Taking the exchange's own list as the truth every so often bounds how
+   * long any such drift can last, whatever caused it.
+   *
+   * A filtered fetch may only remove orders it could have returned. Reconciling
+   * the whole cache against, say, an untriggered-only query would delete every
+   * ordinary limit order in it.
+   */
+  private reconcileOrderCache(
+    state: {
+      orders: Map<string, Order>;
+      filledSoFar: Map<string, number>;
+      snapshotAt: number;
+      syncedAt: number;
+    },
+    orders: Order[],
+    params?: Record<string, any>
+  ): void {
+    const live = new Set<string>();
+
+    for (const order of orders) {
+      if (!order.id) continue;
+      live.add(order.id);
+      state.orders.set(order.id, order);
+      // Only for orders we haven't been tracking, so an in-flight fill isn't
+      // re-announced from a snapshot that happens to include it.
+      if (!state.filledSoFar.has(order.id)) {
+        state.filledSoFar.set(order.id, Number(order.filled ?? 0));
+      }
+    }
+
+    const authoritative = params === undefined || Object.keys(params).length === 0;
+    for (const id of staleOrderIds(state.orders.keys(), live, authoritative)) {
+      state.orders.delete(id);
+      state.filledSoFar.delete(id);
+    }
+    if (authoritative) state.snapshotAt = Date.now();
+
+    state.syncedAt = Date.now();
   }
 
   private stopTickerStream(market?: string): void {
