@@ -21,6 +21,7 @@ import {
   closedCandles,
   atrTrailOffset,
   rangeOver,
+  nestRanges,
   RANGE_WINDOWS,
 } from '../trading/volatility.js';
 import { TrailSpec, describeTrailSpec } from '../trading/trailSpec.js';
@@ -832,7 +833,7 @@ export class ExchangeClient {
     // getAtr rather than a second measurement here: it already reads closed
     // candles only, caches until the next one closes, and shares the candle
     // cache with the fetches above.
-    const ranges = await Promise.all(
+    const measured = await Promise.all(
       RANGE_WINDOWS.map(async ({ label, minutes, source, atrTimeframe }) => {
         const range = rangeOver(series.get(source) ?? [], minutes * 60_000, now, latest);
         const atr = await this.getAtr(
@@ -844,6 +845,19 @@ export class ExchangeClient {
         return { label, high: range?.high, low: range?.low, atr };
       })
     );
+
+    // Each window is measured on candles coarse enough to span it, so the wider
+    // ones lag: a spike reaches the 1h column when its minute candle closes but
+    // the 1d column only when the fifteen-minute one does, and the month --
+    // measured on daily candles -- would not show today at all until midnight.
+    // The windows nest, so carrying the running extreme outward is simply using
+    // the better evidence we already hold about recent time.
+    const nested = nestRanges(measured);
+    const ranges = measured.map((range, index) => ({
+      ...range,
+      high: nested[index].high,
+      low: nested[index].low,
+    }));
 
     this.rangeCache.set(market, { at: now, ranges });
     return ranges;

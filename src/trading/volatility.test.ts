@@ -7,6 +7,7 @@ import {
   atrTrailOffset,
   nextTrailOffset,
   rangeOver,
+  nestRanges,
 } from './volatility.js';
 
 let failures = 0;
@@ -241,6 +242,84 @@ check(
   'AB a price alone is still a range',
   JSON.stringify(rangeOver([], 5 * min, now, 100)) === JSON.stringify({ high: 100, low: 100 }),
   `-> ${JSON.stringify(rangeOver([], 5 * min, now, 100))}`
+);
+
+// --- nesting ----------------------------------------------------------------
+
+// The case that prompted this: an hourly high the day has not caught up with.
+let n = nestRanges([
+  { high: 102.5, low: 101.0 }, // 1h, from minute candles, has the spike
+  { high: 101.8, low: 99.0 },  // 1d, from 15m candles, does not yet
+]);
+check(
+  'AC a wider window cannot show a lower high than one inside it',
+  n[1].high === 102.5,
+  `1d high 101.8 with a 1h high of 102.5 -> ${n[1].high}`
+);
+
+n = nestRanges([
+  { high: 102.5, low: 98.0 },
+  { high: 103.0, low: 99.0 },
+]);
+check(
+  'AD nor a higher low',
+  n[1].low === 98.0 && n[1].high === 103.0,
+  `-> ${JSON.stringify(n[1])}`
+);
+
+n = nestRanges([
+  { high: 100, low: 99 },
+  { high: 101, low: 98 },
+  { high: 102, low: 97 },
+]);
+check(
+  'AE an already-consistent set is left alone',
+  JSON.stringify(n) === JSON.stringify([
+    { high: 100, low: 99 },
+    { high: 101, low: 98 },
+    { high: 102, low: 97 },
+  ]),
+  'unchanged'
+);
+
+// The month is measured on daily candles, so today's extremes reach it only
+// by inheritance.
+n = nestRanges([
+  { high: 110, low: 90 },   // today, from fine candles
+  { high: 105, low: 70 },   // the month, from daily candles, missing today
+]);
+check(
+  'AF the month inherits today without waiting for the day to close',
+  n[1].high === 110 && n[1].low === 70,
+  `-> ${JSON.stringify(n[1])}`
+);
+
+n = nestRanges([
+  { high: 102, low: 100 },
+  { high: undefined, low: undefined },
+  { high: 101, low: 99 },
+]);
+check(
+  'AG a window with no data stays empty rather than borrowing',
+  n[1].high === undefined && n[1].low === undefined && n[2].high === 102 && n[2].low === 99,
+  `middle ${JSON.stringify(n[1])}, outer ${JSON.stringify(n[2])}`
+);
+
+// Monotonicity is the property the panel is read for; assert it holds whatever
+// order the inputs arrive in.
+const messy = [
+  { high: 100, low: 95 }, { high: 99, low: 96 }, { high: 104, low: 94 },
+  { high: 98, low: 97 }, { high: 103, low: 80 }, { high: 101, low: 85 },
+];
+const nested = nestRanges(messy);
+let monotonic = true;
+for (let i = 1; i < nested.length; i++) {
+  if (nested[i].high! < nested[i - 1].high! || nested[i].low! > nested[i - 1].low!) monotonic = false;
+}
+check(
+  'AH highs never shrink and lows never rise across the row',
+  monotonic,
+  nested.map((r) => `${r.high}/${r.low}`).join('  ')
 );
 
 console.log(`\n${failures === 0 ? 'PASS: all volatility cases' : `FAIL: ${failures} case(s)`}\n`);
