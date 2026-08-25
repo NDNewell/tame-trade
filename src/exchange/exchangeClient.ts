@@ -4439,11 +4439,16 @@ export class ExchangeClient {
   /**
    * A stop now, which becomes a trail once the position has proved itself.
    *
-   * The arming price is the entry plus the trail's distance, which has a
-   * property worth knowing: at the moment it arms, the trail's first level is
-   * exactly the entry price. So the order reads as "risk this much until the
-   * trade has moved, then breakeven, then trail" -- with no jump at the
-   * changeover, because the two meet at the same number.
+   * The arming price is the stop plus the trail's distance -- the point at
+   * which trailing would first put the stop somewhere better than where it
+   * already is. Measuring from the entry instead held the stop still through a
+   * window where trailing would have raised it, and gained nothing: the two
+   * rules converge the moment the entry-based one arms and are identical from
+   * then on, so measuring from the entry could only ever be the same or worse.
+   *
+   * It also makes the order mean what it says. 'stop 98.50 trail 10' is a stop
+   * at 98.50 that trails ten behind, and it starts trailing exactly when
+   * trailing would move it. Nothing about the entry price comes into it.
    *
    * The distance and the arming price are both fixed at placement. Recomputing
    * either later would move the arming price after the fact: adding to a
@@ -4460,12 +4465,8 @@ export class ExchangeClient {
     if (!position || !(position.size > 0)) {
       throw new Error('No open position to trail.');
     }
-    if (position.entry === undefined || !(position.entry > 0)) {
-      throw new Error(
-        'The position has no usable entry price, so there is nothing to arm against.'
-      );
-    }
-
+    // No entry price needed: arming is measured from the stop being placed, not
+    // from where the position was opened.
     const existing = await this.findAdaptiveTrails(market);
     if (existing.length > 0) {
       throw new Error(
@@ -4490,7 +4491,7 @@ export class ExchangeClient {
     }
 
     const isLong = position.side.toUpperCase() === 'LONG';
-    const armPrice = isLong ? position.entry + distance : position.entry - distance;
+    const armPrice = isLong ? stopPrice + distance : stopPrice - distance;
 
     const clientOrderId = buildTrailTag(
       spec.kind === 'atr'
@@ -4520,8 +4521,7 @@ export class ExchangeClient {
       `Stop at ${this.formatPriceForDisplay(market, stopPrice)}; ` +
         `trails ${describeTrailSpec(spec)} once price reaches ` +
         `${this.formatPriceForDisplay(market, armPrice)} ` +
-        `(entry ${this.formatPriceForDisplay(market, position.entry)} ` +
-        `+ ${this.formatPriceForDisplay(market, distance)})` +
+        `(the stop plus ${this.formatPriceForDisplay(market, distance)})` +
         (already ? '. Price is already there, so it arms on the next check.' : ''),
       NType.INFO,
       'ORDER'
