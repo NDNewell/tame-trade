@@ -255,3 +255,52 @@ export function rangeOver(
   if (!Number.isFinite(high) || !Number.isFinite(low)) return undefined;
   return { high, low };
 }
+
+/** Extremes for one window, as the panel holds them. */
+export interface WindowExtremes {
+  high?: number;
+  low?: number;
+}
+
+/**
+ * Makes each window's extremes account for the narrower windows inside it.
+ *
+ * The windows all end at now and grow, so they nest: the last day contains the
+ * last hour, which contains the last five minutes. A wider window's high can
+ * therefore never be lower than a narrower one's, and if it is, the wider one is
+ * simply out of date.
+ *
+ * Which it will be, because each window is measured on candles coarse enough to
+ * span it. A spike that retraces enters the 1h column as soon as its minute
+ * candle closes, but does not reach the 1d column until the fifteen-minute
+ * candle holding it closes. The month is worse: measured on daily candles, it
+ * would not show today's high until the day ended.
+ *
+ * Carrying the running extreme outward fixes both. It is not a smoothing or a
+ * fudge -- the narrower window is a subset of the wider one, so its high is
+ * genuinely part of the wider one's range, and the fine candles are simply
+ * better evidence about recent time than the coarse ones have yet recorded.
+ *
+ * Expects windows ordered narrowest first.
+ */
+export function nestRanges(ranges: WindowExtremes[]): WindowExtremes[] {
+  let high: number | undefined;
+  let low: number | undefined;
+
+  return ranges.map((range) => {
+    if (range.high !== undefined && Number.isFinite(range.high)) {
+      high = high === undefined ? range.high : Math.max(high, range.high);
+    }
+    if (range.low !== undefined && Number.isFinite(range.low)) {
+      low = low === undefined ? range.low : Math.min(low, range.low);
+    }
+
+    // A window whose own data is missing stays missing. It still contributes
+    // nothing and inherits nothing: showing a narrower window's extreme in its
+    // place would read as a measurement of this window rather than an absence.
+    return {
+      high: range.high === undefined ? undefined : high,
+      low: range.low === undefined ? undefined : low,
+    };
+  });
+}
