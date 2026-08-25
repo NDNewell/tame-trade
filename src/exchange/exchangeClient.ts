@@ -4046,7 +4046,13 @@ export class ExchangeClient {
       throw new Error('No open position to trail.');
     }
 
-    const reference = await this.getReferencePrice(market);
+    // The mark, because that is what the trigger is measured against. Anchoring
+    // on the last trade instead put the stop a tick or two off from the moment
+    // it was placed, for no reason other than that two prices were in play.
+    const reference =
+      (await this.getMarkPriceForTrail(market)) ??
+      (await this.getReferencePrice(market));
+
     if (reference === undefined) {
       throw new Error(
         `No price available for ${market}, so the trail cannot be placed.`
@@ -4085,10 +4091,18 @@ export class ExchangeClient {
     // once, and the number is what the order carries from then on. Reporting
     // only '2%' invites the reader to assume it stays two percent of a rising
     // price, which it does not.
+    // Says what this order will do from here, which now differs by kind: a
+    // fixed trail keeps its distance for life, an ATR one has its distance
+    // re-derived as candles close. Reporting 'fixed once placed' on both was
+    // true when it was written and became false when ATR trails started
+    // adapting -- exactly the sort of stale reassurance that stops an operator
+    // looking at something they should look at.
     NotificationManager.notify(
       `Trailing ${this.formatPriceForDisplay(market, distance)} behind ` +
         `${this.formatPriceForDisplay(market, reference)} ` +
-        `(${describeTrailSpec(spec)}, fixed once placed)`,
+        `(${describeTrailSpec(spec)}${
+          spec.kind === 'atr' ? ', adjusts as volatility changes' : ', fixed once placed'
+        })`,
       NType.INFO,
       'ORDER'
     );
