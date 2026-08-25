@@ -736,12 +736,22 @@ export class ExchangeClient {
   /**
    * Candles for a market, in the shape the measurements take.
    *
-   * Cached for a fraction of the candle size, so a panel reading eight windows
-   * off four candle sizes does not make four requests every time it repaints.
-   * Daily candles change once a day; asking for them every fifteen seconds
-   * spends the rate limit to be told the same thing. What actually moves
-   * between closes is the current price, and that is read separately and folded
-   * in fresh.
+   * Cached until the next candle of that size closes, because that is exactly
+   * when the answer can change. Daily candles change once a day; asking for
+   * them every fifteen seconds spends the rate limit to be told the same thing.
+   * What actually moves between closes is the current price, and that is read
+   * separately and folded in fresh.
+   *
+   * Expiring on the close rather than on some fraction of it matters. ATR is
+   * cached until the same moment, so if these two disagreed the measurement
+   * would come due, ask for candles, and be handed a set that did not yet
+   * include the bar that had just closed -- a column that updates on the close
+   * in principle but lags it by minutes in practice.
+   *
+   * Clamped at both ends: never longer than a few minutes, so a month of
+   * uptime cannot sit on a month-old read, and never shorter than the floor,
+   * so an exchange that publishes a candle a moment late is retried rather
+   * than polled flat out.
    */
   private async getCandles(market: string, timeframe: string): Promise<Candle[]> {
     const key = `${market}|${timeframe}`;
@@ -763,12 +773,19 @@ export class ExchangeClient {
     }));
 
     const intervalMs = this.exchange!.parseTimeframe(timeframe) * 1000;
-    const ttl = Math.min(
-      ExchangeClient.CANDLE_CACHE_MAX_MS,
-      Math.max(ExchangeClient.CANDLE_CACHE_MIN_MS, intervalMs / 4)
+    const now = Date.now();
+    const last = closedCandles(candles, now, intervalMs).pop();
+
+    // The close after the most recent one: nothing here changes before then.
+    const nextClose =
+      last !== undefined ? last.timestamp + 2 * intervalMs : now;
+
+    const until = Math.min(
+      now + ExchangeClient.CANDLE_CACHE_MAX_MS,
+      Math.max(now + ExchangeClient.CANDLE_CACHE_MIN_MS, nextClose)
     );
 
-    this.candleCache.set(key, { until: Date.now() + ttl, candles });
+    this.candleCache.set(key, { until, candles });
     return candles;
   }
 
