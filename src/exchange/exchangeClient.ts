@@ -4004,15 +4004,33 @@ export class ExchangeClient {
     });
     if (!source) return mark;
 
+    // Two series, not one. The coarse candles reach back far enough to cover
+    // the whole period but are blind to the most recent part of it: exchanges
+    // publish closed candles only, so an extreme set inside the candle still
+    // forming is not in them yet. On a position opened hours ago that meant a
+    // spike fifteen minutes old was invisible, and the reconstruction came back
+    // below the high the resting stop had already been set from.
+    const series = source === '1m' ? [source] : [source, '1m'];
+
     try {
-      const candles = await this.getCandles(market, source);
-      const since = candles.filter((candle) => candle.timestamp >= placedAt);
-      if (since.length === 0) return mark;
+      const extremes: number[] = [];
+
+      for (const timeframe of series) {
+        const candles = await this.getCandles(market, timeframe);
+        const since = candles.filter((candle) => candle.timestamp >= placedAt);
+        if (since.length === 0) continue;
+
+        extremes.push(
+          side === 'long'
+            ? Math.max(...since.map((candle) => candle.high))
+            : Math.min(...since.map((candle) => candle.low))
+        );
+      }
+
+      if (extremes.length === 0) return mark;
 
       const extreme =
-        side === 'long'
-          ? Math.max(...since.map((candle) => candle.high))
-          : Math.min(...since.map((candle) => candle.low));
+        side === 'long' ? Math.max(...extremes) : Math.min(...extremes);
 
       return advanceHighWaterMark(side, extreme, mark ?? extreme);
     } catch {
@@ -4034,10 +4052,40 @@ export class ExchangeClient {
     const mark = await this.getMarkPriceForTrail(market);
     if (mark === undefined) return;
 
+    const [atr, tick] = await Promise.all([
+      this.getAtr(market, ExchangeClient.RANGE_ATR_PERIOD, tag.timeframe).catch(() => undefined),
+      this.getMarketPrecision(market).catch(() => 0),
+    ]);
+    if (atr === undefined) return;
+
+    const cushion = atr * tag.multiple;
+    const direction = side === 'long' ? 1 : -1;
+
     let high = this.trailHighWater.get(id);
     if (high === undefined) {
-      high = await this.reconstructHighWaterMark(market, side, order.timestamp ?? undefined);
-      if (high !== undefined && !this.trailResumeAnnounced.has(id)) {
+      // Rebuilt from the position, not the order.
+      //
+      // The order carries no usable record of when it was placed: Phemex moves
+      // actionTimeNs and transactTimeNs together on every amendment, so after
+      // the first move they all read as the moment of that move. Reconstructing
+      // from them looked back only as far as the last amendment and found a
+      // high of 102.39 where the real one was 103.13.
+      //
+      // The position's opening is the right boundary anyway -- it is the same
+      // "since entry" the trail was placed against.
+      const position = await this.getPositionView(market).catch(() => null);
+      const resumed = position
+        ? await this.anchorForNewTrail(market, side, position.size, cushion, mark)
+        : { anchor: mark, note: 'from the current mark' };
+
+      // Never behind the stop already resting. Whatever high produced that stop
+      // was at least this, so starting below it would leave the trail unable to
+      // account for its own order.
+      const impliedByStop = stop + direction * cushion;
+      high =
+        direction * (impliedByStop - resumed.anchor) > 0 ? impliedByStop : resumed.anchor;
+
+      if (!this.trailResumeAnnounced.has(id)) {
         this.trailResumeAnnounced.add(id);
         NotificationManager.notify(
           `Resumed managing trail ${id.slice(0, 8)} from a high of ${this.formatPriceForDisplay(market, high)}`,
@@ -4051,16 +4099,10 @@ export class ExchangeClient {
     if (high === undefined) return;
     this.trailHighWater.set(id, high);
 
-    const [atr, tick] = await Promise.all([
-      this.getAtr(market, ExchangeClient.RANGE_ATR_PERIOD, tag.timeframe).catch(() => undefined),
-      this.getMarketPrecision(market).catch(() => 0),
-    ]);
-    if (atr === undefined) return;
-
     const plan = planTrailStop(
       { side, highWaterMark: high, stop, mark },
       {
-        cushion: atr * tag.multiple,
+        cushion,
         tick: tick > 0 ? tick : 0.01,
         minimumImprovementFraction: ExchangeClient.TRAIL_MIN_IMPROVEMENT,
         safetyTicks: ExchangeClient.TRAIL_SAFETY_TICKS,
