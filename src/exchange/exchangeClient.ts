@@ -1622,6 +1622,31 @@ export class ExchangeClient {
   }
 
   /**
+   * Drops orders this process has just cancelled from the cached list.
+   *
+   * The cache is refreshed against the exchange periodically, which is right
+   * for drift nobody caused. A cancellation is not drift: we know the order is
+   * gone the moment the exchange accepts it, and continuing to show it is worse
+   * here than anywhere else -- a cancelled stop on screen reads as protection
+   * that no longer exists.
+   *
+   * The next read is also forced to go to the exchange, so anything else the
+   * cancellation changed is picked up rather than waiting out the interval.
+   */
+  private forgetCancelledOrders(market: string, ids: Array<string | undefined>): void {
+    const state = this.orderStreams.get(market);
+    if (!state) return;
+
+    for (const id of ids) {
+      if (id === undefined) continue;
+      state.orders.delete(String(id));
+      state.filledSoFar.delete(String(id));
+    }
+
+    state.snapshotAt = 0;
+  }
+
+  /**
    * Makes the cached order list agree with the exchange's.
    *
    * The feed reports changes, not the whole set, so anything it fails to report
@@ -2176,7 +2201,12 @@ export class ExchangeClient {
     // Cancel the orders within the range
     if (ordersToCancel.length > 0) {
       const cancelPromises = ordersToCancel.map((order) =>
-        this.exchange!.cancelOrder(order.id, market, isHyperliquid ? hyperliquidParams : undefined)
+        this.exchange!
+          .cancelOrder(order.id, market, isHyperliquid ? hyperliquidParams : undefined)
+          .then((result) => {
+            this.forgetCancelledOrders(market, [order.id]);
+            return result;
+          })
       );
       await Promise.all(cancelPromises);
       console.log(`${ordersToCancel.length} limit orders have been canceled.`);
@@ -2257,7 +2287,12 @@ export class ExchangeClient {
       const results = await Promise.allSettled(
         limitOrders.map((order) =>
           // The wallet parameter was omitted here while the fetch above used it.
-          this.exchange!.cancelOrder(order.id, symbol, walletAddress ? { user: walletAddress } : undefined)
+          this.exchange!
+            .cancelOrder(order.id, symbol, walletAddress ? { user: walletAddress } : undefined)
+            .then((result) => {
+              this.forgetCancelledOrders(symbol, [order.id]);
+              return result;
+            })
         )
       );
 
@@ -2301,6 +2336,13 @@ export class ExchangeClient {
         stopOrders.map((order) => this.exchange!.cancelOrder(order.id, symbol, params))
       );
 
+      this.forgetCancelledOrders(
+        symbol,
+        stopOrders
+          .filter((_, index) => results[index].status === 'fulfilled')
+          .map((order) => order.id)
+      );
+
       const failed = results.filter((r) => r.status === 'rejected').length;
       for (const result of results) {
         if (result.status === 'rejected') {
@@ -2332,6 +2374,7 @@ export class ExchangeClient {
     this.currentChaseOrderId = undefined;
     try {
       await this.exchange!.cancelOrder(targetId, market, params);
+      this.forgetCancelledOrders(market, [targetId]);
     } catch (error: any) {
         // Check if it's a benign OrderNotFound error
         const errorMessage = String(error.message || '');
@@ -4085,7 +4128,10 @@ export class ExchangeClient {
 
       if (!replacement?.id) throw new Error('the exchange did not return an order');
 
-      await this.exchange!.cancelOrder(id, market).catch((error: unknown) => {
+      await this.exchange!
+        .cancelOrder(id, market)
+        .then(() => this.forgetCancelledOrders(market, [id]))
+        .catch((error: unknown) => {
         // The trail is running; the old stop is the leftover. Say so plainly
         // rather than leaving two stops on the book unexplained.
         NotificationManager.notify(
