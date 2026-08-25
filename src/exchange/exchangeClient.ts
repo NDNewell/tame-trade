@@ -25,6 +25,8 @@ import {
   RANGE_WINDOWS,
 } from '../trading/volatility.js';
 import { TrailSpec, describeTrailSpec } from '../trading/trailSpec.js';
+import { planTrailAdjustment, TrailSide } from '../trading/adaptiveTrail.js';
+import { buildTrailTag, readTrailTag } from '../trading/trailTag.js';
 import { describeExchangeError, isMissingOrderError } from '../utils/exchangeErrors.js';
 import { classifyOrderStatus, staleOrderIds } from './orderCacheRules.js';
 import { NotificationManager } from '../utils/notificationManager.js';
@@ -104,6 +106,13 @@ export class ExchangeClient {
   private atrCache = new Map<string, { until: number; value?: number }>();
   private rangeCache = new Map<string, { at: number; ranges: PriceRangeView[] }>();
   private candleCache = new Map<string, { until: number; candles: Candle[] }>();
+  /** Markets known to carry an adaptive trail, so the monitor knows where to look. */
+  private adaptiveMarkets = new Set<string>();
+  /** Consecutive amendment failures per order; a trail is abandoned after too many. */
+  private trailFailures = new Map<string, number>();
+  /** Orders the monitor has given up on, so it does not keep retrying silently. */
+  private abandonedTrails = new Set<string>();
+  private trailTimer: NodeJS.Timeout | null = null;
   /** Looked up once per session; it does not change while connected. */
   private accountLabel: string | undefined;
   private equityCache:
@@ -709,6 +718,22 @@ export class ExchangeClient {
   private static readonly CANDLE_LIMIT = 100;
   /** How long to hold a failed volatility read before trying again. */
   private static readonly ATR_RETRY_MS = 30000;
+  /**
+   * How often adaptive trails are reconsidered.
+   *
+   * Deliberately unrelated to any candle boundary. ATR is cached until its own
+   * candle closes, so nearly every pass costs nothing and reaches no network --
+   * work happens only once a close has actually produced a new measurement.
+   * Polling cheaply and acting rarely avoids doing arithmetic against the
+   * exchange's clock and copes with a candle published a little late.
+   */
+  private static readonly TRAIL_CHECK_MS = 20000;
+  /** The stop must improve by this fraction of the current trail to be worth amending. */
+  private static readonly TRAIL_MIN_IMPROVEMENT = 0.05;
+  /** How far a moved stop must stay clear of the mark. */
+  private static readonly TRAIL_SAFETY_TICKS = 2;
+  /** Consecutive failures before a trail is left alone and reported. */
+  private static readonly TRAIL_MAX_FAILURES = 3;
   /**
    * High and low move with every tick, so this is short. It is not shorter
    * because the underlying candles only change on a close, and the current
@@ -3441,7 +3466,8 @@ export class ExchangeClient {
     suppressLog?: boolean,
     enforceFatFinger: boolean = true,
     /** Absolute price distance the exchange should trail the stop by. */
-    trailOffset?: number
+    trailOffset?: number,
+    clientOrderId?: string
   ): Promise<Order | undefined> {
     // A size we work out from the position isn't something the user typed, so it
     // isn't subject to the fatfinger limit — a stop must always be placeable.
@@ -3606,6 +3632,10 @@ export class ExchangeClient {
             params.pegOffsetValueRp =
               side === 'sell' ? -Math.abs(trailOffset) : Math.abs(trailOffset);
             params.pegPriceType = 'TrailingStopPeg';
+
+            // Carries the trail's terms on the order itself, so a restart can
+            // find it again and keep adapting it.
+            if (clientOrderId) params.clOrdID = clientOrderId;
           }
         }
 
@@ -3737,10 +3767,180 @@ export class ExchangeClient {
     }
   }
 
+  /**
+   * Starts reconsidering adaptive trails, if it is not already running.
+   *
+   * One timer covers every trail rather than one per order: the work is a map
+   * lookup in the common case, and a second timer per order would multiply the
+   * ways this can be left running after the order it watched is gone.
+   */
+  startTrailMonitor(): void {
+    if (this.trailTimer) return;
+    this.trailTimer = setInterval(() => {
+      void this.reviewAdaptiveTrails();
+    }, ExchangeClient.TRAIL_CHECK_MS);
+    // Long-lived timer; it must not be the reason the process stays alive.
+    this.trailTimer.unref?.();
+  }
+
+  stopTrailMonitor(): void {
+    if (this.trailTimer) clearInterval(this.trailTimer);
+    this.trailTimer = null;
+  }
+
+  /**
+   * One pass over every adaptive trail we can see.
+   *
+   * The register of what to manage is the exchange, not this process: a trail
+   * carries its terms in its client order id, so anything found open and tagged
+   * is picked up, including after a restart, and anything no longer open simply
+   * is not found. There is no local list to fall out of step.
+   */
+  private async reviewAdaptiveTrails(): Promise<void> {
+    const markets = new Set(this.adaptiveMarkets);
+    if (this.lastFollowedMarket) markets.add(this.lastFollowedMarket);
+
+    for (const market of markets) {
+      try {
+        const trails = await this.findAdaptiveTrails(market);
+        if (trails.length === 0) {
+          this.adaptiveMarkets.delete(market);
+          continue;
+        }
+        this.adaptiveMarkets.add(market);
+        for (const trail of trails) await this.reviewTrail(market, trail);
+      } catch (error) {
+        console.warn(
+          `[ExchangeClient] Could not review trails on ${market}: ${
+            (error as Error).message
+          }`
+        );
+      }
+    }
+  }
+
+  private async reviewTrail(market: string, order: Order): Promise<void> {
+    const id = String(order.id ?? '');
+    if (!id || this.abandonedTrails.has(id)) return;
+
+    const info: any = (order as any).info ?? {};
+    const tag = readTrailTag((order as any).clientOrderId ?? info.clOrdID);
+    if (!tag) return;
+
+    const peg = Math.abs(Number(info.pegOffsetValueRp));
+    const stop = Number(info.stopPxRp);
+    const side: TrailSide = String(order.side ?? '').toLowerCase() === 'sell' ? 'long' : 'short';
+
+    const [mark, atr, tick] = await Promise.all([
+      this.getMarkPriceForTrail(market),
+      this.getAtr(market, ExchangeClient.RANGE_ATR_PERIOD, tag.timeframe).catch(() => undefined),
+      this.getMarketPrecision(market).catch(() => 0),
+    ]);
+
+    if (mark === undefined || atr === undefined) return;
+
+    const plan = planTrailAdjustment(
+      { side, peg, stop, mark },
+      {
+        desiredDistance: atr * tag.multiple,
+        tick: tick > 0 ? tick : 0.01,
+        minimumImprovementFraction: ExchangeClient.TRAIL_MIN_IMPROVEMENT,
+        safetyTicks: ExchangeClient.TRAIL_SAFETY_TICKS,
+      }
+    );
+
+    if (plan.action === 'hold') return;
+
+    try {
+      // The quantity is passed back exactly as the order carries it. A trail
+      // covering the whole position carries zero, which is the marker for that
+      // rather than a size, so it must survive the amendment unchanged.
+      const quantity = Number(info.orderQtyRq ?? 0);
+
+      await this.exchange!.editOrder(id, market, 'Stop', String(order.side), quantity, undefined, {
+        pegOffsetValueRp: side === 'long' ? -plan.peg : plan.peg,
+        pegPriceType: 'TrailingStopPeg',
+        posSide: 'Merged',
+      } as any);
+
+      // Accepted is not applied. Read the order back and check the exchange
+      // actually holds the new distance -- an amendment that is accepted and
+      // ignored would otherwise be retried forever, moving nothing.
+      const after = (await this.findAdaptiveTrails(market)).find((o) => o.id === id);
+      const stored = Math.abs(Number((after as any)?.info?.pegOffsetValueRp));
+
+      if (!(Math.abs(stored - plan.peg) < Math.max(tick, 1e-8))) {
+        throw new Error(`the exchange still holds a trail of ${stored}`);
+      }
+
+      this.trailFailures.delete(id);
+      NotificationManager.notify(
+        `Trail tightened to ${this.formatPriceForDisplay(market, plan.peg)}, ` +
+          `stop ${this.formatPriceForDisplay(market, stop)} -> ` +
+          `${this.formatPriceForDisplay(market, plan.stop)} ` +
+          `(${tag.multiple}x ATR(${ExchangeClient.RANGE_ATR_PERIOD}) ${tag.timeframe})`,
+        NType.SUCCESS,
+        'ORDER'
+      );
+    } catch (error) {
+      const failures = (this.trailFailures.get(id) ?? 0) + 1;
+      this.trailFailures.set(id, failures);
+
+      if (failures >= ExchangeClient.TRAIL_MAX_FAILURES) {
+        this.abandonedTrails.add(id);
+        // Loudly, and once. A trail that has silently stopped adapting is the
+        // failure this whole design exists to avoid, so it is never left to be
+        // inferred from the absence of messages.
+        NotificationManager.notify(
+          `Adaptive trail ${id.slice(0, 8)} could not be adjusted after ${failures} attempts and is no longer being managed. ` +
+            `It is still protecting the position at its current distance. Last error: ${(error as Error).message}`,
+          NType.ERROR,
+          'ERROR'
+        );
+      } else {
+        console.warn(
+          `[ExchangeClient] Trail ${id.slice(0, 8)} amendment failed (${failures}): ${
+            (error as Error).message
+          }`
+        );
+      }
+    }
+  }
+
+  /** The mark, for valuing a trail. Falls back to the last trade if unpublished. */
+  private async getMarkPriceForTrail(market: string): Promise<number | undefined> {
+    const { mark } = await this.getFundingSnapshot(market);
+    if (Number.isFinite(Number(mark)) && Number(mark) > 0) return Number(mark);
+    return this.getReferencePrice(market);
+  }
+
+  /** Working orders on a market that this application placed as adaptive trails. */
+  private async findAdaptiveTrails(market: string): Promise<Order[]> {
+    const orders = await this.getLiveOpenOrders(market).catch(() => [] as Order[]);
+    return orders.filter((order) =>
+      readTrailTag((order as any).clientOrderId ?? (order as any).info?.clOrdID)
+    );
+  }
+
   async createTrailingStopOrder(
     market: string,
     spec: TrailSpec
   ): Promise<Order | undefined> {
+    // One adaptive trail per market. Two managers amending one position's
+    // protection would race, and replacing the existing one silently would
+    // throw away the high-water mark it has built up -- so this refuses and
+    // says what is already there rather than deciding for the operator.
+    if (spec.kind === 'atr') {
+      const existing = await this.findAdaptiveTrails(market);
+      if (existing.length > 0) {
+        const trigger = (existing[0] as any).triggerPrice ?? (existing[0] as any).info?.stopPxRp;
+        throw new Error(
+          `An adaptive trail is already running on ${market} (${String(existing[0].id).slice(0, 8)}, stop ${trigger}). ` +
+            `Cancel it first if you want different terms. No order was placed.`
+        );
+      }
+    }
+
     const position = await this.getPositionView(market);
     if (!position || !(position.size > 0)) {
       throw new Error('No open position to trail.');
@@ -3793,7 +3993,23 @@ export class ExchangeClient {
       'ORDER'
     );
 
-    return this.createStopOrder(market, start, undefined, false, true, distance);
+    const clientOrderId =
+      spec.kind === 'atr'
+        ? buildTrailTag({ multiple: spec.multiple, timeframe: spec.timeframe })
+        : undefined;
+
+    const order = await this.createStopOrder(
+      market,
+      start,
+      undefined,
+      false,
+      true,
+      distance,
+      clientOrderId
+    );
+
+    if (order && spec.kind === 'atr') this.adaptiveMarkets.add(market);
+    return order;
   }
 
   async updateStopOrder(
