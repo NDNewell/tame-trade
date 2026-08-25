@@ -96,5 +96,30 @@ check('Q  each form describes itself for the log',
   describeTrailSpec({ kind: 'atr', multiple: 3, timeframe: '1h', period: 14 })
 );
 
+// --- case folding, and the one place it must not happen -------------------
+
+s = parsed('3atr 1w');
+check('R  weekly is accepted',
+  s?.kind === 'atr' && s.timeframe === '1w', JSON.stringify(s));
+
+// Lower-case m is minutes, upper-case M is months. Folding them together turned
+// a monthly request into a one-minute trail, about ten times tighter, silently.
+check('S  an upper-case M is refused rather than read as minutes',
+  (errored('3atr 1M') ?? '').includes('ambiguous'),
+  `3atr 1M -> "${errored('3atr 1M')}"`);
+
+check('T  and the refusal explains which is which',
+  (errored('15M') === undefined ? '' : '') === '' &&
+    (errored('3atr 15M') ?? '').includes("'m' is minutes"),
+  `3atr 15M -> "${errored('3atr 15M')}"`);
+
+check('U  unambiguous case is still folded',
+  parsed('3atr 4H')?.timeframe === '4h' && parsed('3ATR')?.kind === 'atr',
+  '4H -> 4h, 3ATR -> atr');
+
+check('V  the two-word form is explained rather than rejected blankly',
+  (errored('3 atr') ?? '').includes('one word'),
+  `3 atr -> "${errored('3 atr')}"`);
+
 console.log(`\n${failures === 0 ? 'PASS: all trail-spec cases' : `FAIL: ${failures} case(s)`}\n`);
 process.exit(failures === 0 ? 0 : 1);
