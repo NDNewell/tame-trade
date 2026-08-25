@@ -43,6 +43,13 @@ export interface HeaderView {
   fundsCurrency: string;
 }
 
+/** One period's high and low. */
+export interface RangeColumnView {
+  label: string;
+  high: string;
+  low: string;
+}
+
 export interface MarketView {
   symbol: string;
   last: string;
@@ -129,6 +136,7 @@ export interface ConfirmationView {
 
 export interface TerminalView {
   header: HeaderView;
+  ranges: RangeColumnView[];
   market: MarketView;
   position: PositionView | null;
   orders: OrderRowView[];
@@ -432,6 +440,8 @@ export function planHeight(height: number, hasChase: boolean) {
     1 + // border
     3 + // market label + two rows
     1 + // border
+    3 + // range label row + high + low
+    1 + // border
     1 + // border under the split block
     (hasChase ? chaseRows + 1 : 0) + // chase + its border
     1 + // border above command
@@ -531,6 +541,48 @@ function putFunds(line: Line, end: number, parts: FundsPart[]): Line {
     col += width + FUNDS_GAP;
   }
   return line;
+}
+
+/**
+ * The high/low grid.
+ *
+ * Three rows, the same shape as MARKET: the section name occupies the column
+ * that labels the rows beneath it, which is exactly what it is doing, so the
+ * panel costs no more height than the two rows of data it carries.
+ *
+ * Each period's label and its two values share a column and a left edge, so a
+ * column reads as one period top to bottom.
+ */
+function rangeBlock(
+  ranges: RangeColumnView[],
+  width: number,
+  inner: number
+): Line[] {
+  const labelWidth = 7;
+  const start = 2 + labelWidth;
+  const columns = Math.max(1, ranges.length);
+  // Capped, not merely divided. Spreading six short prices across a wide
+  // terminal puts twenty columns of nothing between them, and reading a row
+  // then becomes a journey rather than a glance. The grid stays compact and
+  // leaves the space to the right unused.
+  const available = Math.floor((inner - start - 1) / columns);
+  const span = Math.max(8, Math.min(12, available));
+
+  const heading = new Line(width).put(2, 'RANGE', SECTION, start);
+  const high = new Line(width).put(2, 'High', LABEL, start);
+  const low = new Line(width).put(2, 'Low', LABEL, start);
+
+  ranges.forEach((range, index) => {
+    const col = start + index * span;
+    const limit = Math.min(col + span, inner);
+    if (col >= inner - 1) return;
+
+    heading.put(col, range.label, LABEL, limit);
+    high.put(col, range.high, VALUE, limit);
+    low.put(col, range.low, VALUE, limit);
+  });
+
+  return [heading, high, low];
 }
 
 function confirmationBlock(
@@ -725,7 +777,19 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
     (2 + Math.max(1, orderRows)) + 1 + // orders
     chaseRows +
     1 + 1 + 1 + 1 + 1; // activity label, command, borders, footer
-  const activityRows = Math.max(1, Math.max(MIN_HEIGHT, size.height) - fixed - 1);
+  const available = Math.max(MIN_HEIGHT, size.height);
+
+  // Range is the panel that yields when the terminal is short. It is a
+  // reference, not something an order depends on, and a block that renders
+  // past the bottom of the screen would take the command line with it.
+  const RANGE_ROWS = 4; // border, label row, high, low
+  const showRanges =
+    view.ranges.length > 0 && available - fixed - 1 - RANGE_ROWS >= 1;
+
+  const activityRows = Math.max(
+    1,
+    available - fixed - (showRanges ? RANGE_ROWS : 0) - 1
+  );
 
   lines.push(border());
   lines.push(
@@ -761,6 +825,17 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
   labelled(secondary, 30, 'Mark', market.mark, 45);
   labelled(secondary, 45, 'Spread', market.spread, inner);
   lines.push(secondary);
+
+  // Six periods will not fit in eighty columns without the numbers colliding,
+  // so the narrow layout carries the shortest, an hour, and the day. Dropping
+  // the panel entirely would lose more than dropping three of its columns.
+  const narrowRanges = showRanges
+    ? view.ranges.filter((range) => ['5m', '1h', '1d'].includes(range.label))
+    : [];
+  if (narrowRanges.length > 0) {
+    lines.push(border());
+    lines.push(...rangeBlock(narrowRanges, width, inner));
+  }
 
   lines.push(border());
   lines.push(new Line(width).put(2, 'POSITION', SECTION));
@@ -947,6 +1022,10 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   );
   labelled(secondaryRow, spreadCol, 'Spread', market.spread, inner);
   lines.push(secondaryRow);
+
+  // --- range: where price has been over each period ----------------------
+  lines.push(border());
+  lines.push(...rangeBlock(view.ranges, width, inner));
 
   // --- confirmation takes the place of position/orders when pending --------
   if (view.confirmation) {

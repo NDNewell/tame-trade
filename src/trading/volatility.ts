@@ -164,3 +164,65 @@ export function nextTrailOffset(input: RatchetInput): number | undefined {
 
   return candidate;
 }
+
+/** A period the high/low panel reports over. */
+export interface RangeWindow {
+  label: string;
+  minutes: number;
+}
+
+/** Shortest first, as they are read left to right. */
+export const RANGE_WINDOWS: RangeWindow[] = [
+  { label: '5m', minutes: 5 },
+  { label: '15m', minutes: 15 },
+  { label: '30m', minutes: 30 },
+  { label: '1h', minutes: 60 },
+  { label: '4h', minutes: 240 },
+  { label: '1d', minutes: 1440 },
+];
+
+export interface PriceRange {
+  high: number;
+  low: number;
+}
+
+/**
+ * Highest high and lowest low over a trailing window.
+ *
+ * The window is rolling rather than the current candle of that size: "the last
+ * hour" is what a reader means by 1h, whereas the current hourly candle resets
+ * on the hour and would show a range of almost nothing at one minute past.
+ *
+ * `latest` is the current price, folded in so the range always contains it.
+ * Exchanges publish closed candles only, so without this a fresh high sits
+ * outside the range it belongs to until the candle closes -- a high of 101.20
+ * printed while price trades at 101.50 reads as a fault, and correctly so.
+ */
+export function rangeOver(
+  candles: Candle[],
+  windowMs: number,
+  now: number,
+  latest?: number
+): PriceRange | undefined {
+  if (!(windowMs > 0)) return undefined;
+
+  const since = now - windowMs;
+  let high = -Infinity;
+  let low = Infinity;
+
+  for (const candle of candles) {
+    // A candle is in the window if any part of it is, so the oldest one is
+    // included rather than the window silently starting late.
+    if (candle.timestamp < since) continue;
+    if (Number.isFinite(candle.high)) high = Math.max(high, candle.high);
+    if (Number.isFinite(candle.low)) low = Math.min(low, candle.low);
+  }
+
+  if (latest !== undefined && Number.isFinite(latest) && latest > 0) {
+    high = Math.max(high, latest);
+    low = Math.min(low, latest);
+  }
+
+  if (!Number.isFinite(high) || !Number.isFinite(low)) return undefined;
+  return { high, low };
+}

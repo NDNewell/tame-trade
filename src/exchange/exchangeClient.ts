@@ -20,6 +20,8 @@ import {
   averageTrueRange,
   closedCandles,
   atrTrailOffset,
+  rangeOver,
+  RANGE_WINDOWS,
 } from '../trading/volatility.js';
 import { TrailSpec, describeTrailSpec } from '../trading/trailSpec.js';
 import { describeExchangeError, isMissingOrderError } from '../utils/exchangeErrors.js';
@@ -32,6 +34,13 @@ import { NType } from '../utils/notificationManager.js';
 export interface CancelResult {
   cancelled: number;
   failed: number;
+}
+
+/** One period's high and low, as the RANGE panel shows them. */
+export interface PriceRangeView {
+  label: string;
+  high?: number;
+  low?: number;
 }
 
 export interface OrderOutcome {
@@ -90,6 +99,7 @@ export class ExchangeClient {
   >();
   /** Keyed by market, timeframe and period; valid until the next candle closes. */
   private atrCache = new Map<string, { until: number; value?: number }>();
+  private rangeCache = new Map<string, { at: number; ranges: PriceRangeView[] }>();
   /** Looked up once per session; it does not change while connected. */
   private accountLabel: string | undefined;
   private equityCache:
@@ -695,6 +705,13 @@ export class ExchangeClient {
   private static readonly CANDLE_LIMIT = 100;
   /** How long to hold a failed volatility read before trying again. */
   private static readonly ATR_RETRY_MS = 30000;
+  /**
+   * High and low move with every tick, so this is short. It is not shorter
+   * because the underlying candles only change on a close, and the current
+   * price -- which is what actually moves between closes -- is folded in
+   * separately on every read.
+   */
+  private static readonly RANGE_CACHE_MS = 15000;
 
   /** Mark price, index price and funding rate, refreshed at a sensible interval. */
   /**
@@ -709,6 +726,67 @@ export class ExchangeClient {
    * but caching "we don't know" for an hour would leave an adaptive trail
    * unadjusted long after the feed recovered.
    */
+  /** Candles for a market, in the shape the measurements take. */
+  private async fetchCandles(market: string, timeframe: string): Promise<Candle[]> {
+    const raw = await this.exchange!.fetchOHLCV(
+      market,
+      timeframe,
+      undefined,
+      ExchangeClient.CANDLE_LIMIT
+    );
+
+    return raw.map((row: any) => ({
+      timestamp: Number(row[0]),
+      high: Number(row[2]),
+      low: Number(row[3]),
+      close: Number(row[4]),
+    }));
+  }
+
+  /**
+   * Highest high and lowest low over each reported period.
+   *
+   * Two candle sizes rather than one: a hundred one-minute candles resolve the
+   * short windows to the minute but reach back less than two hours, so the
+   * longer ones are measured on fifteen-minute candles instead. Reading every
+   * window off a size coarse enough for a day would make the 5m column the last
+   * five-minute candle, which is not a five-minute range.
+   */
+  async getPriceRanges(market: string): Promise<PriceRangeView[]> {
+    const cached = this.rangeCache.get(market);
+    if (cached && Date.now() - cached.at <= ExchangeClient.RANGE_CACHE_MS) {
+      return cached.ranges;
+    }
+
+    const latest = await this.getReferencePrice(market);
+
+    let fine: Candle[] = [];
+    let coarse: Candle[] = [];
+    try {
+      [fine, coarse] = await Promise.all([
+        this.fetchCandles(market, '1m'),
+        this.fetchCandles(market, '15m'),
+      ]);
+    } catch (error) {
+      console.warn(
+        `[ExchangeClient] Could not read ranges for ${market}: ${
+          (error as Error).message
+        }`
+      );
+      // The current price alone still gives an honest, if narrow, range.
+    }
+
+    const now = Date.now();
+    const ranges = RANGE_WINDOWS.map(({ label, minutes }) => {
+      const source = minutes <= 60 ? fine : coarse;
+      const range = rangeOver(source, minutes * 60_000, now, latest);
+      return { label, high: range?.high, low: range?.low };
+    });
+
+    this.rangeCache.set(market, { at: now, ranges });
+    return ranges;
+  }
+
   async getAtr(
     market: string,
     period: number,
@@ -723,20 +801,7 @@ export class ExchangeClient {
     let until = Date.now() + ExchangeClient.ATR_RETRY_MS;
 
     try {
-      const raw = await this.exchange!.fetchOHLCV(
-        market,
-        timeframe,
-        undefined,
-        ExchangeClient.CANDLE_LIMIT
-      );
-
-      const candles: Candle[] = raw.map((row: any) => ({
-        timestamp: Number(row[0]),
-        high: Number(row[2]),
-        low: Number(row[3]),
-        close: Number(row[4]),
-      }));
-
+      const candles = await this.fetchCandles(market, timeframe);
       const closed = closedCandles(candles, Date.now(), intervalMs);
       value = averageTrueRange(closed, period);
 

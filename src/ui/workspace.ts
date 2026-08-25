@@ -94,6 +94,7 @@ export function emptyView(): TerminalView {
       funding: NO_VALUE,
       spread: NO_VALUE,
     },
+    ranges: [],
     position: null,
     orders: [],
     chase: null,
@@ -255,11 +256,12 @@ export class Workspace {
     const symbol = this.market;
 
     try {
-      const [position, orders, risk, funds] = await Promise.all([
+      const [position, orders, risk, funds, ranges] = await Promise.all([
         this.client.getPositionView(this.market).catch(() => null),
         this.client.getOpenOrdersForDisplay(this.market).catch(() => []),
         this.client.getPositionRisk(this.market).catch(() => undefined),
         this.client.getAccountFunds(this.market).catch(() => undefined),
+        this.client.getPriceRanges(this.market).catch(() => []),
       ]);
 
       // A failed read leaves the last known figures in place rather than
@@ -282,6 +284,11 @@ export class Workspace {
 
       this.screen.update({
         header: this.header(),
+        ranges: ranges.map(({ label, high, low }) => ({
+          label,
+          high: tick(high),
+          low: tick(low),
+        })),
         market: {
           symbol,
           last: tick(price.last),
