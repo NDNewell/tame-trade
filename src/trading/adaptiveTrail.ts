@@ -1,157 +1,153 @@
 // src/trading/adaptiveTrail.ts
 //
-// Decides whether a working trailing stop should be moved, and where to.
+// Where a managed trailing stop should sit.
 //
-// Pure: no exchange, no clock, no I/O. This is the function that can close a
-// position at the wrong price if it is wrong, so it is kept somewhere it can be
-// tested directly rather than inferred from live behaviour.
+// Pure: no exchange, no clock, no I/O. This function can close a position at
+// the wrong price if it is wrong, so it lives somewhere it can be tested
+// directly rather than inferred from live behaviour.
+//
+// The whole rule is two numbers and one constraint:
+//
+//   high-water mark   the best price reached since the trail was placed
+//   cushion           how far behind it the stop sits, from volatility
+//
+//   stop = high-water mark - cushion, and the stop never moves backwards.
+//
+// The stop being a ratchet is what makes volatility expansion free. When the
+// market gets wilder the cushion wants to grow, which would put the stop lower;
+// that is refused, so the stop simply stays where it is while new highs carry
+// the high-water mark away from it. The gap widens on its own, without ever
+// giving back protection already earned.
 
 export type TrailSide = 'long' | 'short';
 
-export interface TrailState {
+export interface TrailStopState {
   side: TrailSide;
   /**
-   * The trail distance currently on the order, as a positive number.
-   *
-   * The exchange stores this signed -- negative for a sell-side trail -- but the
-   * sign is direction, which `side` already carries.
+   * Best price reached since the trail was placed: the highest mark for a long,
+   * the lowest for a short. Tracked by this application rather than the
+   * exchange, which is the point -- nothing else moves the stop.
    */
-  peg: number;
-  /** The trigger price currently on the order. */
+  highWaterMark: number;
+  /** The trigger price currently resting on the exchange. */
   stop: number;
   /** Current mark price. Trails are triggered on the mark. */
   mark: number;
 }
 
-export interface TrailPolicy {
-  /** What volatility says the distance from the extreme should be. */
-  desiredDistance: number;
+export interface TrailStopPolicy {
+  /** How far behind the high-water mark the stop should sit: multiple x ATR. */
+  cushion: number;
   /** Smallest price step this market can express. */
   tick: number;
   /**
-   * How much the stop must improve, as a fraction of the current distance,
-   * before an amendment is worth sending. Every amendment is a request the
-   * exchange can reject; moving the stop two cents an hour is not worth one.
+   * How far the stop must improve, as a fraction of the cushion, before an
+   * amendment is worth sending. Every amendment is a request the exchange can
+   * reject, and moving a stop two cents is not worth one.
    */
   minimumImprovementFraction: number;
-  /** How far a new stop must stay from the mark, in ticks. */
+  /** How far a moved stop must stay clear of the mark. */
   safetyTicks: number;
 }
 
-export type TrailPlan =
+export type TrailStopPlan =
   | { action: 'hold'; reason: string }
-  | { action: 'move'; peg: number; stop: number; reason: string };
+  | { action: 'move'; stop: number; reason: string };
 
 const round = (value: number, tick: number): number =>
   tick > 0 ? Math.round(value / tick) * tick : value;
 
 /**
- * Where the exchange's high-water mark must be.
+ * Advances the high-water mark, which only ever moves one way.
  *
- * Phemex tracks the extreme internally and does not report it, but it is
- * recoverable: the trigger it publishes is the extreme less the trail distance,
- * so the extreme is the trigger plus that distance back again. Verified against
- * a live order -- trigger 97.57 with a 5.08 trail implies a 102.65 high, which
- * matched the session high.
+ * A price that fails to beat it leaves it alone -- that is what makes the trail
+ * a trail rather than a stop that follows price back down.
  */
-export function impliedExtreme(state: TrailState): number {
-  const direction = state.side === 'long' ? 1 : -1;
-  return state.stop + direction * state.peg;
+export function advanceHighWaterMark(
+  side: TrailSide,
+  current: number | undefined,
+  mark: number
+): number | undefined {
+  if (!Number.isFinite(mark) || mark <= 0) return current;
+  if (current === undefined || !Number.isFinite(current)) return mark;
+  return side === 'long' ? Math.max(current, mark) : Math.min(current, mark);
 }
 
 /**
- * Whether to move a working trail, and where to.
- *
- * The rule is that the stop level ratchets: it may rise for a long and fall for
- * a short, never the reverse. The peg is only the means -- it is free to widen,
- * provided the extreme has risen enough to pay for the widening and still leave
- * the stop better than it was. That is what lets the trail loosen when
- * volatility expands without ever giving back protection already earned.
+ * Where the stop should be moved to, or why it should be left alone.
  *
  * Three things stop a move:
  *
- *   - it would not improve the stop, so there is nothing to gain
+ *   - the new stop would be no better than the one already resting
  *   - the improvement is too small to be worth an amendment
- *   - it would put the stop at or through the mark
+ *   - it would put the stop at or through the current mark
  *
- * The third is the dangerous one. A collapse in volatility produces a very
- * short desired distance, and the extreme does not fall, so the resulting
- * trigger can land above the current price -- closing the position instantly at
- * market. That is a stop-out caused by volatility *falling*, which is the exact
- * opposite of what a trail is for. The stop is clamped to a safe distance from
- * the mark instead.
+ * The third is the dangerous one and the reason the mark is an input at all. A
+ * collapse in volatility shrinks the cushion sharply while the high-water mark
+ * does not fall, so the computed stop can land above the current price -- which
+ * would close the position immediately, at market, because volatility went
+ * *down*. The stop is clamped to a safe distance below the mark instead.
  */
-export function planTrailAdjustment(
-  state: TrailState,
-  policy: TrailPolicy
-): TrailPlan {
-  const { side, peg, stop, mark } = state;
-  const { desiredDistance, tick, minimumImprovementFraction, safetyTicks } = policy;
+export function planTrailStop(
+  state: TrailStopState,
+  policy: TrailStopPolicy
+): TrailStopPlan {
+  const { side, highWaterMark, stop, mark } = state;
+  const { cushion, tick, minimumImprovementFraction, safetyTicks } = policy;
 
-  if (!(peg > 0) || !Number.isFinite(peg)) {
-    return { action: 'hold', reason: 'the order carries no usable trail distance' };
+  if (!Number.isFinite(highWaterMark) || highWaterMark <= 0) {
+    return { action: 'hold', reason: 'no high-water mark yet' };
   }
   if (!Number.isFinite(stop) || !Number.isFinite(mark) || mark <= 0) {
     return { action: 'hold', reason: 'no usable price for this order' };
   }
-  if (!(desiredDistance > 0) || !Number.isFinite(desiredDistance)) {
+  if (!(cushion > 0) || !Number.isFinite(cushion)) {
     return { action: 'hold', reason: 'volatility could not be measured' };
   }
 
   // 1 for a long, where better means higher; -1 for a short, where it means
   // lower. Everything below is written once and works for both.
   const direction = side === 'long' ? 1 : -1;
-  const extreme = impliedExtreme(state);
 
-  let target = extreme - direction * desiredDistance;
+  let target = highWaterMark - direction * cushion;
 
-  // The stop may never end up at or through the mark.
+  // Never at or through the mark.
   const safetyGap = Math.max(safetyTicks, 1) * (tick > 0 ? tick : 0);
-  const ceiling = mark - direction * safetyGap;
+  const nearest = mark - direction * safetyGap;
 
-  if (direction * (ceiling - stop) <= 0) {
-    // Even the closest safe stop is no better than the one already there.
+  if (direction * (nearest - stop) <= 0) {
     return {
       action: 'hold',
       reason: 'price is too close to the stop to move it safely',
     };
   }
 
-  if (direction * (target - ceiling) > 0) {
-    target = ceiling;
-  }
+  if (direction * (target - nearest) > 0) target = nearest;
 
   const improvement = direction * (target - stop);
+
   if (improvement <= 0) {
-    return {
-      action: 'hold',
-      reason: 'volatility would widen the trail without a new extreme to pay for it',
-    };
+    // The cushion is wider than the gap the stop already has. Leaving the stop
+    // alone is what lets that gap widen by itself as new extremes arrive.
+    return { action: 'hold', reason: 'the stop is already closer than the cushion asks for' };
   }
 
-  if (improvement < peg * minimumImprovementFraction) {
+  if (improvement < cushion * minimumImprovementFraction) {
     return { action: 'hold', reason: 'improvement too small to be worth an amendment' };
   }
 
   const nextStop = round(target, tick);
-  const nextPeg = round(direction * (extreme - nextStop), tick);
 
-  if (!(nextPeg > 0)) {
-    return { action: 'hold', reason: 'the resulting trail distance would be zero' };
-  }
-
-  // Rounding is to the tick and could in principle land back on the old stop.
   if (direction * (nextStop - stop) <= 0) {
     return { action: 'hold', reason: 'improvement disappears once rounded to the tick' };
   }
 
   return {
     action: 'move',
-    peg: nextPeg,
     stop: nextStop,
     reason:
-      nextPeg < peg
-        ? 'volatility fell, tightening the trail'
-        : 'a new extreme allows a wider trail with a better stop',
+      direction * (highWaterMark - stop) > cushion
+        ? 'the high-water mark has moved ahead of the cushion'
+        : 'volatility fell, so the cushion tightened',
   };
 }
