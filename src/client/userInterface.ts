@@ -8,6 +8,7 @@ import { formatOutput as fo } from '../utils/formatOutput.js';
 import { ExchangeProfile } from '../config/configManager.js';
 import { ExchangeCommand, OrderType } from '../commands/exchangeCommand.js';
 import { StateManager } from '../config/stateManager.js';
+import { parseTrailSpec, isTrailSpecError } from '../trading/trailSpec.js';
 import { NotificationManager, NType } from '../utils/notificationManager.js';
 import { describeExchangeError } from '../utils/exchangeErrors.js';
 import { Workspace } from '../ui/workspace.js';
@@ -315,7 +316,7 @@ export class UserInterface {
 
     if (arg === '') {
       NotificationManager.notify(
-        'Usage: trail <distance> or trail <percent>%',
+        'Usage: trail <distance>, trail <percent>%, or trail <multiple>atr [timeframe]',
         NType.INFO,
         'SYSTEM'
       );
@@ -327,22 +328,16 @@ export class UserInterface {
       return;
     }
 
-    const percent = arg.endsWith('%');
-    const value = Number(percent ? arg.slice(0, -1).trim() : arg);
-
-    if (!Number.isFinite(value) || value <= 0) {
-      NotificationManager.notify(
-        `Invalid trail '${arg}'. Give a distance greater than 0, or a percentage such as 2%.`,
-        NType.ERROR,
-        'ERROR'
-      );
+    const spec = parseTrailSpec(arg);
+    if (isTrailSpecError(spec)) {
+      NotificationManager.notify(spec.error, NType.ERROR, 'ERROR');
       return;
     }
 
     try {
       const order = await this.exchangeCommand
         .getExchangeClient()
-        .createTrailingStopOrder(this.currentMarket, value, percent);
+        .createTrailingStopOrder(this.currentMarket, spec);
 
       if (!order) {
         NotificationManager.notify(
