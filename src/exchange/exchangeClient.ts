@@ -95,7 +95,13 @@ export class ExchangeClient {
   private chaseDeadline: number | undefined = undefined;
   private tickerStreams = new Map<
     string,
-    { price: number | undefined; at: number; running: boolean }
+    {
+      price: number | undefined;
+      bid?: number;
+      ask?: number;
+      at: number;
+      running: boolean;
+    }
   >();
   /**
    * Mark, index and funding come from one call, cached: funding moves every few
@@ -111,6 +117,8 @@ export class ExchangeClient {
   /** Keyed by market, timeframe and period; valid until the next candle closes. */
   private atrCache = new Map<string, { until: number; value?: number }>();
   private rangeCache = new Map<string, { at: number; ranges: PriceRangeView[] }>();
+  /** Markets with a background range refresh already running. */
+  private rangeRefreshInFlight = new Set<string>();
   private candleCache = new Map<string, { until: number; candles: Candle[] }>();
   /** Markets known to carry an adaptive trail, so the monitor knows where to look. */
   private adaptiveMarkets = new Set<string>();
@@ -138,6 +146,7 @@ export class ExchangeClient {
   private equityCache:
     | { at: number; currency: string; balance?: number; equity?: number }
     | undefined;
+  private equityRefreshInFlight = false;
   private accountLookupDone = false;
   /** The market being followed, so account lookups know which wallet to ask for. */
   private lastFollowedMarket: string | undefined;
@@ -884,9 +893,31 @@ export class ExchangeClient {
    */
   async getPriceRanges(market: string): Promise<PriceRangeView[]> {
     const cached = this.rangeCache.get(market);
-    if (cached && Date.now() - cached.at <= ExchangeClient.RANGE_CACHE_MS) {
+    const fresh = cached && Date.now() - cached.at <= ExchangeClient.RANGE_CACHE_MS;
+    if (fresh) return cached!.ranges;
+
+    // Nine candle series, each a request the exchange rate-limits. Awaiting
+    // that on the redraw stalled the whole frame -- position, orders and market
+    // repaint together -- for as long as it took, every time the cache lapsed.
+    //
+    // Once there is something to show, showing it wins. Ranges are measured
+    // over minutes to a month; a few seconds of staleness is invisible in the
+    // numbers and very visible in the redraw.
+    if (cached) {
+      if (!this.rangeRefreshInFlight.has(market)) {
+        this.rangeRefreshInFlight.add(market);
+        void this.computePriceRanges(market)
+          .catch(() => undefined)
+          .finally(() => this.rangeRefreshInFlight.delete(market));
+      }
       return cached.ranges;
     }
+
+    return this.computePriceRanges(market);
+  }
+
+  /** The work behind getPriceRanges. Always goes to the exchange. */
+  private async computePriceRanges(market: string): Promise<PriceRangeView[]> {
 
     const latest = await this.getReferencePrice(market);
 
@@ -1102,13 +1133,36 @@ export class ExchangeClient {
     equity?: number;
   }> {
     const cached = this.equityCache;
-    if (
+    const fresh =
       cached &&
       cached.currency === currency &&
-      Date.now() - cached.at <= ExchangeClient.EQUITY_CACHE_MS
-    ) {
+      Date.now() - cached.at <= ExchangeClient.EQUITY_CACHE_MS;
+
+    if (fresh) return { balance: cached!.balance, equity: cached!.equity };
+
+    // A balance read and a positions read, both rate-limited. Same reasoning as
+    // the ranges: once there is a figure to show, showing it beats holding the
+    // frame for a fresher one.
+    if (cached && cached.currency === currency) {
+      if (!this.equityRefreshInFlight) {
+        this.equityRefreshInFlight = true;
+        void this.computeAccountSummary(currency)
+          .catch(() => undefined)
+          .finally(() => {
+            this.equityRefreshInFlight = false;
+          });
+      }
       return { balance: cached.balance, equity: cached.equity };
     }
+
+    return this.computeAccountSummary(currency);
+  }
+
+  /** The work behind getAccountSummary. Always goes to the exchange. */
+  private async computeAccountSummary(currency: string): Promise<{
+    balance?: number;
+    equity?: number;
+  }> {
 
     let balance: number | undefined;
     let equity: number | undefined;
@@ -1190,15 +1244,24 @@ export class ExchangeClient {
     change?: string;
   }> {
     const last = await this.getReferencePrice(market);
-    let bid: number | undefined;
-    let ask: number | undefined;
 
-    try {
-      const book = await this.exchange!.fetchL2OrderBook(market, 1);
-      bid = book.bids?.[0]?.[0];
-      ask = book.asks?.[0]?.[0];
-    } catch {
-      // Book unavailable this tick; the rest of the view is still worth showing.
+    // Top of book from the streamed ticker, which already carries it. This was
+    // fetchL2OrderBook on every redraw -- a rate-limited request every two
+    // seconds for two numbers arriving on a socket we were already holding
+    // open. The fetch remains as a fallback for the first tick and for a feed
+    // that has gone quiet.
+    const streamed = this.tickerStreams.get(market);
+    let bid = streamed?.bid;
+    let ask = streamed?.ask;
+
+    if (bid === undefined || ask === undefined) {
+      try {
+        const book = await this.exchange!.fetchL2OrderBook(market, 1);
+        bid = book.bids?.[0]?.[0];
+        ask = book.asks?.[0]?.[0];
+      } catch {
+        // Book unavailable this tick; the rest of the view is still worth showing.
+      }
     }
 
     const spread =
@@ -1294,7 +1357,13 @@ export class ExchangeClient {
     if (!this.exchange?.has?.['watchTicker']) return;
     if (this.tickerStreams.get(market)?.running) return;
 
-    const state = { price: undefined as number | undefined, at: 0, running: true };
+    const state = {
+      price: undefined as number | undefined,
+      bid: undefined as number | undefined,
+      ask: undefined as number | undefined,
+      at: 0,
+      running: true,
+    };
     this.tickerStreams.set(market, state);
 
     void (async () => {
@@ -1307,6 +1376,13 @@ export class ExchangeClient {
             state.price = last;
             state.at = Date.now();
           }
+
+          // Top of book arrives on the same message, and saves a request for it
+          // on every redraw.
+          const bid = Number(ticker.bid);
+          const ask = Number(ticker.ask);
+          if (Number.isFinite(bid) && bid > 0) state.bid = bid;
+          if (Number.isFinite(ask) && ask > 0) state.ask = ask;
         } catch (error) {
           // The feed is a shortcut, not a dependency. Stop the loop and let
           // callers fall back to fetching, rather than surfacing an error for
