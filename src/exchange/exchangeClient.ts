@@ -126,6 +126,9 @@ export class ExchangeClient {
    */
   private trailHighWater = new Map<string, number>();
   private trailTimer: NodeJS.Timeout | null = null;
+  private trailReviewRunning = false;
+  /** Trails already announced as resumed, so a restart says so once. */
+  private trailResumeAnnounced = new Set<string>();
   /** Looked up once per session; it does not change while connected. */
   private accountLabel: string | undefined;
   private equityCache:
@@ -3807,7 +3810,15 @@ export class ExchangeClient {
   startTrailMonitor(): void {
     if (this.trailTimer) return;
     this.trailTimer = setInterval(() => {
-      void this.reviewAdaptiveTrails();
+      // A pass can outlast the interval -- reconstructing a high-water mark
+      // walks fills and candles -- and two passes reading the same pre-change
+      // state both decide to move the same stop, then both announce it. One at
+      // a time, whatever the interval and however many timers exist.
+      if (this.trailReviewRunning) return;
+      this.trailReviewRunning = true;
+      void this.reviewAdaptiveTrails().finally(() => {
+        this.trailReviewRunning = false;
+      });
     }, ExchangeClient.TRAIL_CHECK_MS);
     // Long-lived timer; it must not be the reason the process stays alive.
     this.trailTimer.unref?.();
@@ -3842,6 +3853,7 @@ export class ExchangeClient {
             this.trailHighWater.delete(id);
             this.trailFailures.delete(id);
             this.abandonedTrails.delete(id);
+            this.trailResumeAnnounced.delete(id);
           }
         }
 
@@ -4025,7 +4037,8 @@ export class ExchangeClient {
     let high = this.trailHighWater.get(id);
     if (high === undefined) {
       high = await this.reconstructHighWaterMark(market, side, order.timestamp ?? undefined);
-      if (high !== undefined) {
+      if (high !== undefined && !this.trailResumeAnnounced.has(id)) {
+        this.trailResumeAnnounced.add(id);
         NotificationManager.notify(
           `Resumed managing trail ${id.slice(0, 8)} from a high of ${this.formatPriceForDisplay(market, high)}`,
           NType.INFO,
@@ -4074,7 +4087,7 @@ export class ExchangeClient {
       // Accepted is not applied. Read the order back and check the exchange
       // actually holds the new trigger -- an amendment that is accepted and
       // ignored would otherwise be retried forever, moving nothing.
-      const after = (await this.findAdaptiveTrails(market)).find((o) => o.id === id);
+      const after = (await this.findAdaptiveTrails(market, true)).find((o) => o.id === id);
       const stored = Number((after as any)?.info?.stopPxRp);
 
       if (!(Math.abs(stored - plan.stop) < Math.max(tick, 1e-8))) {
@@ -4124,9 +4137,17 @@ export class ExchangeClient {
     return this.getReferencePrice(market);
   }
 
-  /** Working orders on a market that this application placed as adaptive trails. */
-  private async findAdaptiveTrails(market: string): Promise<Order[]> {
-    const orders = await this.getLiveOpenOrders(market).catch(() => [] as Order[]);
+  /**
+   * Working orders on a market that this application placed as adaptive trails.
+   *
+   * `fresh` forces a read from the exchange rather than the cached order list.
+   * Checking an amendment against a cache written before it was sent reported
+   * the old value and called a successful change a failure.
+   */
+  private async findAdaptiveTrails(market: string, fresh = false): Promise<Order[]> {
+    const orders = await this.getLiveOpenOrders(market, undefined, fresh).catch(
+      () => [] as Order[]
+    );
     return orders.filter((order) =>
       readTrailTag((order as any).clientOrderId ?? (order as any).info?.clOrdID)
     );
