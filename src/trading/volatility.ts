@@ -169,16 +169,34 @@ export function nextTrailOffset(input: RatchetInput): number | undefined {
 export interface RangeWindow {
   label: string;
   minutes: number;
+  /**
+   * The candle size this window is measured on.
+   *
+   * Always the finest that still reaches back far enough, given a hundred
+   * candles. Fine candles resolve the trailing edge of the window precisely but
+   * run out of history quickly; coarse ones reach back a long way but would make
+   * a five-minute window mean "the last five-minute candle", which is not the
+   * same thing at all.
+   */
+  source: string;
 }
 
-/** Shortest first, as they are read left to right. */
+/**
+ * Shortest first, as they are read left to right.
+ *
+ * The longer two are rolling spans, not calendar ones: 1w is the last seven
+ * days and 1mo the last thirty, both measured from now rather than from a
+ * Monday or the first of the month.
+ */
 export const RANGE_WINDOWS: RangeWindow[] = [
-  { label: '5m', minutes: 5 },
-  { label: '15m', minutes: 15 },
-  { label: '30m', minutes: 30 },
-  { label: '1h', minutes: 60 },
-  { label: '4h', minutes: 240 },
-  { label: '1d', minutes: 1440 },
+  { label: '5m', minutes: 5, source: '1m' },
+  { label: '15m', minutes: 15, source: '1m' },
+  { label: '30m', minutes: 30, source: '1m' },
+  { label: '1h', minutes: 60, source: '1m' },
+  { label: '4h', minutes: 240, source: '15m' },
+  { label: '1d', minutes: 1440, source: '15m' },
+  { label: '1w', minutes: 7 * 1440, source: '4h' },
+  { label: '1mo', minutes: 30 * 1440, source: '1d' },
 ];
 
 export interface PriceRange {
