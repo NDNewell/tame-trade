@@ -360,11 +360,12 @@ export class Workspace {
             peg !== 0 &&
             String(info.pegPriceType ?? '').toLowerCase().includes('trailing');
 
-          // A trail Tame is sizing from volatility, as opposed to one the
-          // exchange is simply running at a fixed distance. The distinction
-          // matters: only one of them will move on its own.
+          // A trail this application moves, as opposed to one the exchange
+          // runs at a fixed distance. It carries no peg -- to the exchange it
+          // is an ordinary stop -- so the tag is the only thing that
+          // distinguishes it, and the distinction matters: only one of the two
+          // adjusts itself.
           const adaptive =
-            isTrailing &&
             readTrailTag((order as any).clientOrderId ?? info.clOrdID) !== undefined;
 
           const filled = Number(order.filled ?? 0);

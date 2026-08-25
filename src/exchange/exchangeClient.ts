@@ -25,7 +25,11 @@ import {
   RANGE_WINDOWS,
 } from '../trading/volatility.js';
 import { TrailSpec, describeTrailSpec } from '../trading/trailSpec.js';
-import { planTrailAdjustment, TrailSide } from '../trading/adaptiveTrail.js';
+import {
+  planTrailStop,
+  advanceHighWaterMark,
+  TrailSide,
+} from '../trading/adaptiveTrail.js';
 import { buildTrailTag, readTrailTag } from '../trading/trailTag.js';
 import { describeExchangeError, isMissingOrderError } from '../utils/exchangeErrors.js';
 import { classifyOrderStatus, staleOrderIds } from './orderCacheRules.js';
@@ -112,6 +116,15 @@ export class ExchangeClient {
   private trailFailures = new Map<string, number>();
   /** Orders the monitor has given up on, so it does not keep retrying silently. */
   private abandonedTrails = new Set<string>();
+  /**
+   * Best price reached since each managed trail was placed.
+   *
+   * Held here rather than on the exchange because nothing else needs it: the
+   * exchange is running a plain stop and has no idea it is a trail. Losing this
+   * to a restart is recoverable -- see reconstructHighWaterMark -- and cannot
+   * lower a stop, only delay raising one.
+   */
+  private trailHighWater = new Map<string, number>();
   private trailTimer: NodeJS.Timeout | null = null;
   /** Looked up once per session; it does not change while connected. */
   private accountLabel: string | undefined;
@@ -721,13 +734,17 @@ export class ExchangeClient {
   /**
    * How often adaptive trails are reconsidered.
    *
-   * Deliberately unrelated to any candle boundary. ATR is cached until its own
-   * candle closes, so nearly every pass costs nothing and reaches no network --
-   * work happens only once a close has actually produced a new measurement.
-   * Polling cheaply and acting rarely avoids doing arithmetic against the
-   * exchange's clock and copes with a candle published a little late.
+   * Two things move a managed trail, on very different clocks. The cushion
+   * changes only when a candle closes, and ATR is cached until then. The
+   * high-water mark changes whenever price makes a new extreme, which can be at
+   * any moment -- and since nothing else advances the stop now, noticing that
+   * promptly is this loop's job rather than the exchange's.
+   *
+   * So the pass is frequent and nearly free: cached ATR, a streamed mark, and a
+   * cached order list. A request is only sent when the stop should actually
+   * move.
    */
-  private static readonly TRAIL_CHECK_MS = 20000;
+  private static readonly TRAIL_CHECK_MS = 10000;
   /** The stop must improve by this fraction of the current trail to be worth amending. */
   private static readonly TRAIL_MIN_IMPROVEMENT = 0.05;
   /** How far a moved stop must stay clear of the mark. */
@@ -3467,7 +3484,8 @@ export class ExchangeClient {
     enforceFatFinger: boolean = true,
     /** Absolute price distance the exchange should trail the stop by. */
     trailOffset?: number,
-    clientOrderId?: string
+    clientOrderId?: string,
+    triggerOnMark = false
   ): Promise<Order | undefined> {
     // A size we work out from the position isn't something the user typed, so it
     // isn't subject to the fatfinger limit — a stop must always be placeable.
@@ -3608,6 +3626,15 @@ export class ExchangeClient {
           // The UI triggers on last price; ccxt defaults to mark price, and the
           // two diverge. 'trigger' was the wrong key and never took effect.
           params.triggerType = 'ByLastPrice';
+
+          // A trail managed from here is an ordinary stop as far as the
+          // exchange is concerned -- no peg, we move it ourselves -- but it
+          // still follows the mark, because a wick on this venue should not
+          // ratchet it up behind a price nobody else saw.
+          if (triggerOnMark) {
+            params.triggerType = 'ByMarkPrice';
+            if (clientOrderId) params.clOrdID = clientOrderId;
+          }
 
           if (trailOffset !== undefined && trailOffset > 0) {
             // A trail follows the price, so the price it follows matters more
@@ -3803,6 +3830,18 @@ export class ExchangeClient {
     for (const market of markets) {
       try {
         const trails = await this.findAdaptiveTrails(market);
+
+        // Anything no longer open has been filled or cancelled; its high-water
+        // mark is meaningless and must not be reused if the id ever recurs.
+        const live = new Set(trails.map((trail) => String(trail.id)));
+        for (const id of Array.from(this.trailHighWater.keys())) {
+          if (!live.has(id) && this.adaptiveMarkets.has(market)) {
+            this.trailHighWater.delete(id);
+            this.trailFailures.delete(id);
+            this.abandonedTrails.delete(id);
+          }
+        }
+
         if (trails.length === 0) {
           this.adaptiveMarkets.delete(market);
           continue;
@@ -3819,6 +3858,51 @@ export class ExchangeClient {
     }
   }
 
+  /**
+   * Rebuilds a trail's high-water mark after a restart.
+   *
+   * The mark is tracked in memory, so a restart forgets it while the stop
+   * itself carries on resting at the exchange. Rather than starting the trail
+   * over from the current price, the highest price since the order was placed
+   * is read back out of candles.
+   *
+   * Getting this slightly low is safe by construction: a low high-water mark
+   * can only make the trail slower to raise the stop, never willing to lower
+   * one.
+   */
+  private async reconstructHighWaterMark(
+    market: string,
+    side: TrailSide,
+    placedAt: number | undefined
+  ): Promise<number | undefined> {
+    const mark = await this.getMarkPriceForTrail(market);
+    if (placedAt === undefined || !Number.isFinite(placedAt)) return mark;
+
+    const elapsed = Date.now() - placedAt;
+
+    // The finest candles that still reach back to when the order was placed.
+    const source = ['1m', '15m', '4h', '1d'].find((timeframe) => {
+      const span = this.exchange!.parseTimeframe(timeframe) * 1000 * ExchangeClient.CANDLE_LIMIT;
+      return span >= elapsed;
+    });
+    if (!source) return mark;
+
+    try {
+      const candles = await this.getCandles(market, source);
+      const since = candles.filter((candle) => candle.timestamp >= placedAt);
+      if (since.length === 0) return mark;
+
+      const extreme =
+        side === 'long'
+          ? Math.max(...since.map((candle) => candle.high))
+          : Math.min(...since.map((candle) => candle.low));
+
+      return advanceHighWaterMark(side, extreme, mark ?? extreme);
+    } catch {
+      return mark;
+    }
+  }
+
   private async reviewTrail(market: string, order: Order): Promise<void> {
     const id = String(order.id ?? '');
     if (!id || this.abandonedTrails.has(id)) return;
@@ -3827,22 +3911,38 @@ export class ExchangeClient {
     const tag = readTrailTag((order as any).clientOrderId ?? info.clOrdID);
     if (!tag) return;
 
-    const peg = Math.abs(Number(info.pegOffsetValueRp));
     const stop = Number(info.stopPxRp);
     const side: TrailSide = String(order.side ?? '').toLowerCase() === 'sell' ? 'long' : 'short';
 
-    const [mark, atr, tick] = await Promise.all([
-      this.getMarkPriceForTrail(market),
+    const mark = await this.getMarkPriceForTrail(market);
+    if (mark === undefined) return;
+
+    let high = this.trailHighWater.get(id);
+    if (high === undefined) {
+      high = await this.reconstructHighWaterMark(market, side, order.timestamp ?? undefined);
+      if (high !== undefined) {
+        NotificationManager.notify(
+          `Resumed managing trail ${id.slice(0, 8)} from a high of ${this.formatPriceForDisplay(market, high)}`,
+          NType.INFO,
+          'SYSTEM'
+        );
+      }
+    }
+
+    high = advanceHighWaterMark(side, high, mark);
+    if (high === undefined) return;
+    this.trailHighWater.set(id, high);
+
+    const [atr, tick] = await Promise.all([
       this.getAtr(market, ExchangeClient.RANGE_ATR_PERIOD, tag.timeframe).catch(() => undefined),
       this.getMarketPrecision(market).catch(() => 0),
     ]);
+    if (atr === undefined) return;
 
-    if (mark === undefined || atr === undefined) return;
-
-    const plan = planTrailAdjustment(
-      { side, peg, stop, mark },
+    const plan = planTrailStop(
+      { side, highWaterMark: high, stop, mark },
       {
-        desiredDistance: atr * tag.multiple,
+        cushion: atr * tag.multiple,
         tick: tick > 0 ? tick : 0.01,
         minimumImprovementFraction: ExchangeClient.TRAIL_MIN_IMPROVEMENT,
         safetyTicks: ExchangeClient.TRAIL_SAFETY_TICKS,
@@ -3858,27 +3958,27 @@ export class ExchangeClient {
       const quantity = Number(info.orderQtyRq ?? 0);
 
       await this.exchange!.editOrder(id, market, 'Stop', String(order.side), quantity, undefined, {
-        pegOffsetValueRp: side === 'long' ? -plan.peg : plan.peg,
-        pegPriceType: 'TrailingStopPeg',
+        triggerPrice: plan.stop,
         posSide: 'Merged',
       } as any);
 
       // Accepted is not applied. Read the order back and check the exchange
-      // actually holds the new distance -- an amendment that is accepted and
+      // actually holds the new trigger -- an amendment that is accepted and
       // ignored would otherwise be retried forever, moving nothing.
       const after = (await this.findAdaptiveTrails(market)).find((o) => o.id === id);
-      const stored = Math.abs(Number((after as any)?.info?.pegOffsetValueRp));
+      const stored = Number((after as any)?.info?.stopPxRp);
 
-      if (!(Math.abs(stored - plan.peg) < Math.max(tick, 1e-8))) {
-        throw new Error(`the exchange still holds a trail of ${stored}`);
+      if (!(Math.abs(stored - plan.stop) < Math.max(tick, 1e-8))) {
+        throw new Error(`the exchange still holds a stop at ${stored}`);
       }
 
       this.trailFailures.delete(id);
       NotificationManager.notify(
-        `Trail tightened to ${this.formatPriceForDisplay(market, plan.peg)}, ` +
-          `stop ${this.formatPriceForDisplay(market, stop)} -> ` +
+        `Trail raised ${this.formatPriceForDisplay(market, stop)} -> ` +
           `${this.formatPriceForDisplay(market, plan.stop)} ` +
-          `(${tag.multiple}x ATR(${ExchangeClient.RANGE_ATR_PERIOD}) ${tag.timeframe})`,
+          `(${tag.multiple}x ATR(${ExchangeClient.RANGE_ATR_PERIOD}) ${tag.timeframe} ` +
+          `= ${this.formatPriceForDisplay(market, atr * tag.multiple)} behind ` +
+          `${this.formatPriceForDisplay(market, high)})`,
         NType.SUCCESS,
         'ORDER'
       );
@@ -3888,12 +3988,12 @@ export class ExchangeClient {
 
       if (failures >= ExchangeClient.TRAIL_MAX_FAILURES) {
         this.abandonedTrails.add(id);
-        // Loudly, and once. A trail that has silently stopped adapting is the
+        // Loudly, and once. A trail that has silently stopped moving is the
         // failure this whole design exists to avoid, so it is never left to be
         // inferred from the absence of messages.
         NotificationManager.notify(
-          `Adaptive trail ${id.slice(0, 8)} could not be adjusted after ${failures} attempts and is no longer being managed. ` +
-            `It is still protecting the position at its current distance. Last error: ${(error as Error).message}`,
+          `Trail ${id.slice(0, 8)} could not be moved after ${failures} attempts and is no longer being managed. ` +
+            `The stop is still resting at ${this.formatPriceForDisplay(market, stop)}. Last error: ${(error as Error).message}`,
           NType.ERROR,
           'ERROR'
         );
@@ -3993,10 +4093,27 @@ export class ExchangeClient {
       'ORDER'
     );
 
-    const clientOrderId =
-      spec.kind === 'atr'
-        ? buildTrailTag({ multiple: spec.multiple, timeframe: spec.timeframe })
-        : undefined;
+    // Two different orders, deliberately.
+    //
+    // A fixed trail is handed to the exchange as a peg and forgotten: nothing
+    // needs to recalculate it, so it is better run somewhere that keeps working
+    // when this process does not.
+    //
+    // An adaptive one is a plain stop that this process moves. It has to be:
+    // its distance changes, so it already depends on Tame running, and owning
+    // the level outright is what makes the rule a single line -- the stop sits
+    // one cushion behind the high-water mark and never moves backwards. Driving
+    // the exchange's own trail instead meant the exchange kept advancing the
+    // stop underneath us, so widening the cushion could only be bought by
+    // giving back locked profit.
+    if (spec.kind !== 'atr') {
+      return this.createStopOrder(market, start, undefined, false, true, distance);
+    }
+
+    const clientOrderId = buildTrailTag({
+      multiple: spec.multiple,
+      timeframe: spec.timeframe,
+    });
 
     const order = await this.createStopOrder(
       market,
@@ -4004,11 +4121,18 @@ export class ExchangeClient {
       undefined,
       false,
       true,
-      distance,
-      clientOrderId
+      undefined,
+      clientOrderId,
+      true
     );
 
-    if (order && spec.kind === 'atr') this.adaptiveMarkets.add(market);
+    if (order?.id) {
+      this.adaptiveMarkets.add(market);
+      // Seeded from the price it was placed against, so the first review has a
+      // high-water mark without having to reconstruct one.
+      this.trailHighWater.set(String(order.id), reference);
+    }
+
     return order;
   }
 
