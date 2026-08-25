@@ -8,6 +8,7 @@ import { ActivityLog } from './activityLog.js';
 import { Screen } from './screen.js';
 import { NO_VALUE, TerminalView } from './frame.js';
 import { PositionRiskResult } from '../trading/positionRisk.js';
+import { readTrailTag } from '../trading/trailTag.js';
 
 const FOOTER = [
   'buy',
@@ -77,7 +78,6 @@ export function emptyView(): TerminalView {
       environment: 'LIVE',
       connection: 'CONNECTING',
       exchange: NO_VALUE,
-      symbol: NO_VALUE,
       instrumentType: '',
       account: NO_VALUE,
       balance: NO_VALUE,
@@ -95,6 +95,7 @@ export function emptyView(): TerminalView {
       funding: NO_VALUE,
       spread: NO_VALUE,
     },
+    ranges: [],
     position: null,
     orders: [],
     chase: null,
@@ -170,7 +171,6 @@ export class Workspace {
 
     const view = emptyView();
     view.header.exchange = this.client.getSelectedExchangeName() ?? NO_VALUE;
-    view.header.symbol = market;
     view.header.connection = 'CONNECTED';
 
     this.screen = new Screen(view, this.onCommand, this.onQuit);
@@ -183,6 +183,10 @@ export class Workspace {
 
     // The feeds push prices and order events; this refresh covers what only REST
     // can tell us, chiefly the position.
+    // Adaptive trails are the exchange's to run and ours to adjust; the monitor
+    // reconsiders them as candles close.
+    this.client.startTrailMonitor();
+
     this.refreshTimer = setInterval(() => void this.refresh(), 2000);
     this.tickTimer = setInterval(() => this.tickCountdown(), 1000);
     void this.refresh();
@@ -193,7 +197,6 @@ export class Workspace {
     return {
       ...emptyView().header,
       exchange: this.client.getSelectedExchangeName() ?? NO_VALUE,
-      symbol: this.market,
       connection: 'CONNECTED',
       account: this.accountLabel ?? NO_VALUE,
       balance: formatMoney(this.funds.balance),
@@ -225,6 +228,7 @@ export class Workspace {
     if (this.tickTimer) clearInterval(this.tickTimer);
     this.refreshTimer = null;
     this.tickTimer = null;
+    this.client.stopTrailMonitor();
     this.screen?.stop();
     this.screen = null;
   }
@@ -253,16 +257,17 @@ export class Workspace {
   private async refresh(): Promise<void> {
     if (!this.screen || !this.market) return;
 
-    // 'SOL/USDT' rather than 'SOL/USDT:USDT': the settlement suffix is exchange
-    // notation and adds nothing once the market is named in the header.
-    const symbol = this.market.split(':')[0];
+    // The full form, settlement suffix included. It is the only place the
+    // market is named now, so it names it completely.
+    const symbol = this.market;
 
     try {
-      const [position, orders, risk, funds] = await Promise.all([
+      const [position, orders, risk, funds, ranges] = await Promise.all([
         this.client.getPositionView(this.market).catch(() => null),
         this.client.getOpenOrdersForDisplay(this.market).catch(() => []),
         this.client.getPositionRisk(this.market).catch(() => undefined),
         this.client.getAccountFunds(this.market).catch(() => undefined),
+        this.client.getPriceRanges(this.market).catch(() => []),
       ]);
 
       // A failed read leaves the last known figures in place rather than
@@ -285,6 +290,12 @@ export class Workspace {
 
       this.screen.update({
         header: this.header(),
+        ranges: ranges.map(({ label, high, low, atr }) => ({
+          label,
+          high: tick(high),
+          low: tick(low),
+          atr: tick(atr),
+        })),
         market: {
           symbol,
           last: tick(price.last),
@@ -349,6 +360,14 @@ export class Workspace {
             peg !== 0 &&
             String(info.pegPriceType ?? '').toLowerCase().includes('trailing');
 
+          // A trail this application moves, as opposed to one the exchange
+          // runs at a fixed distance. It carries no peg -- to the exchange it
+          // is an ordinary stop -- so the tag is the only thing that
+          // distinguishes it, and the distinction matters: only one of the two
+          // adjusts itself.
+          const adaptive =
+            readTrailTag((order as any).clientOrderId ?? info.clOrdID) !== undefined;
+
           const filled = Number(order.filled ?? 0);
           const status = isTrigger
             ? 'WORKING'
@@ -377,6 +396,8 @@ export class Workspace {
             managed:
               chaseOrderId && order.id === chaseOrderId
                 ? 'CHASE'
+                : adaptive
+                ? 'ATR'
                 : isTrailing
                 ? 'TRAIL'
                 : undefined,
