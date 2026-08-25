@@ -106,6 +106,8 @@ export class ExchangeClient {
     string,
     { at: number; mark?: number; index?: number; funding?: number }
   >();
+  /** Markets with a background order refresh already running. */
+  private orderResyncInFlight = new Set<string>();
   /** Keyed by market, timeframe and period; valid until the next candle closes. */
   private atrCache = new Map<string, { until: number; value?: number }>();
   private rangeCache = new Map<string, { at: number; ranges: PriceRangeView[] }>();
@@ -718,7 +720,38 @@ export class ExchangeClient {
   }
 
   /** Open orders for display. Uses the live view; completeness isn't critical. */
+  /**
+   * The order list for the screen, which never waits on the exchange.
+   *
+   * Redrawing is on a two-second timer, and a reconciliation lands in the
+   * middle of that every twenty seconds. Awaiting it there stalled the whole
+   * frame -- position, market and orders all repaint together -- for as long as
+   * the request took.
+   *
+   * So the cache answers immediately and the refresh happens behind it. What is
+   * shown is at worst one cycle old, and everything this process does to orders
+   * updates the cache directly, so the operator's own actions still appear at
+   * once.
+   */
   async getOpenOrdersForDisplay(market: string): Promise<Order[]> {
+    const state = this.orderStreams.get(market);
+
+    if (state?.healthy === true) {
+      // snapshotAt only moves when a refresh finishes, so without this the
+      // two-second redraw would start a new one on every tick while the first
+      // was still running.
+      if (
+        Date.now() - state.snapshotAt > ExchangeClient.ORDER_RESYNC_MS &&
+        !this.orderResyncInFlight.has(market)
+      ) {
+        this.orderResyncInFlight.add(market);
+        void this.getLiveOpenOrders(market)
+          .catch(() => undefined)
+          .finally(() => this.orderResyncInFlight.delete(market));
+      }
+      return Array.from(state.orders.values());
+    }
+
     try {
       return await this.getLiveOpenOrders(market);
     } catch {
@@ -1622,6 +1655,29 @@ export class ExchangeClient {
   }
 
   /**
+   * Puts an order this process has just placed into the cached list.
+   *
+   * Only orders that are actually working: a market order that filled on the
+   * way in is not an open order, and adding it would put a phantom in the panel
+   * -- the mirror image of the bug this exists to prevent.
+   */
+  private rememberPlacedOrder(market: string, order: any): void {
+    const state = this.orderStreams.get(market);
+    if (!state || !order?.id) return;
+
+    const disposition = classifyOrderStatus(order.status);
+    if (disposition === 'finished') return;
+
+    // An unknown status from a placement response is treated as working: the
+    // exchange has just accepted the order, so the one thing we do know is that
+    // it existed a moment ago. The next reconciliation corrects it if not.
+    state.orders.set(String(order.id), order as Order);
+    if (!state.filledSoFar.has(String(order.id))) {
+      state.filledSoFar.set(String(order.id), Number(order.filled ?? 0));
+    }
+  }
+
+  /**
    * Drops orders this process has just cancelled from the cached list.
    *
    * The cache is refreshed against the exchange periodically, which is right
@@ -1881,6 +1937,12 @@ export class ExchangeClient {
 
       // Call the underlying exchange method with market, remaining original args, and the final combined params
       const order = await (this.exchange as any)[method](market, ...originalArgs, finalParams);
+
+      // Into the cached list immediately. The exchange has accepted it, so it
+      // exists; waiting for the next reconciliation to discover that left a new
+      // order missing from the panel for up to twenty seconds. The same
+      // reasoning as forgetting a cancelled one, in the other direction.
+      this.rememberPlacedOrder(market, order);
 
       // What comes back here is the exchange accepting the request, not the
       // outcome. Whether it fills, and for how much, arrives on the order feed —
