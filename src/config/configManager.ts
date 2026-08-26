@@ -5,6 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { AppError } from '../errors/appError.js';
 import { ErrorType } from '../errors/errorType.js';
+import { GuardPolicy } from '../guard/guardPolicy.js';
 
 export type ExchangeAuthType = 'apiKey' | 'privateKey';
 
@@ -28,6 +29,10 @@ export interface Profile {
   // Orders worth at least this much ask for confirmation before being sent.
   // Undefined means no order is ever held for confirmation.
   confirmAbove?: number;
+  // Guardrail thresholds. Stored as a partial: only what the operator changed
+  // is written, so a later version's new defaults reach an existing profile
+  // rather than being frozen at whatever this version happened to ship.
+  guard?: Partial<GuardPolicy>;
 }
 
 export class ConfigManager {
@@ -147,6 +152,33 @@ export class ConfigManager {
       delete profile.confirmAbove;
     } else {
       profile.confirmAbove = threshold;
+    }
+
+    await this.updateProfile(profile);
+  }
+
+  /**
+   * The stored guardrail settings, or nothing if none were ever changed.
+   *
+   * Deliberately not resolved against the defaults here -- `resolvePolicy` does
+   * that, and doing it in two places is how the two copies come to disagree.
+   */
+  async getGuardPolicy(): Promise<Partial<GuardPolicy> | undefined> {
+    if (!(await this.hasProfile())) return undefined;
+
+    const profile = await this.getProfile();
+    const stored = profile.guard;
+
+    return stored && typeof stored === 'object' ? stored : undefined;
+  }
+
+  async setGuardPolicy(policy: Partial<GuardPolicy> | undefined): Promise<void> {
+    const profile = await this.getProfile();
+
+    if (policy === undefined) {
+      delete profile.guard;
+    } else {
+      profile.guard = policy;
     }
 
     await this.updateProfile(profile);

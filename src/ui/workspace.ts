@@ -6,7 +6,7 @@
 import { ExchangeClient } from '../exchange/exchangeClient.js';
 import { ActivityLog } from './activityLog.js';
 import { Screen } from './screen.js';
-import { NO_VALUE, TerminalView } from './frame.js';
+import { ConfirmationView, NO_VALUE, TerminalView } from './frame.js';
 import { PositionRiskResult } from '../trading/positionRisk.js';
 import { readTrailTag } from '../trading/trailTag.js';
 
@@ -17,6 +17,8 @@ const FOOTER = [
   'limit',
   'trail',
   'cancel',
+  'guard',
+  'coach',
   'orders',
   'positions',
   'market',
@@ -186,10 +188,65 @@ export class Workspace {
     // Adaptive trails are the exchange's to run and ours to adjust; the monitor
     // reconsiders them as candles close.
     this.client.startTrailMonitor();
+    // The guardrails sweep for things no order is being placed about: a
+    // position left unprotected, a day quietly giving back its profit.
+    this.client.startGuardSweep();
 
     this.refreshTimer = setInterval(() => void this.refresh(), 2000);
     this.tickTimer = setInterval(() => this.tickCountdown(), 1000);
     void this.refresh();
+  }
+
+  /**
+   * Puts an order in front of the operator, or takes the panel away.
+   *
+   * The confirmation panel replaces the position/orders block rather than
+   * overlaying it, so there is no reading of a held order against a background
+   * of numbers that are about to change. Passing null restores the block.
+   */
+  showConfirmation(confirmation: ConfirmationView | null): void {
+    this.screen?.update({ confirmation });
+  }
+
+  /**
+   * The coach thread and the standing guardrail conditions, as the panel takes
+   * them.
+   *
+   * Pulled from the guard rather than pushed into the workspace, so the panel
+   * cannot drift out of step with what the guard actually holds. Both are in
+   * memory, so this costs nothing and is safe on the redraw path.
+   */
+  private coachState(): Pick<TerminalView, 'coach' | 'coachBusy' | 'guard'> {
+    const guard = this.client.getGuard();
+    const thread = guard.getThread();
+    const active = guard.activeFindings();
+
+    return {
+      coach: thread.all().map(({ kind, text }) => ({ kind, text })),
+      coachBusy: thread.busy(),
+      guard: {
+        count: active.length,
+        // Behaviour ids rather than titles: the status line is read at a glance
+        // and re-read all session, and the id is what `guard explain` takes.
+        // Severity is named only when it is worth acting on.
+        summary: active
+          .map(({ finding }) =>
+            finding.severity === 'notice'
+              ? finding.behaviour.id
+              : `${finding.behaviour.id} (${finding.severity})`
+          )
+          .join(', '),
+      },
+    };
+  }
+
+  /**
+   * Repaints the coach panel now, for a change that must not wait for the
+   * two-second refresh -- a question the operator just typed, or the answer
+   * landing. Everything else arrives on the next cycle.
+   */
+  showCoach(): void {
+    this.screen?.update(this.coachState());
   }
 
   /** The header as it currently stands, for partial updates. */
@@ -229,6 +286,7 @@ export class Workspace {
     this.refreshTimer = null;
     this.tickTimer = null;
     this.client.stopTrailMonitor();
+    this.client.stopGuardSweep();
     this.screen?.stop();
     this.screen = null;
   }
@@ -289,6 +347,7 @@ export class Workspace {
       const chaseDeadline = this.client.getChaseDeadline();
 
       this.screen.update({
+        ...this.coachState(),
         header: this.header(),
         ranges: ranges.map(({ label, high, low, atr }) => ({
           label,

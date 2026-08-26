@@ -33,6 +33,16 @@ import {
 import { buildTrailTag, readTrailTag, TrailTag } from '../trading/trailTag.js';
 import { describeExchangeError, isMissingOrderError } from '../utils/exchangeErrors.js';
 import { classifyOrderStatus, staleOrderIds } from './orderCacheRules.js';
+import { GuardService } from '../guard/guardService.js';
+import { OrderProposal, PositionContext } from '../guard/detectors.js';
+import { GuardVerdict } from '../guard/guardrails.js';
+import { resolvePolicy, GuardPolicy } from '../guard/guardPolicy.js';
+import {
+  describeExitPlan,
+  ExitUrgency,
+  planExit,
+} from '../trading/exitPlan.js';
+import { ExitExecutionPort, ExitExecutor } from '../trading/exitExecutor.js';
 import { NotificationManager } from '../utils/notificationManager.js';
 import { NType } from '../utils/notificationManager.js';
 
@@ -82,6 +92,15 @@ export class ExchangeClient {
   private supportedExchanges: string[] | null = null;
   exchange: Exchange | null = null;
   exchangeManager: ConfigManager;
+  /**
+   * Behavioural guardrails.
+   *
+   * Created eagerly and unconditionally: it must be able to record from the
+   * very first fill, and a journal with a hole in it at the start of the
+   * session is one that cannot say what the session's typical size was.
+   */
+  private guard = new GuardService();
+  private guardSweepTimer: NodeJS.Timeout | null = null;
   private ws: WebSocket | null = null;
   private eventEmitter: EventEmitter;
   private chaseLimitOrderActive: boolean = false;
@@ -322,6 +341,7 @@ export class ExchangeClient {
     await this.loadExchanges();
     await this.loadFatFingerLimit();
     await this.loadConfirmThreshold();
+    await this.loadGuardPolicy();
     this.setEventListeners();
 
     // Call the time synchronization method here
@@ -1212,6 +1232,12 @@ export class ExchangeClient {
       }
     }
 
+    // The peak this session is measured from these samples, so one is recorded
+    // whenever a real figure is available. An incomplete equity is deliberately
+    // not journalled: a peak set by a number that was quietly short would make
+    // every later give-back reading wrong.
+    if (equity !== undefined) this.guard.recordEquity(equity, currency);
+
     this.equityCache = { at: Date.now(), currency, balance, equity };
     return { balance, equity };
   }
@@ -1540,6 +1566,20 @@ export class ExchangeClient {
     // Structured rather than prose: the row is columns the eye can run down,
     // and the market isn't repeated because it is already in the header.
     if (filled > previouslyFilled) {
+      // The guardrails' whole memory is built from this: only the *new* part of
+      // a partial fill is journalled, or a working order that reports its
+      // running total on every update would be counted several times over and
+      // the session would look far larger than it was.
+      this.guard.recordFill({
+        market,
+        side: String(update.side ?? '').toLowerCase() === 'buy' ? 'buy' : 'sell',
+        size: filled - previouslyFilled,
+        price: Number(rawPrice ?? 0),
+        at: eventTime,
+        contractSize: (this.availableMarkets?.[market] as any)?.contractSize ?? 1,
+        inverse: (this.availableMarkets?.[market] as any)?.inverse === true,
+      });
+
       state.filledSoFar.set(id, filled);
 
       const complete =
@@ -1555,6 +1595,7 @@ export class ExchangeClient {
     }
 
     if (status === 'canceled' && filled === 0) {
+      this.guard.recordOrderCancelled(market, id);
       NotificationManager.notify('', NType.INFO, 'ORDER', eventTime, {
         side: side.toUpperCase(),
         quantity: this.formatQuantity(Number(update.amount ?? 0)),
@@ -1747,6 +1788,8 @@ export class ExchangeClient {
     // An unknown status from a placement response is treated as working: the
     // exchange has just accepted the order, so the one thing we do know is that
     // it existed a moment ago. The next reconciliation corrects it if not.
+    this.guard.recordOrderPlaced(market, String(order.id));
+
     state.orders.set(String(order.id), order as Order);
     if (!state.filledSoFar.has(String(order.id))) {
       state.filledSoFar.set(String(order.id), Number(order.filled ?? 0));
@@ -2474,11 +2517,23 @@ export class ExchangeClient {
         stopOrders.map((order) => this.exchange!.cancelOrder(order.id, symbol, params))
       );
 
+      const cancelled = stopOrders.filter(
+        (_, index) => results[index].status === 'fulfilled'
+      );
+
       this.forgetCancelledOrders(
         symbol,
-        stopOrders
-          .filter((_, index) => results[index].status === 'fulfilled')
-          .map((order) => order.id)
+        cancelled.map((order) => order.id)
+      );
+
+      // Only the ones that actually went. A refused cancel left the stop in
+      // place, and recording it as pulled would have the guard reporting
+      // protection that was never removed.
+      void this.noteStopsCancelled(
+        symbol,
+        cancelled.map((order) =>
+          Number((order as any).triggerPrice ?? (order as any).info?.stopPxRp ?? order.stopPrice ?? 0)
+        )
       );
 
       const failed = results.filter((r) => r.status === 'rejected').length;
@@ -3990,6 +4045,477 @@ export class ExchangeClient {
    * lookup in the common case, and a second timer per order would multiply the
    * ways this can be left running after the order it watched is gone.
    */
+
+  // ==========================================================================
+  // Behavioural guardrails
+  //
+  // The rules themselves are in src/guard and know nothing about exchanges.
+  // This section is only the plumbing: it hands the guard what it needs to
+  // measure, and carries out what it decides.
+  // ==========================================================================
+
+  /** How often open positions and the session are reconsidered. */
+  private static readonly GUARD_SWEEP_MS = 30_000;
+
+  getGuard(): GuardService {
+    return this.guard;
+  }
+
+  async loadGuardPolicy(): Promise<void> {
+    try {
+      const stored = await this.exchangeManager.getGuardPolicy();
+      this.guard.setPolicy(resolvePolicy(stored));
+      this.guard.load();
+    } catch {
+      // Defaults stand. A profile that cannot be read must not leave the
+      // application without guardrails *and* without saying so, so this is a
+      // warning rather than silence.
+      NotificationManager.diagnostic(
+        '[ExchangeClient] Could not read guardrail settings; defaults are in use.'
+      );
+      this.guard.load();
+    }
+  }
+
+  async saveGuardPolicy(policy: GuardPolicy): Promise<void> {
+    this.guard.setPolicy(policy);
+    await this.exchangeManager.setGuardPolicy(policy);
+  }
+
+  /**
+   * The position as the guard needs to see it.
+   *
+   * `openedAt` comes from this session's own journal rather than from the
+   * exchange. That is deliberate: a position opened before Tame started has no
+   * known age here, and `noStop` treats an unknown age as 'say nothing' -- which
+   * is far better than flagging every pre-existing position the moment the
+   * application connects.
+   */
+  private async positionContextFor(market: string): Promise<PositionContext | undefined> {
+    const position = await this.getPositionView(market).catch(() => null);
+    if (!position || !(position.size > 0) || position.entry === undefined) return undefined;
+
+    const side = position.side.toLowerCase() === 'long' ? 'long' : 'short';
+    const risk = await this.getPositionRisk(market).catch(() => undefined);
+    const mark = await this.getMarkPriceForTrail(market).catch(() => undefined);
+
+    const info: any = this.availableMarkets?.[market] ?? {};
+    const contractSize = Number(info.contractSize ?? 1);
+    const notional =
+      info.inverse === true
+        ? position.size * contractSize
+        : mark !== undefined
+          ? position.size * contractSize * mark
+          : undefined;
+
+    const journalled = this.guard
+      .snapshot()
+      .openPositions.find((open) => open.market === market);
+
+    return {
+      market,
+      side,
+      size: position.size,
+      entryPrice: position.entry,
+      markPrice: mark,
+      unrealizedPnl: position.unrealizedPnl,
+      notional,
+      hasProtectiveStop: (risk?.protectedQuantity ?? 0) > 0,
+      plannedRisk: risk?.totalRisk,
+      openedAt: journalled?.openedAt,
+    };
+  }
+
+  /**
+   * What the guard makes of an order that has not been sent.
+   *
+   * Called by the command layer, which owns the confirmation prompt. A verdict
+   * of 'allow' with findings attached is the ordinary case for a notice: the
+   * order goes, and the observation is logged alongside it.
+   */
+  async reviewProposal(proposal: OrderProposal): Promise<GuardVerdict> {
+    const position = await this.positionContextFor(proposal.market).catch(() => undefined);
+    const summary = await this.equityFor(proposal.market);
+
+    return this.guard.review({
+      proposal,
+      position,
+      priceMove: await this.recentMoveFor(proposal.market).catch(() => undefined),
+      equity: summary?.equity,
+      currency: this.availableMarkets?.[proposal.market]?.quote,
+    });
+  }
+
+  /**
+   * Equity in the currency this market settles in.
+   *
+   * The percentage checks -- risk per trade, leverage -- divide by this, so
+   * taking equity in the wrong currency would not fail, it would silently
+   * produce a number off by the exchange rate. Undefined when the settle
+   * currency is unknown, which the detectors treat as 'no claim'.
+   */
+  private async equityFor(market: string): Promise<{ equity?: number } | undefined> {
+    const settle = (this.availableMarkets?.[market] as any)?.settle;
+    if (!settle) return undefined;
+    return this.getAccountSummary(String(settle)).catch(() => undefined);
+  }
+
+  /**
+   * Percentage move over the chase window, from candles already being cached.
+   *
+   * Returns undefined rather than zero when it cannot be worked out. Zero is a
+   * claim that the market has not moved, which would be a lie that happens to
+   * silence the detector.
+   */
+  private async recentMoveFor(market: string): Promise<
+    { percent: number; overMs: number } | undefined
+  > {
+    const windowMs = this.guard.getPolicy().chaseWindowMs;
+
+    try {
+      const candles = await this.getCandles(market, '1m');
+      if (!candles || candles.length < 2) return undefined;
+
+      // One bar more than the window: the move is measured from the close
+      // *before* the window opened, not from the close of its first bar, which
+      // would silently discard that bar's own movement.
+      const bars = Math.max(2, Math.round(windowMs / 60_000));
+      const slice = candles.slice(-(bars + 1));
+      const base = Number(slice[0]?.close);
+      const latest = Number(slice[slice.length - 1]?.close);
+      if (!(base > 0) || !(latest > 0)) return undefined;
+
+      return {
+        percent: ((latest - base) / base) * 100,
+        overMs: (slice.length - 1) * 60_000,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  startGuardSweep(): void {
+    if (this.guardSweepTimer) return;
+
+    this.guardSweepTimer = setInterval(() => {
+      void this.runGuardSweep().catch(() => {
+        // The sweep is advisory. It must never be the reason a session ends.
+      });
+    }, ExchangeClient.GUARD_SWEEP_MS);
+
+    this.guardSweepTimer.unref?.();
+  }
+
+  stopGuardSweep(): void {
+    if (this.guardSweepTimer) clearInterval(this.guardSweepTimer);
+    this.guardSweepTimer = null;
+  }
+
+  /**
+   * One pass over the session and whatever position is on screen.
+   *
+   * Scoped to the followed market rather than every position on the account:
+   * sweeping everything would mean a position query per market per thirty
+   * seconds, and the behaviours this catches are about the thing being traded.
+   */
+  private async runGuardSweep(): Promise<void> {
+    const market = this.lastFollowedMarket;
+    if (!market) return;
+
+    const position = await this.positionContextFor(market).catch(() => undefined);
+    const summary = await this.equityFor(market);
+
+    const { transitions, interventions } = this.guard.sweep(
+      position ? [position] : [],
+      summary?.equity,
+      this.availableMarkets?.[market]?.quote
+    );
+
+    // Only the edges are logged. What is merely still true is on the guard
+    // status line, which is rewritten in place -- a standing breach re-derived
+    // every thirty seconds is one fact, and reporting it as a hundred and
+    // twenty events an hour buried every fill and cancel between them.
+    for (const transition of transitions) {
+      const finding = transition.finding;
+      if (!finding) continue;
+
+      // Notices are already visible in the panel's own numbers and on the
+      // status line. They are tracked so they can escalate, but they do not
+      // announce themselves in either direction.
+      if (finding.severity === 'notice') continue;
+
+      if (transition.kind === 'cleared') {
+        NotificationManager.notify(
+          `${finding.behaviour.title}: cleared.`,
+          NType.INFO,
+          'SYSTEM'
+        );
+        continue;
+      }
+
+      NotificationManager.notify(
+        transition.kind === 'escalated'
+          ? `${finding.behaviour.title} (now ${finding.severity}): ${finding.detail}`
+          : `${finding.behaviour.title}: ${finding.detail}`,
+        NType.ERROR,
+        'WARNING'
+      );
+
+      // The coach gets the same edge, and decides for itself whether it has
+      // anything to add -- it is rate-limited hard, so most of these are
+      // dropped. Never awaited: the sweep is on a timer and a slow model call
+      // must not delay the next one.
+      void this.guard
+        .getThread()
+        .nudge(finding)
+        .catch(() => undefined);
+    }
+
+    for (const intervention of interventions) {
+      if (intervention.type === 'lockout') {
+        this.guard.lockout(intervention.until, intervention.behaviour, intervention.reason);
+        NotificationManager.notify(
+          `New entries are stopped for ${Math.ceil(
+            (intervention.until - Date.now()) / 60_000
+          )} minutes. ${intervention.reason} ` +
+            `Closing and protective orders are unaffected. Lift it with 'guard unlock'.`,
+          NType.ERROR,
+          'WARNING'
+        );
+        continue;
+      }
+
+      await this.offerAssistedExit(intervention.market, intervention.urgency, intervention.reason, intervention.authorised);
+    }
+  }
+
+  /**
+   * Works out how the position would be left, and either says so or does it.
+   *
+   * The plan is always computed and always shown. An operator who has not
+   * authorised the guard to act still gets the useful half -- a worked-out exit
+   * they can run themselves with 'guard exit' -- rather than a warning and a
+   * shrug.
+   */
+  private async offerAssistedExit(
+    market: string,
+    urgency: ExitUrgency,
+    reason: string,
+    authorised: boolean
+  ): Promise<void> {
+    const plan = await this.buildExitPlan(market, urgency);
+    if (!plan) return;
+
+    const currency = this.availableMarkets?.[market]?.quote ?? '';
+
+    if (!authorised) {
+      NotificationManager.notify(
+        `${reason} A worked exit is ready: ${describeExitPlan(plan.plan, currency)} ` +
+          `Run it with 'guard exit', or authorise it in future with 'guard autoexit <behaviour>'.`,
+        NType.INFO,
+        'WARNING'
+      );
+      return;
+    }
+
+    NotificationManager.notify(
+      `${reason} Closing the position: ${describeExitPlan(plan.plan, currency)}`,
+      NType.ERROR,
+      'WARNING'
+    );
+
+    await this.runExitPlan(market, plan.side, plan.plan);
+  }
+
+  /**
+   * Tells the guard a protective stop moved, and which way.
+   *
+   * Which way is the whole point: the trail moves stops toward entry many times
+   * an hour and that must never be flagged, while a stop moved away from entry
+   * is the behaviour most worth catching. The side is read from the position
+   * rather than inferred from the prices, because 'lower' means safer for a
+   * short and worse for a long.
+   */
+  private async noteStopMoved(market: string, from: number, to: number): Promise<void> {
+    if (!(from > 0) || !(to > 0) || from === to) return;
+
+    const position = await this.getPositionView(market).catch(() => null);
+    if (!position || !(position.size > 0)) return;
+
+    this.guard.recordStopMoved(
+      market,
+      position.side.toLowerCase() === 'long' ? 'long' : 'short',
+      from,
+      to,
+      position.entry
+    );
+  }
+
+  /**
+   * Tells the guard a protective stop was cancelled while a position was open.
+   *
+   * Whether the position was losing is recorded at the moment of the cancel,
+   * not worked out later: by the time a sweep runs the position may be green
+   * again, and 'they pulled the stop while it was underwater' would quietly
+   * become false.
+   */
+  private async noteStopsCancelled(market: string, triggers: number[]): Promise<void> {
+    if (triggers.length === 0) return;
+
+    const position = await this.getPositionView(market).catch(() => null);
+    if (!position || !(position.size > 0)) return;
+
+    const underwater = (position.unrealizedPnl ?? 0) < 0;
+    for (const trigger of triggers) {
+      if (trigger > 0) this.guard.recordStopCancelled(market, trigger, underwater);
+    }
+  }
+
+  /** The plan for leaving a market, or nothing if there is no position. */
+  async buildExitPlan(
+    market: string,
+    urgency: ExitUrgency
+  ): Promise<{ plan: ReturnType<typeof planExit>; side: 'long' | 'short' } | undefined> {
+    const position = await this.positionContextFor(market).catch(() => undefined);
+    if (!position || !(position.size > 0)) return undefined;
+
+    const tick = await this.getMarketPrecision(market).catch(() => 0);
+
+    let bestBid = position.markPrice ?? 0;
+    let bestAsk = position.markPrice ?? 0;
+    try {
+      const ticker = await this.exchange!.fetchTicker(market);
+      if (Number(ticker.bid) > 0) bestBid = Number(ticker.bid);
+      if (Number(ticker.ask) > 0) bestAsk = Number(ticker.ask);
+    } catch {
+      // No book. The planner treats a zero spread as nothing to earn by
+      // resting, which collapses it toward crossing -- the right default when
+      // we cannot see what we would be resting inside of.
+    }
+
+    const atr = await this.getAtr(market, ExchangeClient.RANGE_ATR_PERIOD, '5m').catch(
+      () => undefined
+    );
+
+    return {
+      side: position.side,
+      plan: planExit(
+        {
+          side: position.side,
+          size: position.size,
+          markPrice: position.markPrice ?? bestBid,
+          bestBid,
+          bestAsk,
+          tick: tick > 0 ? tick : 0.01,
+          atr,
+        },
+        urgency
+      ),
+    };
+  }
+
+  /**
+   * The port the executor works through.
+   *
+   * Every child is reduce-only and every size is position-derived, so the
+   * fatfinger limit is deliberately not enforced on them -- the same exemption
+   * a stop gets, and for the same reason: an order that can only ever reduce
+   * exposure must always be placeable.
+   */
+  private exitPort(): ExitExecutionPort {
+    return {
+      book: async (market) => {
+        const ticker = await this.exchange!.fetchTicker(market);
+        const tick = await this.getMarketPrecision(market).catch(() => 0.01);
+        const bid = Number(ticker.bid);
+        const ask = Number(ticker.ask);
+        if (!(bid > 0) || !(ask > 0)) return undefined;
+        return { bestBid: bid, bestAsk: ask, tick: tick > 0 ? tick : 0.01 };
+      },
+      positionSize: (market) => this.getPositionSize(market),
+      placeReduceOnlyLimit: async (market, side, size, price) => {
+        const quantity = await this.getQuantityPrecision(market, size, {
+          enforceFatFinger: false,
+          price,
+        });
+        const order = await this.executeOrder('createOrder', market, 'limit', side, quantity, price, {
+          reduceOnly: true,
+        });
+        return order?.id ? String(order.id) : undefined;
+      },
+      placeReduceOnlyMarket: async (market, side, size) => {
+        const quantity = await this.getQuantityPrecision(market, size, {
+          enforceFatFinger: false,
+        });
+        const order = await this.executeOrder('createOrder', market, 'market', side, quantity, undefined, {
+          reduceOnly: true,
+        });
+        return order?.id ? String(order.id) : undefined;
+      },
+      cancelOrder: async (market, orderId) => {
+        await this.exchange!.cancelOrder(orderId, market);
+        this.forgetCancelledOrders(market, [orderId]);
+      },
+      filledOf: async (market, orderId) => {
+        const orders = await this.getLiveOpenOrders(market, undefined, true).catch(
+          () => [] as Order[]
+        );
+        const found = orders.find((order) => String(order.id) === orderId);
+        // Absent from the open list means it finished, and a finished child of
+        // a reduce-only exit has filled. Reporting zero would have the executor
+        // send the same quantity again.
+        if (!found) return Number.POSITIVE_INFINITY;
+        return Number(found.filled ?? 0);
+      },
+      say: (message, kind) =>
+        NotificationManager.notify(
+          message,
+          kind === 'good' ? NType.SUCCESS : kind === 'bad' ? NType.ERROR : NType.INFO,
+          kind === 'bad' ? 'WARNING' : 'ORDER'
+        ),
+      wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    };
+  }
+
+  private activeExit: ExitExecutor | null = null;
+
+  /** Whether an assisted exit is running, for 'guard exit stop'. */
+  isExiting(): boolean {
+    return this.activeExit?.isRunning() === true;
+  }
+
+  abortAssistedExit(): boolean {
+    if (!this.activeExit) return false;
+    this.activeExit.abort();
+    return true;
+  }
+
+  async runExitPlan(
+    market: string,
+    side: 'long' | 'short',
+    plan: ReturnType<typeof planExit>
+  ): Promise<void> {
+    if (this.isExiting()) {
+      NotificationManager.notify(
+        'An assisted exit is already running. Stop it with \'guard exit stop\' first.',
+        NType.ERROR,
+        'ERROR'
+      );
+      return;
+    }
+
+    // A fresh executor per run: abort is one-way by design, so a reused one
+    // would refuse to start after the first time it was stopped.
+    const executor = new ExitExecutor(this.exitPort());
+    this.activeExit = executor;
+
+    try {
+      await executor.run(market, side, plan, Date.now());
+    } finally {
+      this.activeExit = null;
+    }
+  }
+
   startTrailMonitor(): void {
     if (this.trailTimer) return;
     this.trailTimer = setInterval(() => {
@@ -4862,6 +5388,11 @@ export class ExchangeClient {
           // check here could only fail and leave the position with no stop.
           const newOrder = await this.createStopOrder(market, finalStopPrice, finalAmount, true, false);
           newOrderId = newOrder?.id; // Store the new order ID
+
+          // Only once the replacement exists: a cancel that was not followed by
+          // a new stop is a cancellation, not a move, and reporting it as a
+          // move would hide the more serious of the two.
+          void this.noteStopMoved(market, Number(stopOrder.stopPrice), finalStopPrice);
 
       } catch (replaceError) {
           console.error(`[ExchangeClient] Error during cancel/replace:`, replaceError);
