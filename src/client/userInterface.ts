@@ -17,6 +17,9 @@ import { NotificationManager, NType } from '../utils/notificationManager.js';
 import { describeExchangeError } from '../utils/exchangeErrors.js';
 import { Workspace } from '../ui/workspace.js';
 import { ActivityLog } from '../ui/activityLog.js';
+import { GuardVerdict } from '../guard/guardrails.js';
+import { OrderProposal } from '../guard/detectors.js';
+import { ALL_BEHAVIOUR_IDS, isBehaviourId } from '../guard/behaviours.js';
 import { releaseInstanceLock } from '../config/instanceLock.js';
 
 export class UserInterface {
@@ -29,6 +32,18 @@ export class UserInterface {
   private stateManager: StateManager;
   private isDevMode: boolean;
   private workspace: Workspace | null = null;
+  /**
+   * An order the guardrails held, waiting for a yes.
+   *
+   * Held here rather than resolved with a blocking prompt: the workspace owns
+   * the input line, and opening a second reader for it produces two things
+   * reading one keyboard. This way the confirmation is just the next command,
+   * which also means every other command still works while one is pending --
+   * including 'cancel all', which is the one an operator may want most.
+   */
+  private pendingOrder:
+    | { command: string; verdict: GuardVerdict; market: string; at: number }
+    | null = null;
 
   constructor() {
     this.exchangeCommand = new ExchangeCommand();
@@ -426,7 +441,414 @@ export class UserInterface {
     );
   }
 
+
+  // ==========================================================================
+  // Behavioural guardrails
+  // ==========================================================================
+
+  /**
+   * Whether an order the operator typed should be sent.
+   *
+   * Returns true to proceed. A held order is stored and the caller returns
+   * without sending; the operator's next command decides its fate.
+   *
+   * Anything that goes wrong here allows the order. A guard that fails closed
+   * would mean a slow position lookup could stop someone trading, which is a
+   * far worse failure than missing one observation.
+   */
+  private async guardReview(
+    command: string,
+    type: OrderType,
+    quantity: number | undefined,
+    price: number | undefined
+  ): Promise<boolean> {
+    if (this.bypassGuardOnce) {
+      this.bypassGuardOnce = false;
+      return true;
+    }
+
+    const client = this.exchangeCommand.getExchangeClient();
+
+    try {
+      const proposal = await this.proposalFor(type, quantity, price);
+      if (!proposal) return true;
+
+      const verdict = await client.reviewProposal(proposal);
+
+      if (verdict.action === 'allow') {
+        // A notice is worth one line next to the order it is about, and no
+        // more than that.
+        if (verdict.headline) {
+          ActivityLog.getInstance().add('WARNING', verdict.headline);
+        }
+        return true;
+      }
+
+      if (verdict.action === 'refuse') {
+        NotificationManager.notify(
+          `${verdict.headline} No order was placed.`,
+          NType.ERROR,
+          'ERROR'
+        );
+        return false;
+      }
+
+      this.holdOrder(command, verdict, proposal);
+      return false;
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * The order, described the way the guard needs to see it.
+   *
+   * The intent is worked out from the position rather than from the words: a
+   * 'sell' is an exit when there is a long open and an entry when there is not,
+   * and the guard must never obstruct the first case.
+   */
+  private async proposalFor(
+    type: OrderType,
+    quantity: number | undefined,
+    price: number | undefined
+  ): Promise<OrderProposal | undefined> {
+    if (quantity === undefined || !(quantity > 0)) return undefined;
+
+    let side: 'buy' | 'sell';
+    switch (type) {
+      case OrderType.MARKET_BUY:
+      case OrderType.LIMIT_BUY:
+        side = 'buy';
+        break;
+      case OrderType.MARKET_SELL:
+      case OrderType.LIMIT_SELL:
+        side = 'sell';
+        break;
+      case OrderType.STOP:
+        // A stop is protection, whichever way it points.
+        return {
+          market: this.currentMarket,
+          side: 'sell',
+          intent: 'protective',
+          size: quantity,
+          price,
+        };
+      default:
+        return undefined;
+    }
+
+    const position = await this.exchangeCommand
+      .getExchangeClient()
+      .getPositionView(this.currentMarket)
+      .catch(() => null);
+
+    const opposing =
+      position !== null &&
+      position.size > 0 &&
+      ((position.side.toLowerCase() === 'long' && side === 'sell') ||
+        (position.side.toLowerCase() === 'short' && side === 'buy'));
+
+    return {
+      market: this.currentMarket,
+      side,
+      intent: opposing ? 'exit' : 'entry',
+      size: quantity,
+      price,
+    };
+  }
+
+  /** Puts a held order on screen and waits for the next command. */
+  private holdOrder(command: string, verdict: GuardVerdict, proposal: OrderProposal): void {
+    this.pendingOrder = {
+      command,
+      verdict,
+      market: this.currentMarket,
+      at: Date.now(),
+    };
+
+    const value =
+      proposal.price !== undefined ? proposal.size * proposal.price : undefined;
+
+    this.workspace?.showConfirmation({
+      action: `${proposal.side.toUpperCase()} ${
+        proposal.price === undefined ? 'MARKET' : 'LIMIT'
+      }`,
+      size: String(proposal.size),
+      estimatedValue: value === undefined ? '--' : value.toFixed(2),
+      estimatedFee: '--',
+      warning: verdict.headline,
+      prompt: "'y' to send anyway, anything else cancels",
+    });
+
+    NotificationManager.notify(
+      `HELD — ${verdict.headline} Type 'y' to send it anyway, anything else cancels.`,
+      NType.ERROR,
+      'WARNING'
+    );
+
+    // The coach's wording arrives afterwards if it arrives at all. Waiting for
+    // it would put a network call between a keystroke and the panel.
+    const guard = this.exchangeCommand.getExchangeClient().getGuard();
+    const leading = verdict.findings[0];
+    if (leading && guard.coachAvailable()) {
+      void guard
+        .phraseFor(leading)
+        .then((phrase) => {
+          if (this.pendingOrder && phrase !== leading.detail) {
+            ActivityLog.getInstance().add('WARNING', phrase);
+          }
+        })
+        .catch(() => undefined);
+    }
+  }
+
+  /**
+   * The operator's answer to a held order.
+   *
+   * Returns true when the input was consumed as an answer, so the caller knows
+   * not to also run it as a command. Only 'y' sends; everything else cancels
+   * the held order and then runs normally, which means an operator who has
+   * changed their mind and typed 'cancel all' gets exactly that.
+   */
+  private async resolvePending(command: string): Promise<boolean> {
+    const pending = this.pendingOrder;
+    if (!pending) return false;
+
+    this.pendingOrder = null;
+    this.workspace?.showConfirmation(null);
+
+    const answer = command.trim().toLowerCase();
+
+    if (answer !== 'y' && answer !== 'yes') {
+      NotificationManager.notify(
+        `Held order cancelled: ${pending.command}`,
+        NType.INFO,
+        'ORDER'
+      );
+      return answer === 'n' || answer === 'no';
+    }
+
+    // On the record. A guard that is overridden every single time is either
+    // wrong or being treated as a formality, and the debrief can only say so
+    // if the overrides were counted.
+    const guard = this.exchangeCommand.getExchangeClient().getGuard();
+    for (const finding of pending.verdict.findings) {
+      guard.recordOverride(pending.market, finding.behaviour.id);
+    }
+
+    NotificationManager.notify(`Sending anyway: ${pending.command}`, NType.INFO, 'ORDER');
+
+    this.bypassGuardOnce = true;
+    await this.handleCommand(pending.command);
+    return true;
+  }
+
+  private bypassGuardOnce = false;
+
+  /**
+   * guard                     where the session stands
+   * guard on | off            the whole system
+   * guard explain <id>        what a behaviour means and why it is checked
+   * guard limit <amount>      daily loss limit — the one rule that refuses
+   * guard limit off
+   * guard mute <id>           stop checking one behaviour
+   * guard unmute <id>
+   * guard severity <id> <notice|hold|block>
+   * guard autoexit <id>       let the guard close a position on this behaviour
+   * guard autoexit off
+   * guard unlock              lift a lockout, deliberately and on the record
+   * guard exit [now]          run a worked exit on the current position
+   * guard exit stop
+   * guard debrief             what the session looked like
+   */
+  private async handleGuardCommand(command: string): Promise<void> {
+    const client = this.exchangeCommand.getExchangeClient();
+    const guard = client.getGuard();
+    const words = command.trim().split(/\s+/).slice(1);
+    const [verb, first, second] = words;
+    const policy = { ...guard.getPolicy() };
+
+    const save = async () => {
+      await client.saveGuardPolicy(policy);
+      NotificationManager.notify('Guardrails updated.', NType.SUCCESS, 'SYSTEM');
+    };
+
+    if (verb === undefined) {
+      for (const line of guard.status()) console.log(line);
+      return;
+    }
+
+    switch (verb.toLowerCase()) {
+      case 'on':
+      case 'off':
+        policy.enabled = verb.toLowerCase() === 'on';
+        await save();
+        return;
+
+      case 'explain': {
+        if (!first || !isBehaviourId(first)) {
+          console.log(`Name a behaviour: ${ALL_BEHAVIOUR_IDS.join(', ')}`);
+          return;
+        }
+        console.log(guard.explain(first));
+        return;
+      }
+
+      case 'limit': {
+        if (first === undefined) {
+          console.log(
+            policy.dailyLossLimit === undefined
+              ? 'No daily loss limit set.'
+              : `Daily loss limit: ${policy.dailyLossLimit}`
+          );
+          return;
+        }
+        if (first.toLowerCase() === 'off') {
+          policy.dailyLossLimit = undefined;
+          await save();
+          return;
+        }
+        const amount = Number(first);
+        if (!Number.isFinite(amount) || amount <= 0) {
+          console.log(`'${first}' is not a usable loss limit.`);
+          return;
+        }
+        policy.dailyLossLimit = amount;
+        await save();
+        return;
+      }
+
+      case 'mute':
+      case 'unmute': {
+        if (!first || !isBehaviourId(first)) {
+          console.log(`Name a behaviour: ${ALL_BEHAVIOUR_IDS.join(', ')}`);
+          return;
+        }
+        policy.muted =
+          verb.toLowerCase() === 'mute'
+            ? [...new Set([...policy.muted, first])]
+            : policy.muted.filter((id) => id !== first);
+        await save();
+        return;
+      }
+
+      case 'severity': {
+        if (!first || !isBehaviourId(first)) {
+          console.log(`Name a behaviour: ${ALL_BEHAVIOUR_IDS.join(', ')}`);
+          return;
+        }
+        if (second !== 'notice' && second !== 'hold' && second !== 'block') {
+          console.log("Give a severity: notice, hold, or block.");
+          return;
+        }
+        policy.severity = { ...policy.severity, [first]: second };
+        await save();
+        return;
+      }
+
+      case 'autoexit': {
+        if (first === undefined) {
+          console.log(
+            policy.autoExit.length === 0
+              ? 'Nothing may close a position automatically.'
+              : `Will close positions on: ${policy.autoExit.join(', ')}`
+          );
+          return;
+        }
+        if (first.toLowerCase() === 'off') {
+          policy.autoExit = [];
+          await save();
+          return;
+        }
+        if (!isBehaviourId(first)) {
+          console.log(`Name a behaviour: ${ALL_BEHAVIOUR_IDS.join(', ')}`);
+          return;
+        }
+        policy.autoExit = [...new Set([...policy.autoExit, first])];
+        // Worth spelling out. This is the only setting that lets the software
+        // send an order nobody typed.
+        NotificationManager.notify(
+          `Tame will now close the position by itself when '${first}' fires. ` +
+            `Turn it off with 'guard autoexit off'.`,
+          NType.ERROR,
+          'WARNING'
+        );
+        await save();
+        return;
+      }
+
+      case 'unlock': {
+        const lockout = guard.lockedOut();
+        if (!lockout) {
+          console.log('Nothing is locked out.');
+          return;
+        }
+        guard.liftLockout('lifted by the operator');
+        NotificationManager.notify(
+          'Lockout lifted. It is on the record.',
+          NType.INFO,
+          'SYSTEM'
+        );
+        return;
+      }
+
+      case 'exit': {
+        if (first?.toLowerCase() === 'stop') {
+          console.log(
+            client.abortAssistedExit()
+              ? 'Stopping the exit. Anything already resting stays where it is.'
+              : 'No exit is running.'
+          );
+          return;
+        }
+        if (!this.currentMarket) {
+          console.log('No market selected.');
+          return;
+        }
+        const urgency =
+          first?.toLowerCase() === 'now'
+            ? 'immediate'
+            : first?.toLowerCase() === 'firm'
+              ? 'firm'
+              : 'measured';
+        const built = await client.buildExitPlan(this.currentMarket, urgency);
+        if (!built) {
+          console.log('No position to exit.');
+          return;
+        }
+        await client.runExitPlan(this.currentMarket, built.side, built.plan);
+        return;
+      }
+
+      case 'debrief': {
+        if (!guard.coachAvailable()) {
+          console.log(
+            'No coach configured. Set ANTHROPIC_API_KEY to get written session debriefs; ' +
+              "'guard' on its own always works."
+          );
+          return;
+        }
+        console.log('Writing the debrief...');
+        const written = await guard.debrief().catch(() => undefined);
+        console.log(written ?? 'Nothing to say about this session yet.');
+        return;
+      }
+
+      default:
+        console.log(
+          "guard | on | off | explain <id> | limit <amount> | mute <id> | severity <id> <level> | " +
+            'autoexit <id> | unlock | exit [now|firm|stop] | debrief'
+        );
+    }
+  }
+
   private async handleCommand(command: string) {
+    // A held order is answered before anything else is read. 'y' sends it;
+    // 'n' cancels and stops there; anything else cancels it and then runs as
+    // the command it is -- so an operator who has changed their mind and typed
+    // 'cancel all' gets exactly that, and not a surprise entry.
+    if (this.pendingOrder && (await this.resolvePending(command))) return;
+
     if (command.startsWith('print')) {
       if (command.includes('possize')) {
         const positionSize = await this.exchangeCommand
@@ -498,6 +920,8 @@ export class UserInterface {
       await this.handleTrailCommand(command);
     } else if (command === 'fatfinger' || command.startsWith('fatfinger ')) {
       await this.handleFatFingerCommand(command);
+    } else if (command === 'guard' || command.startsWith('guard ')) {
+      await this.handleGuardCommand(command);
     } else if (command.startsWith('market')) {
       const market = command.split(' ')[1];
       if (this.availableMarkets.includes(market)) {
@@ -937,6 +1361,17 @@ export class UserInterface {
         const commandParams = await OrderType.parseCommand(command);
         if (commandParams !== null) {
           const { type, quantity, price } = commandParams;
+
+          // The last thing between a typed order and the exchange. It can
+          // hold the order or refuse it; it can never alter it.
+          const cleared = await this.guardReview(
+            command,
+            type,
+            quantity === undefined ? undefined : Number(quantity),
+            price === undefined ? undefined : Number(price)
+          );
+
+          if (!cleared) return;
 
           if (
             type === OrderType.MARKET_BUY ||

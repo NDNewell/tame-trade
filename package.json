@@ -7,11 +7,13 @@
   "scripts": {
     "start": "tsx src/index.ts",
     "dev": "node reload.cjs",
-    "dev:np": "node reload.cjs -np"
+    "dev:np": "node reload.cjs -np",
+    "test": "for f in $(find src -name \"*.test.ts\" | sort); do printf \"%-34s \" \"$(basename $f)\"; tsx \"$f\" > /dev/null 2>&1 && echo PASS || { echo FAIL; tsx \"$f\"; exit 1; }; done"
   },
   "author": "Nicholas Newell",
   "license": "ISC",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.120.0",
     "@types/node": "^20.11.0",
     "bcrypt": "^6.0.0",
     "ccxt": "^4.4.71",

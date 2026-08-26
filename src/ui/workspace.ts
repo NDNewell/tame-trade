@@ -6,7 +6,7 @@
 import { ExchangeClient } from '../exchange/exchangeClient.js';
 import { ActivityLog } from './activityLog.js';
 import { Screen } from './screen.js';
-import { NO_VALUE, TerminalView } from './frame.js';
+import { ConfirmationView, NO_VALUE, TerminalView } from './frame.js';
 import { PositionRiskResult } from '../trading/positionRisk.js';
 import { readTrailTag } from '../trading/trailTag.js';
 
@@ -17,6 +17,7 @@ const FOOTER = [
   'limit',
   'trail',
   'cancel',
+  'guard',
   'orders',
   'positions',
   'market',
@@ -186,10 +187,24 @@ export class Workspace {
     // Adaptive trails are the exchange's to run and ours to adjust; the monitor
     // reconsiders them as candles close.
     this.client.startTrailMonitor();
+    // The guardrails sweep for things no order is being placed about: a
+    // position left unprotected, a day quietly giving back its profit.
+    this.client.startGuardSweep();
 
     this.refreshTimer = setInterval(() => void this.refresh(), 2000);
     this.tickTimer = setInterval(() => this.tickCountdown(), 1000);
     void this.refresh();
+  }
+
+  /**
+   * Puts an order in front of the operator, or takes the panel away.
+   *
+   * The confirmation panel replaces the position/orders block rather than
+   * overlaying it, so there is no reading of a held order against a background
+   * of numbers that are about to change. Passing null restores the block.
+   */
+  showConfirmation(confirmation: ConfirmationView | null): void {
+    this.screen?.update({ confirmation });
   }
 
   /** The header as it currently stands, for partial updates. */
@@ -229,6 +244,7 @@ export class Workspace {
     this.refreshTimer = null;
     this.tickTimer = null;
     this.client.stopTrailMonitor();
+    this.client.stopGuardSweep();
     this.screen?.stop();
     this.screen = null;
   }
