@@ -4065,6 +4065,11 @@ export class ExchangeClient {
     try {
       const stored = await this.exchangeManager.getGuardPolicy();
       this.guard.setPolicy(resolvePolicy(stored));
+      // Read here rather than at construction because the coach's key lives in
+      // the same file as the thresholds, and this is the one place that file is
+      // opened on the way into a session. A key entered on the home menu is
+      // therefore live on the next 'Start Trading' without restarting.
+      this.guard.setApiKey(await this.exchangeManager.getAnthropicKey());
       this.guard.load();
     } catch {
       // Defaults stand. A profile that cannot be read must not leave the

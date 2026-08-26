@@ -123,7 +123,7 @@ export class CoachThread {
     if (!this.coach.available()) {
       this.push(
         'system',
-        'No coach configured. Set ANTHROPIC_API_KEY and restart to enable it.'
+        "No coach configured. Add a key under 'AI Coach Key' on the home menu."
       );
       return;
     }

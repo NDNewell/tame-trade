@@ -121,22 +121,52 @@ function facts(snapshot: SessionSnapshot, findings: Finding[]): string {
   );
 }
 
+/** Where the key in use came from, or why there isn't one. */
+export type KeySource = 'profile' | 'environment' | 'none' | 'rejected';
+
 export class Coach {
   private client: Anthropic | undefined;
   private model: string;
   private enabled: boolean;
+  private source: KeySource = 'none';
 
   constructor(options: CoachOptions = {}) {
     this.model = options.model ?? MODEL;
     this.enabled = options.enabled !== false;
+    this.useKey(options.apiKey);
+  }
+
+  /**
+   * Adopts a key, which is normally found after this object already exists.
+   *
+   * The profile is read from disk well after the guard is constructed -- the
+   * guard has to be able to record from the very first fill, so it cannot wait
+   * on a file -- and the coach has to be able to come to life at that point.
+   *
+   * Rebuilt in place rather than replaced. The thread holds a reference to this
+   * object, and swapping the coach out from under it would leave it talking to
+   * the previous one for the rest of the session.
+   *
+   * A key stored in the profile beats one exported in the shell. Someone who
+   * has just typed a key into this application is entitled to expect that to be
+   * the key it uses, and a stale export is much the harder of the two to
+   * notice: it fails by quietly working with the wrong account.
+   */
+  useKey(key: string | undefined): void {
+    const stored = key?.trim();
+    const exported = process.env.ANTHROPIC_API_KEY?.trim();
+    const resolved = stored || exported;
 
     // No key, no coach. Constructing the client anyway and discovering the
     // problem on the first call would put the failure in front of the operator
     // at the least useful moment.
-    const key = options.apiKey ?? process.env.ANTHROPIC_API_KEY;
-    if (key && this.enabled) {
-      this.client = new Anthropic({ apiKey: key });
-    }
+    this.source = !resolved ? 'none' : stored ? 'profile' : 'environment';
+    this.client = resolved && this.enabled ? new Anthropic({ apiKey: resolved }) : undefined;
+  }
+
+  /** Where the key came from, so the status line can name it. */
+  keySource(): KeySource {
+    return this.source;
   }
 
   available(): boolean {
@@ -297,6 +327,10 @@ export class Coach {
         // coach never says anything.
         console.warn('[Coach] Anthropic credentials were rejected; coaching is off.');
         this.client = undefined;
+        // Recorded rather than merely switched off, so the status line can say
+        // 'rejected' instead of 'not configured'. They are different problems
+        // and only one of them is fixed by entering a key.
+        this.source = 'rejected';
         return undefined;
       }
       if (error instanceof Anthropic.APIError) {

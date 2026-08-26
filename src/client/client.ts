@@ -73,7 +73,10 @@ export class Client {
   }
 
   private async showMenu() {
-    const action = await this.userInterface.displayHomeScreen();
+    // Read on every pass so the menu reflects a key that was just entered or
+    // removed, rather than the state the menu was first drawn with.
+    const coachKey = await this.configManager.getAnthropicKey().catch(() => undefined);
+    const action = await this.userInterface.displayHomeScreen(coachKey);
 
     switch (action) {
       case 'startTrading':
@@ -87,6 +90,17 @@ export class Client {
         await this.exchangeManager.removeExchange();
         await this.showMenu();
         break;
+      case 'coachKey': {
+        const entered = await this.userInterface.editCoachKey(coachKey);
+        // undefined is 'left it alone'; null is 'remove it'. Both are distinct
+        // from a string, and collapsing them would make Back erase the key.
+        if (entered !== undefined) {
+          await this.configManager.setAnthropicKey(entered ?? undefined);
+          console.log(entered ? 'Coach key saved.' : 'Coach key removed.');
+        }
+        await this.showMenu();
+        break;
+      }
       case 'deleteProfile':
         await this.configManager.deleteProfile();
         console.log('Profile deleted.');
