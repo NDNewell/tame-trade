@@ -14,6 +14,8 @@
 
 import { BehaviourId, BEHAVIOURS } from './behaviours.js';
 import { Coach } from './coach.js';
+import { CoachThread } from './coachThread.js';
+import { FindingTracker, Transition } from './findingTracker.js';
 import { OrderProposal, PositionContext, PriceMove } from './detectors.js';
 import { GuardPolicy, resolvePolicy } from './guardPolicy.js';
 import {
@@ -30,6 +32,21 @@ import {
   SessionSnapshot,
 } from './sessionJournal.js';
 
+/**
+ * A sweep, plus what changed since the last one.
+ *
+ * `findings` is everything currently true and is what a status line renders;
+ * `transitions` is the much shorter list of things that have started, worsened
+ * or ended, and is the only part that belongs in a log. Keeping both on one
+ * object is deliberate -- the caller that reports the edges and the caller that
+ * displays the state are the same caller, and giving them two methods to call
+ * in the right order is how they come to disagree.
+ */
+export interface GuardSweep extends SweepResult {
+  transitions: Transition[];
+  active: Array<{ finding: Finding; since: number }>;
+}
+
 export interface GuardServiceOptions {
   policy?: Partial<GuardPolicy>;
   apiKey?: string;
@@ -42,6 +59,8 @@ export class GuardService {
   private journal: SessionJournal;
   private guardrails: Guardrails;
   private coach: Coach;
+  private thread: CoachThread;
+  private tracker = new FindingTracker();
   private policy: GuardPolicy;
   private now: () => number;
   private currency = '';
@@ -52,6 +71,15 @@ export class GuardService {
     this.coach = new Coach({ apiKey: options.apiKey });
     this.now = options.clock ?? (() => Date.now());
     this.journal = options.journal ?? new SessionJournal();
+    this.thread = new CoachThread({
+      coach: this.coach,
+      snapshot: () => this.snapshot(),
+      // What the coach is told is currently true is what the status line says
+      // is currently true. Deriving it twice is how the panel and the prose
+      // come to describe different sessions.
+      findings: () => this.tracker.active().map((entry) => entry.finding),
+      clock: this.now,
+    });
   }
 
   /**
@@ -71,6 +99,21 @@ export class GuardService {
   setPolicy(policy: GuardPolicy): void {
     this.policy = policy;
     this.guardrails.setPolicy(policy);
+    // A muted behaviour stops being reported, and a disabled guard stops
+    // reporting entirely. Neither means the condition resolved, so the tracked
+    // set is dropped rather than cleared: 'cleared' is a claim about the
+    // position, and this is only a change in what we are looking at.
+    this.tracker.reset();
+  }
+
+  /** The coach conversation, for the panel that renders it. */
+  getThread(): CoachThread {
+    return this.thread;
+  }
+
+  /** Everything the guardrails currently hold to be true, worst first. */
+  activeFindings(): Array<{ finding: Finding; since: number }> {
+    return this.tracker.active();
   }
 
   coachAvailable(): boolean {
@@ -180,14 +223,21 @@ export class GuardService {
     this.journal.record({ type: 'override', at: this.now(), market, behaviour });
   }
 
-  sweep(positions: PositionContext[], equity?: number, currency?: string): SweepResult {
-    return this.guardrails.sweep({
-      now: this.now(),
+  sweep(positions: PositionContext[], equity?: number, currency?: string): GuardSweep {
+    const now = this.now();
+    const result = this.guardrails.sweep({
+      now,
       snapshot: this.snapshot(),
       positions,
       equity,
       currency: currency ?? this.currency,
     });
+
+    return {
+      ...result,
+      transitions: this.tracker.update(result.findings, now),
+      active: this.tracker.active(),
+    };
   }
 
   /** Stops new entries until `until`. Journalled, so a restart honours it. */
@@ -302,3 +352,5 @@ export class GuardService {
 }
 
 export type { Finding, GuardVerdict, Intervention, SweepResult };
+export type { Transition } from './findingTracker.js';
+export type { CoachEntry } from './coachThread.js';

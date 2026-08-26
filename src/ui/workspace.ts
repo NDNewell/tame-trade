@@ -18,6 +18,7 @@ const FOOTER = [
   'trail',
   'cancel',
   'guard',
+  'coach',
   'orders',
   'positions',
   'market',
@@ -207,6 +208,47 @@ export class Workspace {
     this.screen?.update({ confirmation });
   }
 
+  /**
+   * The coach thread and the standing guardrail conditions, as the panel takes
+   * them.
+   *
+   * Pulled from the guard rather than pushed into the workspace, so the panel
+   * cannot drift out of step with what the guard actually holds. Both are in
+   * memory, so this costs nothing and is safe on the redraw path.
+   */
+  private coachState(): Pick<TerminalView, 'coach' | 'coachBusy' | 'guard'> {
+    const guard = this.client.getGuard();
+    const thread = guard.getThread();
+    const active = guard.activeFindings();
+
+    return {
+      coach: thread.all().map(({ kind, text }) => ({ kind, text })),
+      coachBusy: thread.busy(),
+      guard: {
+        count: active.length,
+        // Behaviour ids rather than titles: the status line is read at a glance
+        // and re-read all session, and the id is what `guard explain` takes.
+        // Severity is named only when it is worth acting on.
+        summary: active
+          .map(({ finding }) =>
+            finding.severity === 'notice'
+              ? finding.behaviour.id
+              : `${finding.behaviour.id} (${finding.severity})`
+          )
+          .join(', '),
+      },
+    };
+  }
+
+  /**
+   * Repaints the coach panel now, for a change that must not wait for the
+   * two-second refresh -- a question the operator just typed, or the answer
+   * landing. Everything else arrives on the next cycle.
+   */
+  showCoach(): void {
+    this.screen?.update(this.coachState());
+  }
+
   /** The header as it currently stands, for partial updates. */
   private header() {
     return {
@@ -305,6 +347,7 @@ export class Workspace {
       const chaseDeadline = this.client.getChaseDeadline();
 
       this.screen.update({
+        ...this.coachState(),
         header: this.header(),
         ranges: ranges.map(({ label, high, low, atr }) => ({
           label,

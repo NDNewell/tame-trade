@@ -136,6 +136,32 @@ export interface ConfirmationView {
   prompt: string;
 }
 
+/**
+ * One exchange in the coach thread, before it is wrapped to a panel width.
+ *
+ * Unwrapped on purpose: only the frame knows how wide the panel turned out,
+ * and text wrapped anywhere else would have to be re-wrapped here anyway.
+ */
+export interface CoachEntryView {
+  kind: 'operator' | 'coach' | 'system';
+  text: string;
+}
+
+/**
+ * What the guardrails currently hold to be true.
+ *
+ * This is the half of the guard's output that is a *condition* rather than an
+ * event: a position sized past the risk limit stays sized past it until it is
+ * closed. It belongs somewhere that can be rewritten in place, which is what
+ * this is -- the activity log gets the moment it started and the moment it
+ * ends, and nothing in between.
+ */
+export interface GuardStatusView {
+  count: number;
+  /** Already ordered worst first, e.g. 'risk-per-trade (hold), give-back'. */
+  summary: string;
+}
+
 export interface TerminalView {
   header: HeaderView;
   ranges: RangeColumnView[];
@@ -157,6 +183,15 @@ export interface TerminalView {
    * follows the tail.
    */
   activityOffset?: number;
+  /**
+   * The coach conversation, oldest first. An empty thread renders an invitation
+   * rather than an empty box, so the panel explains itself without a help page.
+   */
+  coach?: CoachEntryView[];
+  /** A reply is outstanding. The panel says so rather than looking finished. */
+  coachBusy?: boolean;
+  /** Standing guardrail conditions, shown rather than repeated into the log. */
+  guard?: GuardStatusView;
   footer: string[];
   footerRight: string;
 }
@@ -183,18 +218,22 @@ interface BoxChars {
   h: string; v: string;
   tl: string; tr: string; bl: string; br: string;
   teeDown: string; teeUp: string; teeLeft: string; teeRight: string;
+  /** Where one block's divider closes and the next one's opens. */
+  cross: string;
 }
 
 const UNICODE_BOX: BoxChars = {
   h: '─', v: '│',
   tl: '┌', tr: '┐', bl: '└', br: '┘',
   teeDown: '┬', teeUp: '┴', teeLeft: '┤', teeRight: '├',
+  cross: '┼',
 };
 
 const ASCII_BOX: BoxChars = {
   h: '-', v: '|',
   tl: '+', tr: '+', bl: '+', br: '+',
   teeDown: '+', teeUp: '+', teeLeft: '+', teeRight: '+',
+  cross: '+',
 };
 
 const box: BoxChars = canRenderUnicode() ? UNICODE_BOX : ASCII_BOX;
@@ -646,6 +685,114 @@ function confirmationBlock(
   return lines;
 }
 
+/**
+ * Below this the coach goes under the activity log rather than beside it.
+ *
+ * Splitting the region costs the log its right-hand half, and the activity
+ * columns run to about column 54 before the message even starts. Halving an
+ * eighty-column terminal would leave the message with six characters, so the
+ * threshold is set where both halves are still worth reading.
+ */
+const COACH_SPLIT_WIDTH = 120;
+
+/** Content rows the stacked coach band gets, on top of its border and label. */
+const COACH_BAND_ROWS = 3;
+
+interface CoachLine {
+  text: string;
+  paint: Paint | undefined;
+}
+
+/**
+ * Greedy word wrap.
+ *
+ * A token longer than the panel is broken rather than clipped: it is nearly
+ * always a number, and half a number read as a whole one is the kind of mistake
+ * this application exists to avoid.
+ */
+function wrapText(text: string, width: number): string[] {
+  if (width <= 0) return [];
+
+  const out: string[] = [];
+
+  for (const paragraph of String(text).split('\n')) {
+    const words: string[] = [];
+    for (const word of paragraph.split(/\s+/)) {
+      if (word.length === 0) continue;
+      for (let i = 0; i < word.length; i += width) words.push(word.slice(i, i + width));
+    }
+
+    let line = '';
+    for (const word of words) {
+      if (line.length === 0) {
+        line = word;
+      } else if (line.length + 1 + word.length <= width) {
+        line += ' ' + word;
+      } else {
+        out.push(line);
+        line = word;
+      }
+    }
+    if (line.length > 0) out.push(line);
+  }
+
+  return out;
+}
+
+/**
+ * The thread flattened into paintable rows.
+ *
+ * The operator's own lines keep the '>' they were typed after and take the
+ * command colour, so a glance separates what was asked from what came back
+ * without reading either.
+ */
+function coachLines(view: TerminalView, width: number): CoachLine[] {
+  const entries = view.coach ?? [];
+  const out: CoachLine[] = [];
+
+  if (entries.length === 0) {
+    return [{ text: "Ask with 'coach <question>'", paint: MUTED }];
+  }
+
+  for (const entry of entries) {
+    if (out.length > 0) out.push({ text: '', paint: undefined });
+
+    if (entry.kind === 'operator') {
+      const wrapped = wrapText(entry.text, Math.max(1, width - 2));
+      wrapped.forEach((text, index) =>
+        out.push({ text: `${index === 0 ? '> ' : '  '}${text}`, paint: 'cyan' })
+      );
+      continue;
+    }
+
+    const paint = entry.kind === 'system' ? MUTED : VALUE;
+    for (const text of wrapText(entry.text, width)) out.push({ text, paint });
+  }
+
+  // Appended rather than shown in place of the thread: the previous answer
+  // stays readable while the next one is being written.
+  if (view.coachBusy) out.push({ text: 'thinking...', paint: MUTED });
+
+  return out;
+}
+
+/** The tail of the thread, which is the part worth the rows. */
+function tailCoach(lines: CoachLine[], rows: number): CoachLine[] {
+  if (lines.length <= rows) return lines;
+
+  // It does not all fit, so the separators go first. A blank row between two
+  // exchanges is worth having when there is room and worth less than the
+  // sentence it displaces when there is not -- and a tail that happens to begin
+  // on one would otherwise spend the panel's first row on nothing.
+  const dense = lines.filter((line) => line.text.length > 0);
+  return dense.slice(Math.max(0, dense.length - rows));
+}
+
+/** Rows the stacked band would take, borders and label included. Zero if idle. */
+function coachBandCost(view: TerminalView): number {
+  return (view.coach ?? []).length === 0 ? 0 : COACH_BAND_ROWS + 2;
+}
+
 /** The slice of activity to show, given how far back the view is scrolled. */
 function windowActivity(
   activity: ActivityRowView[],
@@ -669,12 +816,16 @@ function windowActivity(
  * Events without structured data keep their message, rather than being padded
  * with placeholders into a shape they don't have.
  */
-function activityRow(
-  event: ActivityRowView,
-  width: number,
-  inner: number
-): Line {
-  const line = new Line(width);
+/**
+ * Painted into a line that may already hold something else.
+ *
+ * `stop` is where the row must end -- the full inner width normally, the
+ * divider when the coach is sitting beside it. Everything below clips to it, so
+ * a long message ends at the divider instead of running through the panel next
+ * to it.
+ */
+function paintActivity(line: Line, event: ActivityRowView, stop: number): Line {
+  const inner = stop;
   const cTime = 2;
   const cEvent = 18;
   const cSide = 26;
@@ -685,6 +836,7 @@ function activityRow(
   line
     .put(cTime, event.time, MUTED, cEvent)
     .put(cEvent, event.category, categoryColor(event.category), cSide);
+
 
   const detail = event.detail;
   if (!detail) {
@@ -706,13 +858,32 @@ function activityRow(
   return line;
 }
 
-function activityLabel(view: TerminalView, width: number, rows: number): Line {
+function activityLabel(
+  view: TerminalView,
+  width: number,
+  rows: number,
+  divider?: number
+): Line {
   const line = new Line(width).put(2, 'ACTIVITY', SECTION);
-  const offset = view.activityOffset ?? 0;
+  const split = divider !== undefined && divider > 0;
+  const stop = split ? (divider as number) : width - 2;
 
+  if (split) line.divider(divider as number);
+
+  const offset = view.activityOffset ?? 0;
   if (offset > 0) {
     const behind = Math.min(offset, Math.max(0, view.activity.length - rows));
-    line.put(12, `scrolled back ${behind}`, 'yellow', width - 2);
+    line.put(12, `scrolled back ${behind}`, 'yellow', stop);
+  }
+
+  if (split) line.put((divider as number) + 2, 'COACH', SECTION, width - 2);
+
+  // Right-aligned, and the last thing painted, so a long list of standing
+  // conditions gives ground to the labels rather than overwriting them.
+  const guard = view.guard;
+  if (guard && guard.count > 0) {
+    const floor = split ? (divider as number) + 10 : 30;
+    line.putRight(width - 2, `GUARD ${guard.count}: ${guard.summary}`, 'yellow', floor);
   }
 
   return line;
@@ -908,9 +1079,15 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
   }
 
   lines.push(border());
-  lines.push(activityLabel(view, width, activityRows));
-  const visible = windowActivity(activity, activityRows, view.activityOffset ?? 0);
-  for (let row = 0; row < activityRows; row++) {
+
+  // Never beside the log at this width -- there is barely room for the log --
+  // so the coach takes a band beneath it, and only when it has something to say.
+  const bandCost = coachBandCost(view);
+  const logRows = Math.max(1, activityRows - bandCost);
+
+  lines.push(activityLabel(view, width, logRows));
+  const visible = windowActivity(activity, logRows, view.activityOffset ?? 0);
+  for (let row = 0; row < logRows; row++) {
     const line = new Line(width);
     const event = visible[row];
     if (event) {
@@ -920,6 +1097,18 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
         .put(21, event.message, VALUE, inner);
     }
     lines.push(line);
+  }
+
+  if (bandCost > 0) {
+    lines.push(border());
+    lines.push(new Line(width).put(2, 'COACH', SECTION));
+    const band = tailCoach(coachLines(view, inner - 3), COACH_BAND_ROWS);
+    for (let row = 0; row < COACH_BAND_ROWS; row++) {
+      const spoken = band[row];
+      lines.push(
+        spoken ? new Line(width).put(2, spoken.text, spoken.paint, inner) : new Line(width)
+      );
+    }
   }
 
   lines.push(border());
@@ -945,7 +1134,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   const { header, market, position, orders, chase, activity } = view;
 
   const border = (
-    opts: { edge?: 'top' | 'bottom'; divider?: 'down' | 'up' } = {}
+    opts: { edge?: 'top' | 'bottom'; divider?: 'down' | 'up' | 'cross' } = {}
   ): Line => {
     const left = opts.edge === 'top' ? box.tl : opts.edge === 'bottom' ? box.bl : box.teeRight;
     const right = opts.edge === 'top' ? box.tr : opts.edge === 'bottom' ? box.br : box.teeLeft;
@@ -954,7 +1143,9 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
     line.put(0, left + box.h.repeat(width - 2) + right, undefined, width);
 
     if (opts.divider) {
-      line.put(divider, opts.divider === 'down' ? box.teeDown : box.teeUp, undefined, width);
+      const glyph =
+        opts.divider === 'down' ? box.teeDown : opts.divider === 'up' ? box.teeUp : box.cross;
+      line.put(divider, glyph, undefined, width);
     }
 
     return line;
@@ -1194,7 +1385,11 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   }
 
   // --- chase: only present while one is running --------------------------
-  lines.push(border({ divider: 'up' }));
+  // The position/orders divider closes here. When the coach sits beside the log
+  // a fresh one opens immediately, so the border crosses rather than caps --
+  // unless a chase is in between, where it caps and reopens beneath.
+  const splitCoach = width >= COACH_SPLIT_WIDTH;
+  lines.push(border({ divider: !chase && splitCoach ? 'cross' : 'up' }));
   if (chase) {
     lines.push(new Line(width).put(2, 'CHASE', SECTION));
     lines.push(
@@ -1219,27 +1414,53 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
     lines.push(
       new Line(width).put(2, 'Status').put(14, chase.status, statusColor(chase.status))
     );
-    lines.push(border());
+    lines.push(border({ divider: splitCoach ? 'down' : undefined }));
   }
 
-  // --- activity ----------------------------------------------------------
-  lines.push(activityLabel(view, width, activityRows));
+  // --- activity, with the coach beside it or beneath it -------------------
+  const bandCost = splitCoach ? 0 : coachBandCost(view);
+  const logRows = Math.max(1, activityRows - bandCost);
 
-  const visible = windowActivity(activity, activityRows, view.activityOffset ?? 0);
-  for (let row = 0; row < activityRows; row++) {
-    const line = new Line(width);
+  lines.push(activityLabel(view, width, logRows, splitCoach ? divider : undefined));
+
+  const visible = windowActivity(activity, logRows, view.activityOffset ?? 0);
+  // The coach panel starts two columns past the divider and runs to the frame
+  // edge; the floor keeps it from collapsing to nothing on an odd width.
+  const thread = splitCoach
+    ? tailCoach(coachLines(view, Math.max(8, inner - divider - 3)), logRows)
+    : [];
+
+  for (let row = 0; row < logRows; row++) {
+    const line = splitCoach ? new Line(width).divider(divider) : new Line(width);
     const event = visible[row];
 
-    if (event) {
-      lines.push(activityRow(event, width, inner));
-      continue;
+    if (event) paintActivity(line, event, splitCoach ? divider : inner);
+
+    const spoken = thread[row];
+    if (spoken && spoken.text.length > 0) {
+      line.put(divider + 2, spoken.text, spoken.paint, inner);
     }
 
     lines.push(line);
   }
 
+  // Too narrow to sit beside the log, so it sits under it. Only when there is
+  // something to show: an empty band would cost the log three rows to say
+  // nothing.
+  if (bandCost > 0) {
+    lines.push(border());
+    lines.push(new Line(width).put(2, 'COACH', SECTION));
+    const band = tailCoach(coachLines(view, inner - 3), COACH_BAND_ROWS);
+    for (let row = 0; row < COACH_BAND_ROWS; row++) {
+      const spoken = band[row];
+      lines.push(
+        spoken ? new Line(width).put(2, spoken.text, spoken.paint, inner) : new Line(width)
+      );
+    }
+  }
+
   // --- command entry, kept fixed so activity never moves it --------------
-  lines.push(border());
+  lines.push(border({ divider: splitCoach ? 'up' : undefined }));
   lines.push(new Line(width).put(2, '>', 'cyan').put(4, view.input, HEADLINE, inner));
 
   // --- footer ------------------------------------------------------------

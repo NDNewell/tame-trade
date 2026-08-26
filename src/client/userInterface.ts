@@ -646,6 +646,59 @@ export class UserInterface {
   private bypassGuardOnce = false;
 
   /**
+   * coach <question>   ask about the session, in the coach panel
+   * coach              write the debrief
+   * coach clear        empty the thread
+   *
+   * The one command here that talks to a model on purpose, rather than as an
+   * improvement on wording that already existed. It answers in the panel rather
+   * than the activity log: a hundred and twenty words of prose in a column of
+   * timestamped events is unreadable, and it evicts the events besides.
+   */
+  private async handleCoachCommand(command: string): Promise<void> {
+    const guard = this.exchangeCommand.getExchangeClient().getGuard();
+    const thread = guard.getThread();
+    const question = command.trim().slice('coach'.length).trim();
+
+    if (question.toLowerCase() === 'clear') {
+      thread.clear();
+      this.workspace?.showCoach();
+      return;
+    }
+
+    if (!guard.coachAvailable()) {
+      thread.note(
+        'No coach configured. Set ANTHROPIC_API_KEY and restart to enable it; ' +
+          "'guard' on its own always works without one."
+      );
+      this.workspace?.showCoach();
+      return;
+    }
+
+    // Bare 'coach' is the debrief, which is a different call: it weighs the
+    // whole session rather than answering a question about it.
+    if (question.length === 0) {
+      thread.note('Writing the debrief...');
+      this.workspace?.showCoach();
+
+      const written = await guard.debrief().catch(() => undefined);
+      thread.note(written ?? 'Nothing to say about this session yet.');
+      this.workspace?.showCoach();
+      return;
+    }
+
+    // Painted before the call goes out, so the panel shows what was asked while
+    // the answer is still being written. Not awaited by the command loop: a
+    // model call must never be between the operator and the next command.
+    void thread
+      .ask(question)
+      .then(() => this.workspace?.showCoach())
+      .catch(() => undefined);
+
+    this.workspace?.showCoach();
+  }
+
+  /**
    * guard                     where the session stands
    * guard on | off            the whole system
    * guard explain <id>        what a behaviour means and why it is checked
@@ -659,7 +712,7 @@ export class UserInterface {
    * guard unlock              lift a lockout, deliberately and on the record
    * guard exit [now]          run a worked exit on the current position
    * guard exit stop
-   * guard debrief             what the session looked like
+   * guard debrief             what the session looked like (an alias for 'coach')
    */
   private async handleGuardCommand(command: string): Promise<void> {
     const client = this.exchangeCommand.getExchangeClient();
@@ -820,19 +873,12 @@ export class UserInterface {
         return;
       }
 
-      case 'debrief': {
-        if (!guard.coachAvailable()) {
-          console.log(
-            'No coach configured. Set ANTHROPIC_API_KEY to get written session debriefs; ' +
-              "'guard' on its own always works."
-          );
-          return;
-        }
-        console.log('Writing the debrief...');
-        const written = await guard.debrief().catch(() => undefined);
-        console.log(written ?? 'Nothing to say about this session yet.');
+      // Kept as an alias now that the coach has a panel of its own. Routing it
+      // through the same handler is what stops the debrief appearing in two
+      // different places depending on which word the operator reached for.
+      case 'debrief':
+        await this.handleCoachCommand('coach');
         return;
-      }
 
       default:
         console.log(
@@ -920,6 +966,8 @@ export class UserInterface {
       await this.handleTrailCommand(command);
     } else if (command === 'fatfinger' || command.startsWith('fatfinger ')) {
       await this.handleFatFingerCommand(command);
+    } else if (command === 'coach' || command.startsWith('coach ')) {
+      await this.handleCoachCommand(command);
     } else if (command === 'guard' || command.startsWith('guard ')) {
       await this.handleGuardCommand(command);
     } else if (command.startsWith('market')) {

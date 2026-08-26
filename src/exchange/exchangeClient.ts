@@ -4225,21 +4225,50 @@ export class ExchangeClient {
     const position = await this.positionContextFor(market).catch(() => undefined);
     const summary = await this.equityFor(market);
 
-    const { findings, interventions } = this.guard.sweep(
+    const { transitions, interventions } = this.guard.sweep(
       position ? [position] : [],
       summary?.equity,
       this.availableMarkets?.[market]?.quote
     );
 
-    for (const finding of findings) {
-      // Notices are already visible in the panel's own numbers; repeating them
-      // every thirty seconds would train the operator to stop reading the log.
+    // Only the edges are logged. What is merely still true is on the guard
+    // status line, which is rewritten in place -- a standing breach re-derived
+    // every thirty seconds is one fact, and reporting it as a hundred and
+    // twenty events an hour buried every fill and cancel between them.
+    for (const transition of transitions) {
+      const finding = transition.finding;
+      if (!finding) continue;
+
+      // Notices are already visible in the panel's own numbers and on the
+      // status line. They are tracked so they can escalate, but they do not
+      // announce themselves in either direction.
       if (finding.severity === 'notice') continue;
+
+      if (transition.kind === 'cleared') {
+        NotificationManager.notify(
+          `${finding.behaviour.title}: cleared.`,
+          NType.INFO,
+          'SYSTEM'
+        );
+        continue;
+      }
+
       NotificationManager.notify(
-        `${finding.behaviour.title}: ${finding.detail}`,
+        transition.kind === 'escalated'
+          ? `${finding.behaviour.title} (now ${finding.severity}): ${finding.detail}`
+          : `${finding.behaviour.title}: ${finding.detail}`,
         NType.ERROR,
         'WARNING'
       );
+
+      // The coach gets the same edge, and decides for itself whether it has
+      // anything to add -- it is rate-limited hard, so most of these are
+      // dropped. Never awaited: the sweep is on a timer and a slow model call
+      // must not delay the next one.
+      void this.guard
+        .getThread()
+        .nudge(finding)
+        .catch(() => undefined);
     }
 
     for (const intervention of interventions) {

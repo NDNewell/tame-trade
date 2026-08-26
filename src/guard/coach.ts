@@ -49,6 +49,12 @@ Hard rules:
 
 Style: plain sentences, second person, no lists unless there are genuinely separate items, no headings. British spelling. Brevity is the point — an operator reads this between trades.`;
 
+/** One side of the coach thread, as the panel and the model both see it. */
+export interface ThreadTurn {
+  role: 'operator' | 'coach';
+  text: string;
+}
+
 export interface CoachOptions {
   apiKey?: string;
   model?: string;
@@ -187,13 +193,80 @@ export class Coach {
   }
 
   /**
+   * A question the operator actually asked, with the thread behind it.
+   *
+   * The one place the coach is not reacting to a measurement. Everything else
+   * in this file is triggered by the guardrails; this is triggered by someone
+   * typing, which means the question can be about anything -- including things
+   * the coach must refuse. The system prompt already forbids trading advice and
+   * that rule is not restated here: repeating a prohibition in the turn tends to
+   * produce a reply that argues with itself about whether it may answer, rather
+   * than one that simply answers what it can.
+   *
+   * History is passed as plain turns with no facts attached. Only the newest
+   * turn carries the session numbers, because the numbers move: a thread three
+   * questions long would otherwise contain three contradictory equity figures
+   * and invite the model to reconcile them.
+   */
+  async converse(
+    question: string,
+    history: ThreadTurn[],
+    snapshot: SessionSnapshot,
+    findings: Finding[] = []
+  ): Promise<string | undefined> {
+    if (!this.client) return undefined;
+
+    const turns: Anthropic.MessageParam[] = history.map((turn) => ({
+      role: turn.role === 'operator' ? ('user' as const) : ('assistant' as const),
+      content: turn.text,
+    }));
+
+    return this.ask(
+      `Here is the session as the journal has it.\n\n${facts(snapshot, findings)}\n\n` +
+        `The operator asks: ${question}\n\n` +
+        `Answer in at most 80 words, from these numbers. If the answer is not in ` +
+        `them, say which number would settle it rather than guessing.`,
+      800,
+      turns
+    );
+  }
+
+  /**
+   * Something worth saying that nobody asked for.
+   *
+   * Used when a guardrail has just started or just got worse. Kept to one
+   * sentence because it arrives uninvited: an unprompted paragraph in a panel
+   * the operator was not reading is an interruption, and the second time it
+   * happens they stop reading the panel.
+   */
+  async remark(finding: Finding, snapshot: SessionSnapshot): Promise<string | undefined> {
+    if (!this.client) return undefined;
+
+    return this.ask(
+      `A guardrail has just started applying. The measurement is fixed and ` +
+        `correct; do not re-judge it.\n\n` +
+        `Behaviour: ${finding.behaviour.id}\n` +
+        `What was measured: ${finding.detail}\n` +
+        `Why it matters: ${finding.behaviour.why}\n\n` +
+        `Session so far:\n${facts(snapshot, [])}\n\n` +
+        `Write one sentence, at most 30 words, stating what changed and the ` +
+        `number behind it. No advice, no question, no encouragement.`,
+      200
+    );
+  }
+
+  /**
    * The single call, with the failure modes all handled in one place.
    *
    * Every failure returns undefined. A coach that throws would turn a
    * network blip into a broken confirmation panel, and the panel's job -- to
    * show the operator an order before it is sent -- does not depend on it.
    */
-  private async ask(question: string, maxTokens: number): Promise<string | undefined> {
+  private async ask(
+    question: string,
+    maxTokens: number,
+    history: Anthropic.MessageParam[] = []
+  ): Promise<string | undefined> {
     if (!this.client) return undefined;
 
     try {
@@ -203,7 +276,9 @@ export class Coach {
         thinking: { type: 'adaptive' },
         output_config: { effort: 'medium' },
         system: [{ type: 'text', text: SYSTEM, cache_control: { type: 'ephemeral' } }],
-        messages: [{ role: 'user', content: question }],
+        // The brief is the cache prefix and nothing before this line varies, so
+        // a thread of follow-ups re-reads it rather than re-paying for it.
+        messages: [...history, { role: 'user', content: question }],
       });
 
       if (response.stop_reason === 'refusal') return undefined;
