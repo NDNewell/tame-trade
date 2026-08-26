@@ -78,11 +78,31 @@ export class UserInterface {
     );
   }
 
-  async displayHomeScreen(): Promise<string> {
+  /**
+   * Shows a secret without showing it.
+   *
+   * Enough of the key to tell two of them apart, and never enough to use. The
+   * last four characters are what distinguishes keys from the same account, and
+   * the length is what catches a paste that picked up a newline.
+   */
+  private static maskKey(key: string): string {
+    return key.length <= 8
+      ? `${'*'.repeat(key.length)} (${key.length} characters — suspiciously short)`
+      : `${key.slice(0, 7)}…${key.slice(-4)} (${key.length} characters)`;
+  }
+
+  async displayHomeScreen(coachKey?: string): Promise<string> {
+    // The menu says whether a key is already there. 'Add' where one exists
+    // invites the question of whether it replaces or appends, and the answer
+    // should not have to be discovered by trying it.
     const menuChoices = [
       { name: 'Start Trading', value: 'startTrading' },
       { name: 'Add Exchange', value: 'addExchange' },
       { name: 'Remove Exchange', value: 'removeExchange' },
+      {
+        name: coachKey ? 'AI Coach Key (set)' : 'AI Coach Key (not set)',
+        value: 'coachKey',
+      },
       { name: 'Delete Profile', value: 'deleteProfile' },
       { name: 'Quit', value: 'quit' },
     ];
@@ -98,6 +118,77 @@ export class UserInterface {
     clear();
 
     return action;
+  }
+
+  /**
+   * Enter, replace or remove the coach key.
+   *
+   * Typed with `type: 'password'` so it does not land in the terminal's
+   * scrollback, unlike the exchange credentials above -- those predate this and
+   * are worth the same treatment, but changing them is a separate decision
+   * about a separate flow.
+   *
+   * Returns the new value, `null` to clear it, or undefined to leave it alone.
+   */
+  async editCoachKey(current?: string): Promise<string | null | undefined> {
+    console.log(
+      current
+        ? `A coach key is stored: ${UserInterface.maskKey(current)}`
+        : 'No coach key is stored. The guardrails work without one; the written debriefs do not.'
+    );
+    console.log(
+      'It is kept in ~/.tame/config.json beside your exchange credentials, and never leaves this machine except in calls to Anthropic.\n'
+    );
+
+    const { action } = await inquirer.prompt([
+      {
+        type: 'list',
+        name: 'action',
+        message: 'AI Coach Key:',
+        choices: [
+          { name: current ? 'Replace it' : 'Enter a key', value: 'set' },
+          ...(current ? [{ name: 'Remove it', value: 'clear' }] : []),
+          { name: 'Back', value: 'back' },
+        ],
+      },
+    ]);
+
+    if (action === 'back') {
+      clear();
+      return undefined;
+    }
+
+    if (action === 'clear') {
+      clear();
+      return null;
+    }
+
+    const { key } = await inquirer.prompt([
+      {
+        type: 'password',
+        name: 'key',
+        mask: '*',
+        message: 'Paste your Anthropic API key (sk-ant-...):',
+      },
+    ]);
+
+    clear();
+
+    const trimmed = String(key ?? '').trim();
+    // An empty answer is a change of mind, not an instruction to wipe the key
+    // that is already there. Removing one is its own menu entry.
+    if (trimmed.length === 0) return undefined;
+
+    if (!trimmed.startsWith('sk-ant-')) {
+      // Checked rather than rejected. The prefix is a convention and not a
+      // guarantee, so this warns and stores it anyway; the alternative is
+      // refusing a key that works because the format changed.
+      console.log(
+        `${fo('That does not look like an Anthropic key (they normally begin sk-ant-). Storing it anyway.', 'yellow')}`
+      );
+    }
+
+    return trimmed;
   }
 
   async createProfile(): Promise<string> {
@@ -668,7 +759,7 @@ export class UserInterface {
 
     if (!guard.coachAvailable()) {
       thread.note(
-        'No coach configured. Set ANTHROPIC_API_KEY and restart to enable it; ' +
+        "No coach configured. Add a key under 'AI Coach Key' on the home menu; " +
           "'guard' on its own always works without one."
       );
       this.workspace?.showCoach();

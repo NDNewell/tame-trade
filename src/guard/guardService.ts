@@ -13,7 +13,7 @@
 // exchange-specific special cases.
 
 import { BehaviourId, BEHAVIOURS } from './behaviours.js';
-import { Coach } from './coach.js';
+import { Coach, KeySource } from './coach.js';
 import { CoachThread } from './coachThread.js';
 import { FindingTracker, Transition } from './findingTracker.js';
 import { OrderProposal, PositionContext, PriceMove } from './detectors.js';
@@ -118,6 +118,21 @@ export class GuardService {
 
   coachAvailable(): boolean {
     return this.coach.available();
+  }
+
+  /**
+   * Hands the coach a key found in the profile.
+   *
+   * Separate from the constructor for the same reason `load` is: this object is
+   * built before anything has been read from disk, because it must be able to
+   * journal the first fill of the session.
+   */
+  setApiKey(key: string | undefined): void {
+    this.coach.useKey(key);
+  }
+
+  coachKeySource(): KeySource {
+    return this.coach.keySource();
   }
 
   snapshot(): SessionSnapshot {
@@ -341,10 +356,16 @@ export class GuardService {
       lines.push(`Muted: ${this.policy.muted.join(', ')}`);
     }
 
+    // Naming the source matters: an exported key and a stored one behave
+    // identically until they disagree, and 'rejected' is a different problem
+    // from 'never set' that entering another key will not always fix.
+    const source = this.coach.keySource();
     lines.push(
       this.coach.available()
-        ? 'Coach: available'
-        : 'Coach: off (set ANTHROPIC_API_KEY to enable session debriefs)'
+        ? `Coach: available (key from ${source === 'profile' ? 'your profile' : 'ANTHROPIC_API_KEY'})`
+        : source === 'rejected'
+        ? 'Coach: off — the key was rejected. Enter another from the home menu.'
+        : "Coach: off — add a key under 'AI Coach Key' on the home menu."
     );
 
     return lines;
