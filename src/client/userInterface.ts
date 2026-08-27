@@ -773,7 +773,8 @@ export class UserInterface {
       this.workspace?.showCoach();
 
       const written = await guard.debrief().catch(() => undefined);
-      thread.note(written ?? 'Nothing to say about this session yet.');
+      if (written && written.length > 0) thread.speak(written);
+      else thread.note('Nothing to say about this session yet.');
       this.workspace?.showCoach();
       return;
     }
@@ -980,6 +981,23 @@ export class UserInterface {
   }
 
   private async handleCommand(command: string) {
+    // Recorded first, as typed, before substitution and before anything is
+    // dispatched. The intention is the part worth keeping: 'trail 3atr 15m arm
+    // 96.2' says what was wanted, and the stop it eventually produces does not
+    // -- a reader given only the resulting order has to infer the plan, and a
+    // command that was refused leaves no order to infer anything from at all.
+    //
+    // Best-effort, and outside anything that can stop the command running: a
+    // failure to write the record must never be a failure to trade.
+    try {
+      this.exchangeCommand
+        .getExchangeClient()
+        .getGuard()
+        .recordCommand(command, { market: this.currentMarket });
+    } catch {
+      // No guard, or no journal. The command proceeds either way.
+    }
+
     // A held order is answered before anything else is read. 'y' sends it;
     // 'n' cancels and stops there; anything else cancels it and then runs as
     // the command it is -- so an operator who has changed their mind and typed

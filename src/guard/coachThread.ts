@@ -19,8 +19,11 @@
 
 import { BehaviourId, atLeast } from './behaviours.js';
 import { Coach, ThreadTurn } from './coach.js';
+import { CoachBlock } from '../ui/coachBlocks.js';
+import { CoachLog, CoachOccasion } from './coachLog.js';
 import { Finding } from './guardrails.js';
-import { SessionSnapshot } from './sessionJournal.js';
+import { MarketContext } from './marketContext.js';
+import { SessionSnapshot, dayKey } from './sessionJournal.js';
 
 /** What a rendered line in the panel came from. */
 export type CoachEntryKind =
@@ -35,7 +38,20 @@ export interface CoachEntry {
   kind: CoachEntryKind;
   text: string;
   at: number;
+  /**
+   * The reply as the coach divided it, when it arrived divided.
+   *
+   * `text` is kept alongside because it is what the transcript stores and what
+   * a later turn is shown as history: a conversation reads back as prose, not
+   * as a structure. The blocks are for the panel, which is the only thing that
+   * needs to know where one point ends.
+   */
+  blocks?: CoachBlock[];
 }
+
+/** Blocks rendered back to prose, for the archive and for the model's own history. */
+export const blocksToText = (blocks: CoachBlock[]): string =>
+  blocks.map((block) => block.text).join('\n\n');
 
 export interface CoachThreadOptions {
   coach: Coach;
@@ -43,9 +59,19 @@ export interface CoachThreadOptions {
   snapshot: () => SessionSnapshot;
   /** What the guardrails currently hold to be true. */
   findings?: () => Finding[];
+  /**
+   * The market, no older than the age the caller asks for. A question is worth
+   * a fresh reading; a remark that arrives uninvited takes whatever is to hand.
+   */
+  market?: (maxAgeMs: number) => Promise<MarketContext | undefined>;
   clock?: () => number;
   /** Injected in tests; the real one is Date.now. */
   nudgeIntervalMs?: number;
+  /**
+   * Where the conversation is kept. Omitted in tests, which have no business
+   * writing to the operator's home directory.
+   */
+  log?: CoachLog;
 }
 
 /**
@@ -70,8 +96,21 @@ export class CoachThread {
   private coach: Coach;
   private snapshot: () => SessionSnapshot;
   private findings: () => Finding[];
+  private market: (maxAgeMs: number) => Promise<MarketContext | undefined>;
   private now: () => number;
   private nudgeIntervalMs: number;
+  private log: CoachLog | undefined;
+  /**
+   * How wide the panel's prose column is.
+   *
+   * Told to the coach so a block's length limit is measured in rows of the
+   * panel it is actually going into. A default is carried for tests and for the
+   * moment before the workspace has drawn itself; being a few columns out costs
+   * a split in a slightly different place and nothing else.
+   */
+  private paneWidthColumns = 40;
+  /** Stamped onto each turn so a transcript says what was being traded. */
+  private subject: string | undefined;
 
   /** True while a model call is outstanding, so the panel can say so. */
   private inFlight = 0;
@@ -84,8 +123,46 @@ export class CoachThread {
     this.coach = options.coach;
     this.snapshot = options.snapshot;
     this.findings = options.findings ?? (() => []);
+    this.market = options.market ?? (async () => undefined);
     this.now = options.clock ?? (() => Date.now());
     this.nudgeIntervalMs = options.nudgeIntervalMs ?? DEFAULT_NUDGE_INTERVAL_MS;
+    this.log = options.log;
+  }
+
+  /** Adopts a transcript, which is found after this object already exists. */
+  useLog(log: CoachLog): void {
+    this.log = log;
+  }
+
+  paneWidth(): number {
+    return this.paneWidthColumns;
+  }
+
+  /** The panel's prose width, as the frame worked it out. */
+  setPaneWidth(width: number): void {
+    if (Number.isFinite(width) && width >= 8) this.paneWidthColumns = Math.floor(width);
+  }
+
+  /** Which market the conversation is about, for the record. */
+  setSubject(market: string | undefined): void {
+    this.subject = market;
+  }
+
+  /**
+   * Puts today's transcript back into the panel.
+   *
+   * A restart at lunchtime should not present an empty panel as though the
+   * morning had not happened: the operator can see the morning's positions in
+   * every other region, and only the conversation would have amnesia. The tail
+   * is taken because the panel holds a tail; the archive keeps the rest.
+   */
+  restore(now = this.now()): void {
+    if (!this.log || this.entries.length > 0) return;
+
+    for (const turn of this.log.read(dayKey(now)).slice(-MAX_ENTRIES)) {
+      this.entries.push({ kind: turn.speaker, text: turn.text, at: turn.at });
+    }
+    this.revision++;
   }
 
   available(): boolean {
@@ -118,7 +195,7 @@ export class CoachThread {
     const text = question.trim();
     if (text.length === 0) return;
 
-    this.push('operator', text);
+    this.push('operator', text, 'question');
 
     if (!this.coach.available()) {
       this.push(
@@ -136,14 +213,23 @@ export class CoachThread {
     this.inFlight++;
     this.revision++;
     try {
+      // Zero: a question typed just now is answered against the market as it is
+      // now, not as it was when the panel last refreshed itself.
+      const market = await this.market(0).catch(() => undefined);
+
       const written = await this.coach
-        .converse(text, history, this.snapshot(), this.findings())
+        .converse(text, history, this.snapshot(), this.findings(), market, this.paneWidthColumns)
         .catch(() => undefined);
 
-      this.push(
-        written === undefined ? 'system' : 'coach',
-        written ?? 'The coach could not answer that one. The numbers above are unchanged.'
-      );
+      if (written === undefined) {
+        this.push(
+          'system',
+          'The coach could not answer that one. The numbers above are unchanged.',
+          'answer'
+        );
+      } else {
+        this.push('coach', blocksToText(written), 'answer', undefined, written);
+      }
     } finally {
       this.inFlight--;
       this.revision++;
@@ -181,9 +267,12 @@ export class CoachThread {
     this.inFlight++;
     this.revision++;
     try {
-      const written = await this.coach.remark(finding, this.snapshot()).catch(() => undefined);
+      const market = await this.market(60_000).catch(() => undefined);
+      const written = await this.coach
+        .remark(finding, this.snapshot(), market)
+        .catch(() => undefined);
       if (written === undefined) return false;
-      this.push('coach', written);
+      this.push('coach', written, 'remark', finding.behaviour.id);
       return true;
     } finally {
       this.inFlight--;
@@ -196,15 +285,45 @@ export class CoachThread {
     this.push('system', text);
   }
 
+  /**
+   * A coach turn the thread did not ask for, already divided into blocks.
+   *
+   * The debrief comes this way: it is written by the same voice as an answer
+   * and belongs in the thread as one, rather than as a note in the panel's
+   * voice -- which is what it used to be, and which is why it rendered without
+   * a speaker or any structure at all.
+   */
+  speak(blocks: CoachBlock[], occasion: CoachOccasion = 'debrief'): void {
+    if (blocks.length === 0) return;
+    this.push('coach', blocksToText(blocks), occasion, undefined, blocks);
+  }
+
   clear(): void {
     this.entries = [];
     this.revision++;
   }
 
-  private push(kind: CoachEntryKind, text: string): void {
-    this.entries.push({ kind, text, at: this.now() });
+  /**
+   * Adds a line to the panel and to the record.
+   *
+   * Both, always, and in that order. A turn that reached the operator but not
+   * the transcript would make the archive quietly wrong in the one direction
+   * that is hard to notice later -- it would read as though the coach had said
+   * less than it did.
+   */
+  private push(
+    kind: CoachEntryKind,
+    text: string,
+    occasion: CoachOccasion = 'system',
+    behaviour?: string,
+    blocks?: CoachBlock[]
+  ): void {
+    const at = this.now();
+    this.entries.push({ kind, text, at, blocks });
     if (this.entries.length > MAX_ENTRIES) this.entries.shift();
     this.revision++;
+
+    this.log?.append({ at, speaker: kind, occasion, text, market: this.subject, behaviour });
   }
 
   /** The thread as the model takes it: real turns only, in order. */

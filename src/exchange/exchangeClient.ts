@@ -36,6 +36,8 @@ import { classifyOrderStatus, staleOrderIds } from './orderCacheRules.js';
 import { GuardService } from '../guard/guardService.js';
 import { OrderProposal, PositionContext } from '../guard/detectors.js';
 import { GuardVerdict } from '../guard/guardrails.js';
+import { MarketContext, MarketSeries } from '../guard/marketContext.js';
+import { describeOrders } from '../trading/orderView.js';
 import { resolvePolicy, GuardPolicy } from '../guard/guardPolicy.js';
 import {
   describeExitPlan,
@@ -197,6 +199,12 @@ export class ExchangeClient {
     this.supportedExchanges = [];
     this.eventEmitter = new EventEmitter();
     this.chaseLimitOrderActive = false;
+
+    // The guard knows nothing about exchanges by design, so what the coach may
+    // see of the market arrives as a function rather than as a dependency. It
+    // resolves to undefined until a market is being followed, which is exactly
+    // what a coach asked about the market before one is chosen should be told.
+    this.guard.setMarketSource(() => this.getMarketContext().catch(() => undefined));
   }
 
   static getInstance(): ExchangeClient {
@@ -514,6 +522,8 @@ export class ExchangeClient {
     leverage?: number;
     effectiveLeverage?: number;
     liquidation?: number;
+    /** Position value in the settlement currency, as the exchange reports it. */
+    notional?: number;
     currency: string;
   } | null> {
     const position = await this.getPositionStructure(market);
@@ -541,6 +551,9 @@ export class ExchangeClient {
         currency
       ),
       liquidation: Number(info.liquidationPrice) || undefined,
+      notional: Number.isFinite(Number(position.notional ?? info.valueRv))
+        ? Math.abs(Number(position.notional ?? info.valueRv))
+        : undefined,
       currency,
     };
   }
@@ -796,6 +809,25 @@ export class ExchangeClient {
    * quoting with room to spare.
    */
   private static readonly CANDLE_LIMIT = 100;
+  /**
+   * The kline limits the exchange will accept.
+   *
+   * Not a range: anything between two of these is rejected outright with
+   * 'Please double check input arguments', which is what happened the first
+   * time the coach's history was deepened and 182 daily candles were asked for.
+   * A request over a thousand is silently capped rather than refused, which is
+   * the more dangerous of the two failures -- so the snap below is upward into
+   * this set and never past its end.
+   */
+  private static readonly CANDLE_LIMITS = [5, 10, 50, 100, 500, 1000];
+
+  /** The smallest accepted limit that satisfies a wanted depth. */
+  private static snapLimit(wanted: number): number {
+    return (
+      ExchangeClient.CANDLE_LIMITS.find((limit) => limit >= wanted) ??
+      ExchangeClient.CANDLE_LIMITS[ExchangeClient.CANDLE_LIMITS.length - 1]
+    );
+  }
   /** How long to hold a failed volatility read before trying again. */
   private static readonly ATR_RETRY_MS = 30000;
   /**
@@ -831,7 +863,21 @@ export class ExchangeClient {
   /** The period ATR is quoted at essentially everywhere. */
   private static readonly RANGE_ATR_PERIOD = 14;
   private static readonly CANDLE_CACHE_MIN_MS = 15000;
-  private static readonly CANDLE_CACHE_MAX_MS = 300000;
+  /**
+   * The longest a candle series is held, whatever its size says.
+   *
+   * Was five minutes flat, which was defensible when every series was a hundred
+   * bars and the coarse ones were only read for ATR. It stopped being
+   * defensible when the coach's history went to five hundred daily and weekly
+   * bars: a weekly candle cannot change more than once a week, and refetching
+   * five hundred of them twelve times an hour spends the rate limit to be told
+   * the same thing.
+   *
+   * The real bound is the next close, and the forming bar is dropped before
+   * anything reads the series, so nothing in a held series can change before
+   * then. This is the backstop over that, not the rule.
+   */
+  private static readonly CANDLE_CACHE_MAX_MS = 3600000;
 
   /** Mark price, index price and funding rate, refreshed at a sensible interval. */
   /**
@@ -866,20 +912,29 @@ export class ExchangeClient {
    * so an exchange that publishes a candle a moment late is retried rather
    * than polled flat out.
    */
-  private async getCandles(market: string, timeframe: string): Promise<Candle[]> {
-    const key = `${market}|${timeframe}`;
+  private async getCandles(
+    market: string,
+    timeframe: string,
+    wanted = ExchangeClient.CANDLE_LIMIT
+  ): Promise<Candle[]> {
+    // Snapped here as well as at the call sites, so no caller can send a value
+    // the exchange refuses.
+    const limit = ExchangeClient.snapLimit(wanted);
+
+    // The depth is part of the key. A deep series and a shallow one on the same
+    // timeframe are different answers with different costs, and letting a
+    // hundred-candle read satisfy a request for six months -- or the reverse,
+    // pulling a thousand candles to measure ATR(14) -- would be wrong in one
+    // direction or wasteful in the other.
+    const key = `${market}|${timeframe}|${limit}`;
     const cached = this.candleCache.get(key);
     if (cached && Date.now() < cached.until) return cached.candles;
 
-    const raw = await this.exchange!.fetchOHLCV(
-      market,
-      timeframe,
-      undefined,
-      ExchangeClient.CANDLE_LIMIT
-    );
+    const raw = await this.exchange!.fetchOHLCV(market, timeframe, undefined, limit);
 
     const candles = raw.map((row: any) => ({
       timestamp: Number(row[0]),
+      open: Number(row[1]),
       high: Number(row[2]),
       low: Number(row[3]),
       close: Number(row[4]),
@@ -893,8 +948,15 @@ export class ExchangeClient {
     const nextClose =
       last !== undefined ? last.timestamp + 2 * intervalMs : now;
 
+    // Never longer than one bar of this size: on a fast timeframe the backstop
+    // above would otherwise hold a minute candle for an hour.
+    const ceiling = Math.min(
+      ExchangeClient.CANDLE_CACHE_MAX_MS,
+      Math.max(ExchangeClient.CANDLE_CACHE_MIN_MS, intervalMs)
+    );
+
     const until = Math.min(
-      now + ExchangeClient.CANDLE_CACHE_MAX_MS,
+      now + ceiling,
       Math.max(now + ExchangeClient.CANDLE_CACHE_MIN_MS, nextClose)
     );
 
@@ -923,17 +985,23 @@ export class ExchangeClient {
     // Once there is something to show, showing it wins. Ranges are measured
     // over minutes to a month; a few seconds of staleness is invisible in the
     // numbers and very visible in the redraw.
-    if (cached) {
-      if (!this.rangeRefreshInFlight.has(market)) {
-        this.rangeRefreshInFlight.add(market);
-        void this.computePriceRanges(market)
-          .catch(() => undefined)
-          .finally(() => this.rangeRefreshInFlight.delete(market));
-      }
-      return cached.ranges;
+    // Refreshed in the background whether or not there is anything cached yet,
+    // and the caller is answered immediately either way.
+    //
+    // The first call used to await the computation, which meant the first
+    // populated frame of a session waited on nine rate-limited candle requests
+    // -- and since the workspace reads price, position, orders and ranges
+    // together, everything else waited with it. The panel now shows '--' for a
+    // few seconds instead, which is what it has to show anyway, and the values
+    // that were ready are on screen while the slow ones arrive.
+    if (!this.rangeRefreshInFlight.has(market)) {
+      this.rangeRefreshInFlight.add(market);
+      void this.computePriceRanges(market)
+        .catch(() => undefined)
+        .finally(() => this.rangeRefreshInFlight.delete(market));
     }
 
-    return this.computePriceRanges(market);
+    return cached?.ranges ?? [];
   }
 
   /** The work behind getPriceRanges. Always goes to the exchange. */
@@ -1067,6 +1135,66 @@ export class ExchangeClient {
       (this.availableMarkets?.[market]?.info as any)?.fundingInterval
     );
     return Number.isFinite(seconds) && seconds > 0 ? seconds : undefined;
+  }
+
+  /** '8h', '4h', '1h' -- how the interval reads rather than how it is stored. */
+  private static intervalLabel(seconds: number): string {
+    if (seconds % 3600 === 0) return `${seconds / 3600}h`;
+    if (seconds % 60 === 0) return `${seconds / 60}m`;
+    return `${seconds}s`;
+  }
+
+  /**
+   * What the next funding payment costs, or pays, on the position as it stands.
+   *
+   * The rate is the honest figure and the annualised one says whether it
+   * matters over time, but neither answers the question actually being asked,
+   * which is how much money moves at the next payment. A hundredth of a percent
+   * sounds like nothing until it is read against a six-figure notional.
+   *
+   * Signed from the operator's side: negative is paid out, positive is
+   * received. A positive rate means longs pay shorts, so a long notional
+   * against a positive rate is a cost -- which is why the notional arrives
+   * signed rather than as a size.
+   *
+   * Linear contracts only. An inverse contract settles in the base asset and
+   * the arithmetic is a different one; returning the linear answer for it would
+   * be a confident wrong number rather than a missing one.
+   */
+  fundingCost(
+    market: string,
+    signedNotional: number | undefined
+  ): { amount: number; daily: number; currency: string; interval: string } | undefined {
+    if (signedNotional === undefined || !Number.isFinite(signedNotional)) return undefined;
+    if (signedNotional === 0) return undefined;
+
+    const info = this.availableMarkets?.[market];
+    if ((info as any)?.inverse === true) return undefined;
+
+    const rate = this.fundingCache.get(market)?.funding;
+    if (rate === undefined || !Number.isFinite(rate)) return undefined;
+
+    const seconds = this.fundingIntervalSeconds(market);
+    if (seconds === undefined) return undefined;
+
+    // Negated so the sign reads from the operator's side rather than the
+    // market's: what they pay is money leaving.
+    const amount = -(signedNotional * rate);
+
+    return {
+      amount,
+      // A day's worth, which is the figure worth reading. One payment of nine
+      // dollars sounds like a rounding error; the same position costing
+      // twenty-nine a day is a number that can be weighed against the trade.
+      //
+      // Scaled from the current rate, which assumes it holds across the day's
+      // remaining payments. It will not exactly -- the rate is re-struck each
+      // interval -- but it is the same assumption the annualised figure beside
+      // it already makes, and the alternative is a number nobody can act on.
+      daily: amount * (86400 / seconds),
+      currency: String(info?.settle ?? info?.quote ?? ''),
+      interval: ExchangeClient.intervalLabel(seconds),
+    };
   }
 
   private formatFunding(market: string, rate: number): string {
@@ -1578,6 +1706,12 @@ export class ExchangeClient {
         at: eventTime,
         contractSize: (this.availableMarkets?.[market] as any)?.contractSize ?? 1,
         inverse: (this.availableMarkets?.[market] as any)?.inverse === true,
+        // What this fill is, as opposed to what it looked like from here. The
+        // `filledSoFar` map below is per-stream, so a reconnect starts a fresh
+        // one and replays fills it has already reported; naming them lets the
+        // journal recognise the ones it has already counted.
+        orderId: id,
+        filledTotal: filled,
       });
 
       state.filledSoFar.set(id, filled);
@@ -4061,6 +4195,177 @@ export class ExchangeClient {
     return this.guard;
   }
 
+  /**
+   * How much history of each size the coach is shown.
+   *
+   * The ladder runs from the last hour to the last few years, because the
+   * questions being asked run that far: where to put a stop is a question about
+   * the last few bars, whether to hold over a weekend is a question about the
+   * last few months, and 'is this level still the level' is a question about
+   * where price has spent its time since it was.
+   *
+   * It used to be four sizes and a hundred and eight bars in total, which was
+   * chosen to cost nothing -- those were the sizes the range panel already had
+   * in cache. That reasoning survives for the fine end and not the coarse: a
+   * hundred daily candles is three months, and a position held through a
+   * quarter is one the coach can only see the end of.
+   *
+   * So the coarse sizes are fetched to their own depth, on their own schedule,
+   * in the background. A daily candle changes once a day; a weekly one once a
+   * week. Nothing here is ever read on the path of a coach call.
+   */
+  private static readonly COACH_SERIES: Array<{ timeframe: string; count: number }> = [
+    { timeframe: '1m', count: 60 }, //  1 hour, to the minute
+    { timeframe: '5m', count: 72 }, //  6 hours
+    { timeframe: '15m', count: 96 }, // 1 day
+    { timeframe: '1h', count: 96 }, //  4 days
+    { timeframe: '4h', count: 120 }, // 20 days
+    { timeframe: '1d', count: 180 }, // 6 months
+    { timeframe: '1w', count: 104 }, // 2 years
+    { timeframe: '1M', count: 48 }, //  4 years
+  ];
+
+  /**
+   * How deep each of those has to be fetched, given the bar still forming and
+   * the limits the exchange is willing to be asked for.
+   */
+  private static coachDepth(count: number): number {
+    return ExchangeClient.snapLimit(count + 2);
+  }
+
+  /**
+   * Keeps the coach's candle history warm.
+   *
+   * Called from the sweep, never from a coach call. Each size is refreshed only
+   * when its own cache has lapsed, which for the coarse ones is roughly when a
+   * bar of that size closes -- so the weekly series is read about once a week,
+   * and the cost of the whole ladder amortises to almost nothing.
+   */
+  async warmCoachCandles(market?: string): Promise<void> {
+    const symbol = market ?? this.lastFollowedMarket;
+    if (!symbol || !this.exchange) return;
+
+    for (const { timeframe, count } of ExchangeClient.COACH_SERIES) {
+      await this.getCandles(symbol, timeframe, ExchangeClient.coachDepth(count)).catch(
+        () => undefined
+      );
+    }
+  }
+
+  /**
+   * What the coach is shown of the market.
+   *
+   * Built from what is already held rather than by fetching: the candle cache
+   * is read but never filled here, and the range panel's cache is used as it
+   * stands. A coach call must not put nine candle requests on the wire, and it
+   * certainly must not do so behind a confirmation panel that is waiting on it.
+   *
+   * Position and price are read live, because they are the two things that are
+   * worthless stale and both are cheap -- the ticker is streamed and the
+   * position is one call the panel is already making every couple of seconds.
+   */
+  async getMarketContext(market?: string): Promise<MarketContext | undefined> {
+    const symbol = market ?? this.lastFollowedMarket;
+    if (!symbol || !this.exchange) return undefined;
+
+    const info: any = this.availableMarkets?.[symbol] ?? {};
+
+    const [price, position, risk, orders] = await Promise.all([
+      this.getDisplayPrice(symbol).catch(() => ({}) as Awaited<
+        ReturnType<ExchangeClient['getDisplayPrice']>
+      >),
+      this.getPositionView(symbol).catch(() => null),
+      this.getPositionRisk(symbol).catch(() => undefined),
+      this.getOpenOrdersForDisplay(symbol).catch(() => []),
+    ]);
+
+    // Cached only. An empty panel is better than a coach that rate-limits the
+    // client it lives inside.
+    const ranges = this.rangeCache.get(symbol)?.ranges ?? [];
+
+    const series: MarketSeries[] = [];
+    for (const { timeframe, count } of ExchangeClient.COACH_SERIES) {
+      const cached = this.candleCache.get(
+        `${symbol}|${timeframe}|${ExchangeClient.coachDepth(count)}`
+      )?.candles;
+      if (!cached || cached.length === 0) continue;
+
+      // The bar still forming is dropped: its high, low and close are all
+      // provisional, and a coach reading it as a closed bar is reading a bar
+      // that has not happened yet.
+      const intervalMs = this.exchange.parseTimeframe(timeframe) * 1000;
+      const closed = closedCandles(cached, Date.now(), intervalMs);
+
+      series.push({
+        timeframe,
+        candles: closed.slice(-count).map((candle) => ({
+          at: candle.timestamp,
+          open: candle.open ?? candle.close,
+          high: candle.high,
+          low: candle.low,
+          close: candle.close,
+        })),
+      });
+    }
+
+    const spread =
+      price.bid !== undefined && price.ask !== undefined ? price.ask - price.bid : undefined;
+
+    return {
+      market: symbol,
+      at: Date.now(),
+      base: info.base,
+      quote: info.quote,
+      last: price.last,
+      bid: price.bid,
+      ask: price.ask,
+      mark: price.mark,
+      index: price.index,
+      spread,
+      funding: price.funding,
+      ranges: ranges.map(({ label, high, low, atr }) => ({ label, high, low, atr })),
+      position: position
+        ? {
+            side: position.side,
+            size: position.size,
+            entry: position.entry,
+            mark: position.mark,
+            unrealizedPnl: position.unrealizedPnl,
+            leverage: position.leverage,
+            effectiveLeverage: position.effectiveLeverage,
+            liquidation: position.liquidation,
+            plannedRisk: risk?.totalRisk,
+            coverage: risk?.coveragePercentage,
+            ...(() => {
+              const cost = this.fundingCost(
+                symbol,
+                position.notional === undefined
+                  ? undefined
+                  : position.side === 'SHORT'
+                    ? -position.notional
+                    : position.notional
+              );
+              return cost
+                ? {
+                    fundingCost: cost.amount,
+                    fundingDaily: cost.daily,
+                    fundingInterval: cost.interval,
+                  }
+                : {};
+            })(),
+            currency: position.currency,
+          }
+        : undefined,
+      // Read once, by the same function the panel uses. The coach and the
+      // screen therefore cannot disagree about what is protecting the position.
+      orders: describeOrders(orders, {
+        isTrailArmed: (id) => this.isTrailArmed(id),
+        chaseOrderId: this.getCurrentChaseOrderId(),
+      }),
+      series,
+    };
+  }
+
   async loadGuardPolicy(): Promise<void> {
     try {
       const stored = await this.exchangeManager.getGuardPolicy();
@@ -4230,6 +4535,15 @@ export class ExchangeClient {
     const position = await this.positionContextFor(market).catch(() => undefined);
     const summary = await this.equityFor(market);
 
+    // Keeps the coach's view of the market warm. The two things it says without
+    // being asked -- the confirmation panel's sentence and an unprompted remark
+    // -- both arrive at moments that cannot wait for a read, so the read
+    // happens here, on a timer, where waiting costs nothing.
+    void this.guard.refreshMarket();
+    // And the history behind it. Each size refuses to refetch until a bar of
+    // its own size has closed, so this is a no-op on almost every sweep.
+    void this.warmCoachCandles(market);
+
     const { transitions, interventions } = this.guard.sweep(
       position ? [position] : [],
       summary?.equity,
@@ -4312,6 +4626,17 @@ export class ExchangeClient {
     if (!plan) return;
 
     const currency = this.availableMarkets?.[market]?.quote ?? '';
+
+    // Recorded whether or not it is run. A plan that was offered and declined
+    // is a decision, and it is the half of the exchange that leaves no other
+    // trace: the plan that runs at least leaves fills behind it.
+    this.guard.recordExitPlanned(
+      market,
+      urgency,
+      plan.plan.slices.length,
+      plan.plan.slices.reduce((total, slice) => total + slice.size, 0),
+      `${describeExitPlan(plan.plan, currency)}${authorised ? '' : ' (offered, not run)'}`
+    );
 
     if (!authorised) {
       NotificationManager.notify(
@@ -4914,6 +5239,12 @@ export class ExchangeClient {
 
       if (!this.armedTrails.has(id)) {
         this.armedTrails.add(id);
+        // Journalled as well as announced. It is the moment a fixed stop starts
+        // following the position, and it is the only transition in the system
+        // that leaves no trace on the order itself -- the order is identical
+        // either side of it. Without this line a record of the day cannot say
+        // when, or whether, the trail ever began.
+        this.guard.recordTrailArmed(market, tag.armPrice, stop, id);
         NotificationManager.notify(
           `Trail armed at ${this.formatPriceForDisplay(market, tag.armPrice)} ` +
             `(${this.describeTrailTag(tag)})`,
