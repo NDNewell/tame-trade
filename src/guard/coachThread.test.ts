@@ -36,7 +36,9 @@ const fakeCoach = (
     available: () => over.available !== false,
     converse: async (question: string, history: unknown[]) => {
       calls.push({ kind: 'converse', question, history: history.length });
-      return 'reply' in over ? over.reply : 'A written answer.';
+      // The coach answers in blocks now; undefined still means it could not.
+      const reply = 'reply' in over ? over.reply : 'A written answer.';
+      return reply === undefined ? undefined : [{ type: 'answer', text: reply }];
     },
     remark: async () => {
       calls.push({ kind: 'remark', question: '', history: 0 });
