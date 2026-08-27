@@ -36,6 +36,21 @@ export interface FillEvent {
   inverse?: boolean;
   /** Quote-currency fee, when the exchange reports one. */
   fee?: number;
+  /** The order this was a fill of, where the feed says. */
+  orderId?: string;
+  /**
+   * How much of that order had filled once this fill was in, which together
+   * with the order id names the fill exactly.
+   *
+   * Present so that hearing about a fill twice cannot count it twice. The order
+   * feed replays recent history whenever it reconnects, and every reader of it
+   * starts out believing nothing has filled yet, so the same partial fill
+   * arrives again looking new. It went unnoticed because it does not corrupt
+   * anything visibly: the position on screen comes from the exchange and stayed
+   * correct, while the journal beside it quietly counted five sessions' worth
+   * of trading for one session's worth of trades.
+   */
+  filledTotal?: number;
 }
 
 export interface OrderPlacedEvent {
@@ -43,6 +58,50 @@ export interface OrderPlacedEvent {
   at: number;
   market: string;
   orderId?: string;
+  /**
+   * What the order will do, in the words the panel uses.
+   *
+   * An id and a market say an order happened and nothing about what it was, so
+   * a record of the day could not distinguish an entry from the stop protecting
+   * it. Optional because the counter that reads this event predates the field
+   * and must keep working on files that have none.
+   */
+  description?: string;
+  /** True for a record written by observing the exchange, not by placing it. */
+  reconstructed?: boolean;
+}
+
+/**
+ * What the exchange said was true, as opposed to what the journal derived.
+ *
+ * The journal builds the position from fills it was told about, and it is not
+ * always told: fills that land while Tame is closed, or that a stream drops,
+ * leave it holding a position the exchange does not agree with. Nothing on
+ * screen shows the disagreement, because the panel reads the exchange directly
+ * -- only the guard is working from the derived figure, which is the one that
+ * decides whether a size is too large.
+ *
+ * Recorded as an observation rather than reconciled into fills. Inventing the
+ * fills that would explain the difference would make the arithmetic agree by
+ * fabricating trades, and a record that lies plausibly is worse than one that
+ * admits a gap.
+ */
+export interface ReconciliationEvent {
+  type: 'reconciliation';
+  at: number;
+  market: string;
+  /** As the exchange reports it. Absent when the exchange says flat. */
+  observed?: {
+    side: Direction;
+    size: number;
+    entry?: number;
+  };
+  /** What the journal derived at the same moment, for the difference. */
+  derived?: {
+    side: Direction;
+    size: number;
+    entry?: number;
+  };
 }
 
 export interface OrderCancelledEvent {
@@ -112,6 +171,68 @@ export interface LockoutEvent {
   reason: string;
 }
 
+/**
+ * A command the operator typed, and what became of it.
+ *
+ * The intention, as opposed to its consequences. Everything else in this file
+ * is an effect observed after the fact -- an order appeared, a fill arrived --
+ * and effects do not say what was being attempted. 'trail 3atr 15m arm 96.2' is
+ * a sentence about a plan; the stop it produces is not, and a reader given only
+ * the stop has to guess at the plan and will sometimes guess wrong.
+ */
+export interface CommandEvent {
+  type: 'command';
+  at: number;
+  /** As typed, before any substitution. */
+  text: string;
+  market?: string;
+  /** False when the command was refused, with the reason in `error`. */
+  accepted: boolean;
+  error?: string;
+}
+
+/** An order's price or size was changed rather than replaced. */
+export interface OrderAmendedEvent {
+  type: 'order-amended';
+  at: number;
+  market: string;
+  orderId?: string;
+  field: 'price' | 'trigger' | 'quantity';
+  from?: number;
+  to?: number;
+  /** What moved it: a chase, a managed trail, or the operator. */
+  by: 'chase' | 'trail' | 'operator';
+}
+
+/**
+ * A delayed trail started trailing.
+ *
+ * The moment a stop stops being fixed. Worth a line of its own because it is
+ * the only transition in the system that nothing on the order records: the
+ * order is identical either side of it, and the difference is entirely in
+ * whether this process has begun moving it.
+ */
+export interface TrailArmedEvent {
+  type: 'trail-armed';
+  at: number;
+  market: string;
+  orderId?: string;
+  armPrice: number;
+  trigger: number;
+}
+
+/** A worked exit was planned, with the terms it was planned on. */
+export interface ExitPlannedEvent {
+  type: 'exit-planned';
+  at: number;
+  market: string;
+  urgency: string;
+  slices: number;
+  quantity: number;
+  /** The plan as it was described to the operator, verbatim. */
+  description?: string;
+}
+
 /** The operator deliberately lifted a lockout, which is recorded too. */
 export interface LockoutLiftedEvent {
   type: 'lockout-lifted';
@@ -129,7 +250,12 @@ export type JournalEvent =
   | OverrideEvent
   | FlagEvent
   | LockoutEvent
-  | LockoutLiftedEvent;
+  | LockoutLiftedEvent
+  | CommandEvent
+  | OrderAmendedEvent
+  | TrailArmedEvent
+  | ExitPlannedEvent
+  | ReconciliationEvent;
 
 /** A position that is currently open, as reconstructed from fills. */
 export interface OpenPosition {
@@ -361,6 +487,21 @@ export interface SessionSnapshot {
   flags: FlagEvent[];
   /** In force now, or undefined if entries are not stopped. */
   lockout: LockoutEvent | undefined;
+
+  /**
+   * What was typed, what was amended, what armed, what was planned.
+   *
+   * Carried rather than counted. No detector reads these -- they exist so that
+   * an account of the session can say what was being attempted, not only what
+   * arrived -- and a count would answer one question where the list answers
+   * whichever one is asked later.
+   */
+  commands: CommandEvent[];
+  amendments: OrderAmendedEvent[];
+  trailArmings: TrailArmedEvent[];
+  exitPlans: ExitPlannedEvent[];
+  /** The most recent observation of the exchange, per market. */
+  reconciliations: ReconciliationEvent[];
 }
 
 /**
@@ -386,6 +527,11 @@ export function deriveSnapshot(
   const stopCancellations: StopCancelledEvent[] = [];
   const overrides: OverrideEvent[] = [];
   const flags: FlagEvent[] = [];
+  const commands: CommandEvent[] = [];
+  const amendments: OrderAmendedEvent[] = [];
+  const trailArmings: TrailArmedEvent[] = [];
+  const exitPlans: ExitPlannedEvent[] = [];
+  const reconciled = new Map<string, ReconciliationEvent>();
   let lockout: LockoutEvent | undefined;
 
   let ordersPlaced = 0;
@@ -444,6 +590,23 @@ export function deriveSnapshot(
       case 'lockout-lifted':
         lockout = undefined;
         break;
+      case 'command':
+        commands.push(event);
+        break;
+      case 'order-amended':
+        amendments.push(event);
+        break;
+      case 'trail-armed':
+        trailArmings.push(event);
+        break;
+      case 'exit-planned':
+        exitPlans.push(event);
+        break;
+      case 'reconciliation':
+        // Only the newest per market. An older observation has been overtaken
+        // by definition, and a list of them would invite reading a stale one.
+        reconciled.set(event.market, event);
+        break;
     }
   }
 
@@ -480,6 +643,11 @@ export function deriveSnapshot(
     // An expired lockout is not a lockout. Resolving that here means no caller
     // has to remember to check the clock against it.
     lockout: lockout && lockout.until > now ? lockout : undefined,
+    commands,
+    amendments,
+    trailArmings,
+    exitPlans,
+    reconciliations: [...reconciled.values()],
   };
 }
 
@@ -490,6 +658,58 @@ export const dayKey = (at: number): string => {
     moment.getDate()
   ).padStart(2, '0')}`;
 };
+
+/**
+ * One day's events off disk, oldest first.
+ *
+ * Separate from the journal class because reading a past day is not what a
+ * journal does -- it holds the session in progress -- and the history that
+ * assembles the coach's longer memory has to read days that no journal is
+ * keeping. Both go through here so there is one idea of what the file format
+ * is.
+ *
+ * A line that will not parse is skipped rather than fatal: a corrupt journal
+ * must degrade the record, never stop the application from trading.
+ */
+export function readJournalDay(directory: string, day: string): JournalEvent[] {
+  const events: JournalEvent[] = [];
+
+  try {
+    const file = path.join(directory, `${day}.jsonl`);
+    if (!fs.existsSync(file)) return events;
+
+    for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+      const text = line.trim();
+      if (!text) continue;
+      try {
+        const parsed = JSON.parse(text) as JournalEvent;
+        if (parsed && typeof parsed.at === 'number' && typeof parsed.type === 'string') {
+          events.push(parsed);
+        }
+      } catch {
+        // One unreadable line loses one event, not the day.
+      }
+    }
+  } catch {
+    // No journal on disk, or it cannot be read. The caller gets nothing.
+  }
+
+  return events;
+}
+
+/** Days with a journal, newest first. */
+export function journalDays(directory: string): string[] {
+  try {
+    return fs
+      .readdirSync(directory)
+      .filter((name) => name.endsWith('.jsonl'))
+      .map((name) => name.replace(/\.jsonl$/, ''))
+      .sort()
+      .reverse();
+  } catch {
+    return [];
+  }
+}
 
 /**
  * The session's events, in memory and on disk.
@@ -504,6 +724,8 @@ export class SessionJournal {
   private file: string | undefined;
   private day: string;
   private listeners: Array<(event: JournalEvent) => void> = [];
+  /** Fills already counted, so a replayed one is not counted again. */
+  private seenFills = new Set<string>();
 
   constructor(private directory = path.join(os.homedir(), '.tame', 'journal')) {
     this.day = dayKey(Date.now());
@@ -522,19 +744,13 @@ export class SessionJournal {
       }
       this.file = path.join(this.directory, `${this.day}.jsonl`);
 
-      if (!fs.existsSync(this.file)) return;
-
-      const lines = fs.readFileSync(this.file, 'utf8').split('\n');
-      for (const line of lines) {
-        const text = line.trim();
-        if (!text) continue;
-        try {
-          const parsed = JSON.parse(text) as JournalEvent;
-          if (parsed && typeof parsed.at === 'number' && typeof parsed.type === 'string') {
-            this.events.push(parsed);
-          }
-        } catch {
-          // One unreadable line loses one event, not the day.
+      for (const event of readJournalDay(this.directory, this.day)) {
+        this.events.push(event);
+        // Rebuilt from what is on disk, so a restart mid-session does not
+        // re-count the fills it is reading back in.
+        if (event.type === 'fill') {
+          const key = SessionJournal.fillKey(event);
+          if (key !== undefined) this.seenFills.add(key);
         }
       }
     } catch {
@@ -547,7 +763,32 @@ export class SessionJournal {
     this.listeners.push(listener);
   }
 
+  /**
+   * What names a fill, or undefined for a fill the feed did not name.
+   *
+   * The order id alone will not do -- one order can fill in five parts -- and
+   * neither will the size and price, since an order worked in equal slices
+   * produces genuinely identical ones. The running total is what distinguishes
+   * the third slice from the fourth.
+   *
+   * Where the feed gives no order id there is nothing to key on, and the fill
+   * is recorded. Counting a rare duplicate is the better error: the alternative
+   * is silently dropping a real fill because it resembled another one.
+   */
+  private static fillKey(event: FillEvent): string | undefined {
+    if (!event.orderId) return undefined;
+    return `${event.market}|${event.orderId}|${event.filledTotal ?? event.size}`;
+  }
+
   record(event: JournalEvent): void {
+    if (event.type === 'fill') {
+      const key = SessionJournal.fillKey(event);
+      if (key !== undefined) {
+        if (this.seenFills.has(key)) return;
+        this.seenFills.add(key);
+      }
+    }
+
     // A day boundary mid-session starts a new file. The in-memory list is not
     // cleared: a position opened before midnight is still open after it, and
     // dropping it would make the next fill look like it came from nowhere.
@@ -581,5 +822,6 @@ export class SessionJournal {
   /** For tests and for `guard reset`. */
   clear(): void {
     this.events = [];
+    this.seenFills.clear();
   }
 }
