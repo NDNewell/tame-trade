@@ -6,9 +6,10 @@
 import { ExchangeClient } from '../exchange/exchangeClient.js';
 import { ActivityLog } from './activityLog.js';
 import { Screen } from './screen.js';
-import { ConfirmationView, NO_VALUE, TerminalView } from './frame.js';
+import { ConfirmationView, NO_VALUE, TerminalView, coachProseWidth } from './frame.js';
 import { PositionRiskResult } from '../trading/positionRisk.js';
-import { readTrailTag } from '../trading/trailTag.js';
+import { RANGE_WINDOWS } from '../trading/volatility.js';
+import { describeOrders } from '../trading/orderView.js';
 
 const FOOTER = [
   'buy',
@@ -74,6 +75,41 @@ const signed = (value: unknown): string => {
   return `${numeric >= 0 ? '+' : ''}${numeric.toFixed(2)}`;
 };
 
+/**
+ * Every period the panel will ever show, with nothing in it yet.
+ *
+ * The shell has to be the final shape from the first frame, so the columns come
+ * from the window definitions rather than from whatever the exchange has
+ * answered so far. Cells fill in individually as their timeframe arrives; one
+ * slow or failed daily request leaves one column reading '--' instead of
+ * withholding the whole block.
+ */
+const pendingRanges = (): TerminalView['ranges'] =>
+  RANGE_WINDOWS.map(({ label }) => ({
+    label,
+    high: NO_VALUE,
+    low: NO_VALUE,
+    atr: NO_VALUE,
+  }));
+
+/** What has arrived, laid into the full set of columns. */
+const mergeRanges = (
+  measured: Array<{ label: string; high?: number; low?: number; atr?: number }>,
+  tick: (value: unknown) => string
+): TerminalView['ranges'] => {
+  const byLabel = new Map(measured.map((range) => [range.label, range]));
+
+  return RANGE_WINDOWS.map(({ label }) => {
+    const range = byLabel.get(label);
+    return {
+      label,
+      high: range?.high === undefined ? NO_VALUE : tick(range.high),
+      low: range?.low === undefined ? NO_VALUE : tick(range.low),
+      atr: range?.atr === undefined ? NO_VALUE : tick(range.atr),
+    };
+  });
+};
+
 export function emptyView(): TerminalView {
   return {
     header: {
@@ -97,7 +133,7 @@ export function emptyView(): TerminalView {
       funding: NO_VALUE,
       spread: NO_VALUE,
     },
-    ranges: [],
+    ranges: pendingRanges(),
     position: null,
     orders: [],
     chase: null,
@@ -157,7 +193,16 @@ export class Workspace {
   constructor(
     private client: ExchangeClient,
     private onCommand: (command: string) => Promise<void>,
-    private onQuit: () => void
+    private onQuit: () => void,
+    /**
+     * A question typed at the coach prompt.
+     *
+     * Routed separately from the command line all the way down. The two
+     * prompts mean different things and merging them anywhere -- including
+     * here, where it would be convenient -- is how a question ends up being
+     * parsed as an order.
+     */
+    private onCoach: (question: string) => Promise<void> = async () => {}
   ) {}
 
   start(market: string): void {
@@ -175,7 +220,7 @@ export class Workspace {
     view.header.exchange = this.client.getSelectedExchangeName() ?? NO_VALUE;
     view.header.connection = 'CONNECTED';
 
-    this.screen = new Screen(view, this.onCommand, this.onQuit);
+    this.screen = new Screen(view, this.onCommand, this.onQuit, this.onCoach);
     this.screen.start();
 
     ActivityLog.getInstance().add('SYSTEM', `Connected to ${view.header.exchange}`);
@@ -221,8 +266,13 @@ export class Workspace {
     const thread = guard.getThread();
     const active = guard.activeFindings();
 
+    // Told each time the panel is drawn, so a resized terminal changes where
+    // the next reply's blocks are cut. Only the frame knows the column.
+    const screen = this.screen;
+    if (screen) thread.setPaneWidth(coachProseWidth(screen.size()));
+
     return {
-      coach: thread.all().map(({ kind, text }) => ({ kind, text })),
+      coach: thread.all().map(({ kind, text, blocks }) => ({ kind, text, blocks })),
       coachBusy: thread.busy(),
       guard: {
         count: active.length,
@@ -264,6 +314,10 @@ export class Workspace {
 
   setMarket(market: string): void {
     this.market = market;
+    // The transcript says what was being traded while it was being said. A
+    // conversation about sizing reads very differently against SOL than
+    // against BTC, and the market is not in the words.
+    this.client.getGuard().getThread().setSubject(market);
     // The figures are account-level but their unit follows the market's
     // settlement currency, so they are cleared until the next refresh rather
     // than shown against the previous market's unit.
@@ -346,15 +400,24 @@ export class Workspace {
       const chaseOrderId = this.client.getCurrentChaseOrderId();
       const chaseDeadline = this.client.getChaseDeadline();
 
+      // Signed from the operator's side, so the panel can say whether the next
+      // payment is money leaving or arriving rather than only how much it is.
+      const signedNotional =
+        position && position.notional !== undefined
+          ? position.side === 'SHORT'
+            ? -position.notional
+            : position.notional
+          : undefined;
+      const cost = this.client.fundingCost(this.market, signedNotional);
+      // The period stays on the value even though it is always a day: every
+      // other figure in POSITION is a point-in-time reading, and a rate sitting
+      // among them with no period reads as a total.
+      const fundingCost = cost ? `${signed(cost.daily)}/24h` : undefined;
+
       this.screen.update({
         ...this.coachState(),
         header: this.header(),
-        ranges: ranges.map(({ label, high, low, atr }) => ({
-          label,
-          high: tick(high),
-          low: tick(low),
-          atr: tick(atr),
-        })),
+        ranges: mergeRanges(ranges, tick),
         market: {
           symbol,
           last: tick(price.last),
@@ -397,82 +460,35 @@ export class Workspace {
                   ? `${position.effectiveLeverage.toFixed(2)}x`
                   : NO_VALUE,
               liquidation: dash(position.liquidation),
+              funding: fundingCost,
+              fundingCurrency: cost?.currency,
             }
           : null,
-        orders: (this.lastOrders = orders.map((order) => {
-          const info = (order as any).info ?? {};
-          const trigger = (order as any).triggerPrice ?? info.stopPxRp ?? info.stopPxEp;
-          const size = Number(order.remaining ?? order.amount ?? 0);
-          const isTrigger = trigger !== undefined && Number(trigger) > 0;
-
-          // What the order is, kept separate from where it is in its life. The
-          // exchange conflates the two; the distinction is ours to present.
-          const type = isTrigger
-            ? 'STOP'
-            : String(order.type ?? 'LIMIT').toUpperCase();
-
-          // A trailing stop is a stop the exchange keeps moving. Without this
-          // it is indistinguishable from a fixed one in the panel, so there is
-          // no way to tell from the screen whether the trail actually took.
-          const peg = Number(info.pegOffsetValueRp ?? info.pegOffsetValueEp ?? 0);
-          const isTrailing =
-            peg !== 0 &&
-            String(info.pegPriceType ?? '').toLowerCase().includes('trailing');
-
-          // A trail this application moves, as opposed to one the exchange
-          // runs at a fixed distance. It carries no peg -- to the exchange it
-          // is an ordinary stop -- so the tag is the only thing that
-          // distinguishes it, and the distinction matters: only one of the two
-          // adjusts itself.
-          // A trail this application is responsible for. Before it arms it is
-          // an ordinary stop that will become a trail; after, it is one being
-          // moved. Those are different enough to show differently, since only
-          // one of them is going anywhere.
-          const tag = readTrailTag((order as any).clientOrderId ?? info.clOrdID);
-          const waiting =
-            tag?.armPrice !== undefined && !this.client.isTrailArmed(String(order.id));
-
-          const filled = Number(order.filled ?? 0);
-          const status = isTrigger
-            ? 'WORKING'
-            : filled > 0 && size > 0
-            ? 'PARTIAL'
-            : String(order.status ?? 'open').toLowerCase() === 'open'
-            ? 'WORKING'
-            : String(order.status ?? '').toUpperCase();
-
-          return {
-            id: String(order.id ?? '').slice(0, 8),
-            side: String(order.side ?? '').toUpperCase(),
-            // An order covering the whole position carries a quantity of zero.
-            // 'ALL' says what that means; '0' reads as an empty order.
-            qty: size > 0 ? formatQuantity(size) : isTrigger ? 'ALL' : NO_VALUE,
-            price: isTrigger
-              ? tick(trigger)
-              : order.price !== undefined
-              ? tick(order.price)
+        orders: (this.lastOrders = describeOrders(orders, {
+          isTrailArmed: (id) => this.client.isTrailArmed(id),
+          chaseOrderId,
+        }).map((view) => ({
+          id: view.id.slice(0, 8),
+          side: view.side,
+          // An order covering the whole position carries a quantity of zero.
+          // 'ALL' says what that means; '0' reads as an empty order.
+          qty: view.wholePosition
+            ? 'ALL'
+            : view.quantity !== undefined
+              ? formatQuantity(view.quantity)
               : NO_VALUE,
-            type,
-            status,
-            // Only while a chase is actually running and working this order.
-            // CHASE is checked first: it means this process is working the
-            // order, which is a stronger claim than the exchange trailing it.
-            managed:
-              chaseOrderId && order.id === chaseOrderId
-                ? 'CHASE'
-                : waiting
-                ? 'ARM'
-                : tag?.kind === 'atr'
-                ? 'ATR'
-                : tag !== undefined || isTrailing
-                ? 'TRAIL'
-                : undefined,
-            expires:
-              chaseOrderId && order.id === chaseOrderId && chaseDeadline
-                ? countdown(chaseDeadline)
-                : undefined,
-          };
-        })),
+          price:
+            view.trigger !== undefined
+              ? tick(view.trigger)
+              : view.price !== undefined
+                ? tick(view.price)
+                : NO_VALUE,
+          type: view.type,
+          status: view.status,
+          managed: view.managed,
+          expires:
+            view.managed === 'CHASE' && chaseDeadline ? countdown(chaseDeadline) : undefined,
+        }))),
       });
     } catch (error) {
       ActivityLog.getInstance().add('WARNING', `Could not refresh: ${(error as Error).message}`);
