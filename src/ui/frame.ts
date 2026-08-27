@@ -1648,7 +1648,7 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
 
   /** A rule across the whole application: above the columns, and below them. */
   const fullBorder = (
-    opts: { edge?: 'top' | 'bottom'; coachTee?: 'down' | 'up' } = {}
+    opts: { edge?: 'top' | 'bottom'; coachTee?: 'down' | 'up' | 'cross' } = {}
   ): Line => {
     const left = opts.edge === 'top' ? box.tl : opts.edge === 'bottom' ? box.bl : box.teeRight;
     const right = opts.edge === 'top' ? box.tr : opts.edge === 'bottom' ? box.br : box.teeLeft;
@@ -1840,11 +1840,11 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
       lines.push(line);
     }
 
-    lines.push(leftBorder());
+    lines.push(coachInput.length === 1 ? fullBorder({ coachTee: 'cross' }) : leftBorder());
     lines.push(inputRow());
     lines.push(fullBorder({ edge: 'bottom', coachTee: 'up' }));
-    paintCoach(lines, coachTop, lines.length - 2 - (coachInput.length - 1));
-    paintCoachInputOverflow(lines, lines.length - 2);
+    paintCoach(lines, coachTop, lines.length - 2 - coachInput.length);
+    paintCoachInput(lines, lines.length - 2);
     return lines;
   }
 
@@ -2026,12 +2026,19 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   }
 
   // --- the two prompts, forming the bottom edge of the application --------
-  lines.push(leftBorder());
+  // A rule over both prompts, not just the left one.
+  //
+  // The trading prompt has always had one and the coach prompt had none, so the
+  // conversation ran straight into the thing being typed and the two halves of
+  // the bottom edge did not match. When the question is one line -- which it
+  // usually is -- this is a single rule across the frame with the divider
+  // crossing it, and the two prompts sit under it level with each other.
+  lines.push(coachInput.length === 1 ? fullBorder({ coachTee: 'cross' }) : leftBorder());
   lines.push(inputRow());
   lines.push(fullBorder({ edge: 'bottom', coachTee: 'up' }));
 
-  paintCoach(lines, coachTop, lines.length - 2 - (coachInput.length - 1));
-  paintCoachInputOverflow(lines, lines.length - 2);
+  paintCoach(lines, coachTop, lines.length - 2 - coachInput.length);
+  paintCoachInput(lines, lines.length - 2);
 
   return lines;
 
@@ -2077,8 +2084,25 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
    * above gives up a row for each one, and gets it back the moment the question
    * is sent.
    */
-  function paintCoachInputOverflow(rows: Line[], promptIndex: number): void {
-    if (!sidebar || coachInput.length <= 1) return;
+  function paintCoachInput(rows: Line[], promptIndex: number): void {
+    if (!sidebar) return;
+
+    // A wrapped question grows upward and its rule rises with it, so the text
+    // being typed always sits inside its own region rather than being cut off
+    // from its prompt by a line through the middle of it. At one row the rule
+    // is the frame-wide one already drawn above, and there is nothing to do.
+    if (coachInput.length > 1) {
+      const column = coachCol as number;
+      const rule = rows[promptIndex - coachInput.length];
+      if (rule) {
+        rule.put(
+          column,
+          box.teeRight + box.h.repeat(Math.max(0, width - column - 2)) + box.teeLeft,
+          undefined,
+          width
+        );
+      }
+    }
 
     for (let index = 0; index < coachInput.length - 1; index++) {
       const target = promptIndex - (coachInput.length - 1) + index;
