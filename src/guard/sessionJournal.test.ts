@@ -6,6 +6,7 @@ import {
   FillEvent,
   JournalEvent,
   OpenPosition,
+  SessionJournal,
 } from './sessionJournal.js';
 
 let failures = 0;
@@ -180,6 +181,41 @@ snapshot = deriveSnapshot([fill('sell', 1, 110, 2000), fill('buy', 1, 100, 1000)
 check('   events arriving out of order are replayed in the order they happened',
   snapshot.trades.length === 1 && near(snapshot.trades[0]?.realizedPnl, 10),
   `trades=${snapshot.trades.length} pnl=${snapshot.trades[0]?.realizedPnl}`);
+
+// --- replayed fills --------------------------------------------------------
+// The order feed replays recent history whenever it reconnects, and each reader
+// of it starts out believing nothing has filled yet. Before the fills carried an
+// identity this counted one session's trading five times over.
+const journal = new SessionJournal('/nonexistent-directory-for-tests');
+const replayed = {
+  type: 'fill' as const,
+  at: 1000,
+  market: 'X',
+  side: 'buy' as const,
+  size: 10,
+  price: 100,
+  orderId: 'o1',
+  filledTotal: 10,
+};
+
+journal.record(replayed);
+journal.record({ ...replayed });
+journal.record({ ...replayed });
+check('   a fill heard three times is counted once',
+  journal.all().length === 1, `events=${journal.all().length}`);
+
+// The next slice of the same order is a different fill, and must survive.
+journal.record({ ...replayed, at: 2000, size: 5, filledTotal: 15 });
+check('   a later slice of the same order is not mistaken for a repeat',
+  journal.all().length === 2, `events=${journal.all().length}`);
+
+// An unnamed fill has nothing to key on, and is kept: counting a rare duplicate
+// beats dropping a real fill because it resembled another one.
+const unnamed = new SessionJournal('/nonexistent-directory-for-tests');
+unnamed.record({ type: 'fill', at: 1, market: 'X', side: 'buy', size: 1, price: 1 });
+unnamed.record({ type: 'fill', at: 1, market: 'X', side: 'buy', size: 1, price: 1 });
+check('   fills the feed did not name are kept rather than guessed at',
+  unnamed.all().length === 2, `events=${unnamed.all().length}`);
 
 console.log(`\n${failures === 0 ? 'PASS: all session-journal cases' : `FAIL: ${failures} case(s)`}\n`);
 process.exit(failures === 0 ? 0 : 1);
