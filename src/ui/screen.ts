@@ -7,7 +7,14 @@
 // history of rendered dashboards. The command line is drawn at a fixed row, so
 // incoming activity never moves it under the cursor mid-keystroke.
 
-import { renderPainted, TerminalView, MIN_WIDTH, MIN_HEIGHT } from './frame.js';
+import {
+  renderPainted,
+  coachPanelColumn,
+  coachInputRows,
+  TerminalView,
+  MIN_WIDTH,
+  MIN_HEIGHT,
+} from './frame.js';
 import { ActivityLog } from './activityLog.js';
 import { CommandHistory } from './commandHistory.js';
 
@@ -27,7 +34,15 @@ const MOUSE_OFF = `${ESC}[?1006l${ESC}[?1000l`;
 const WHEEL_UP = 64;
 const WHEEL_DOWN = 65;
 const SCROLL_STEP = 3;
-const MOUSE_EVENT = /\x1b\[<(\d+);\d+;\d+[Mm]/g;
+// The column is captured as well as the button: which panel the pointer is over
+// decides what the wheel scrolls.
+const MOUSE_EVENT = /\x1b\[<(\d+);(\d+);\d+[Mm]/g;
+
+// Shift with the arrows scrolls the coach wherever it happens to be sitting.
+// The wheel can only find it when it has a panel of its own, and below a wide
+// terminal it does not.
+const COACH_UP = `${ESC}[1;2A`;
+const COACH_DOWN = `${ESC}[1;2B`;
 
 const at = (row: number, col: number) => `${ESC}[${row + 1};${col + 1}H`;
 
@@ -35,21 +50,36 @@ const at = (row: number, col: number) => `${ESC}[${row + 1};${col + 1}H`;
 const INPUT_COL = 4;
 
 export type CommandHandler = (command: string) => void | Promise<void>;
+/** A question typed at the coach prompt, which never reaches the exchange. */
+export type CoachHandler = (question: string) => void | Promise<void>;
 export type ConfirmHandler = (accepted: boolean) => void | Promise<void>;
 
 export class Screen {
   private view: TerminalView;
   private running = false;
   private input = '';
+  private coachInput = '';
+  /**
+   * Which prompt a keystroke reaches.
+   *
+   * The two prompts do categorically different things -- one sends orders, the
+   * other asks questions -- so they are never merged, and something has to say
+   * which is listening. Tab moves between them, which is what Tab does
+   * everywhere else, and the focused prompt keeps the cyan caret so the answer
+   * is on screen rather than in the operator's memory.
+   */
+  private focus: 'command' | 'coach' = 'command';
   private history = new CommandHistory();
   private pendingConfirm: ConfirmHandler | null = null;
   private repaintQueued = false;
   private activityOffset = 0;
+  private coachOffset = 0;
 
   constructor(
     initial: TerminalView,
     private onCommand: CommandHandler,
-    private onQuit: () => void
+    private onQuit: () => void,
+    private onCoach: CoachHandler = () => {}
   ) {
     this.view = initial;
   }
@@ -65,6 +95,11 @@ export class Screen {
     this.history.load();
 
     const log = ActivityLog.getInstance();
+    // Kept on disk from the moment there is a workspace to fill. The panel
+    // holds five hundred events and a busy session overruns that inside an
+    // hour; what scrolls off the top is the part of the day nobody can go back
+    // and look at.
+    log.persistTo();
     log.captureConsole();
     log.onChange(() => this.scheduleRepaint());
 
@@ -121,7 +156,8 @@ export class Screen {
     });
   }
 
-  private size() {
+  /** The frame's dimensions, which the workspace needs to size the coach column. */
+  size() {
     // One column short of the terminal: writing into the final column makes most
     // terminals wrap to the next line, which breaks the frame's right edge.
     return {
@@ -136,8 +172,11 @@ export class Screen {
     const view: TerminalView = {
       ...this.view,
       input: this.input,
+      coachInput: this.coachInput,
+      focus: this.focus,
       activity: ActivityLog.getInstance().visible(),
       activityOffset: this.activityOffset,
+      coachOffset: this.coachOffset,
     };
 
     const lines = renderPainted(view, this.size());
@@ -149,10 +188,25 @@ export class Screen {
     });
     out += CLEAR_BELOW; // clear anything below a shorter frame
 
-    // The command row is third from the bottom: border, command, border, footer,
-    // border. Put the real cursor after the text rather than drawing a glyph.
-    const commandRow = lines.length - 4;
-    out += at(commandRow, INPUT_COL + this.input.length) + CURSOR_SHOW;
+    // The prompts are second from the bottom now that the command-reference
+    // footer is gone: border, the two prompts, bottom border. The real cursor is
+    // parked in whichever one has focus rather than a glyph being drawn for it.
+    const promptRow = lines.length - 2;
+
+    // The coach prompt wraps upward, so the cursor belongs at the end of its
+    // last row rather than at the end of the whole string -- which, once the
+    // question had wrapped, was a column well past the frame's right edge.
+    // Wrapped by the same function the frame paints with, so the two cannot
+    // disagree about where the next character lands.
+    const column =
+      this.focus === 'coach'
+        ? (coachPanelColumn(this.size()) ?? 0) + INPUT_COL
+        : INPUT_COL;
+    const typed =
+      this.focus === 'coach'
+        ? (coachInputRows(this.size(), this.coachInput).rows.pop() ?? '')
+        : this.input;
+    out += at(promptRow, column + typed.length) + CURSOR_SHOW;
 
     process.stdout.write(out);
   }
@@ -171,11 +225,32 @@ export class Screen {
         this.onQuit();
         return;
 
+      case '\t':
+        // Only where there is a second prompt to reach. On a terminal too
+        // narrow for the sidebar, Tab would move focus somewhere invisible.
+        if (coachPanelColumn(this.size()) !== null) {
+          this.focus = this.focus === 'command' ? 'coach' : 'command';
+          this.scheduleRepaint();
+        }
+        return;
+
       case '\r':
       case '\n': {
+        if (this.focus === 'coach') {
+          const question = this.coachInput.trim();
+          this.coachInput = '';
+          // Back to the newest exchange: the answer to what was just asked is
+          // the thing worth looking at, and it lands at the bottom.
+          this.coachOffset = 0;
+          if (question.length > 0) void this.onCoach(question);
+          this.scheduleRepaint();
+          return;
+        }
+
         const command = this.input.trim();
         this.input = '';
         this.activityOffset = 0;
+        this.coachOffset = 0;
         if (command.length > 0) {
           this.history.add(command);
           void this.onCommand(command);
@@ -187,21 +262,33 @@ export class Screen {
 
       case '\x7f':
       case '\b':
-        this.input = this.input.slice(0, -1);
+        if (this.focus === 'coach') this.coachInput = this.coachInput.slice(0, -1);
+        else this.input = this.input.slice(0, -1);
         this.scheduleRepaint();
         return;
 
       case '\x15': // Ctrl+U
-        this.input = '';
+        if (this.focus === 'coach') this.coachInput = '';
+        else this.input = '';
         this.scheduleRepaint();
         return;
 
       case '\x1b[A': // up
-        this.recall(-1);
+        // History belongs to the command line. The coach prompt has none: a
+        // recalled question is worth retyping and a recalled order is not.
+        if (this.focus === 'command') this.recall(-1);
         return;
 
       case '\x1b[B': // down
-        this.recall(1);
+        if (this.focus === 'command') this.recall(1);
+        return;
+
+      case COACH_UP:
+        this.scrollCoach(SCROLL_STEP);
+        return;
+
+      case COACH_DOWN:
+        this.scrollCoach(-SCROLL_STEP);
         return;
 
       default:
@@ -213,7 +300,8 @@ export class Screen {
 
     const printable = [...data].filter((ch) => ch >= ' ' && ch !== '\x7f').join('');
     if (printable.length > 0) {
-      this.input += printable;
+      if (this.focus === 'coach') this.coachInput += printable;
+      else this.input += printable;
       this.scheduleRepaint();
     }
   };
@@ -222,19 +310,28 @@ export class Screen {
   private handleMouse(data: string): boolean {
     if (!data.includes(`${ESC}[<`)) return false;
 
+    // Where the coach panel starts, so a wheel event over it scrolls the thread
+    // rather than the log underneath the pointer's other half of the screen.
+    const coachColumn = coachPanelColumn(this.size());
+
     MOUSE_EVENT.lastIndex = 0;
     let match: RegExpExecArray | null;
     let moved = false;
 
     while ((match = MOUSE_EVENT.exec(data)) !== null) {
       const button = Number(match[1]);
-      if (button === WHEEL_UP) {
-        this.activityOffset += SCROLL_STEP;
-        moved = true;
-      } else if (button === WHEEL_DOWN) {
-        this.activityOffset = Math.max(0, this.activityOffset - SCROLL_STEP);
-        moved = true;
+      if (button !== WHEEL_UP && button !== WHEEL_DOWN) continue;
+
+      // Terminals report columns from one; the frame counts them from zero.
+      const column = Number(match[2]) - 1;
+      const step = button === WHEEL_UP ? SCROLL_STEP : -SCROLL_STEP;
+
+      if (coachColumn !== null && column > coachColumn) {
+        this.coachOffset = Math.max(0, this.coachOffset + step);
+      } else {
+        this.activityOffset = Math.max(0, this.activityOffset + step);
       }
+      moved = true;
     }
 
     if (moved) this.scheduleRepaint();
@@ -242,6 +339,11 @@ export class Screen {
     // Swallow every mouse report, wheel or not, so button presses never land in
     // the command line as stray characters.
     return true;
+  }
+
+  private scrollCoach(step: number): void {
+    this.coachOffset = Math.max(0, this.coachOffset + step);
+    this.scheduleRepaint();
   }
 
   private recall(direction: number): void {

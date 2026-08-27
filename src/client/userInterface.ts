@@ -329,7 +329,14 @@ export class UserInterface {
       async (command: string) => {
         await this.handleCommand(command.trim());
       },
-      () => this.quit()
+      () => this.quit(),
+      // Sent through the same dispatcher as a typed 'coach ...' so that a
+      // question asked at the prompt is journalled, rate-limited and answered
+      // by exactly the path a typed one takes. The prompts are separate; what
+      // happens after they are read should not be.
+      async (question: string) => {
+        await this.handleCommand(`coach ${question}`);
+      }
     );
 
     if (this.currentMarket) {
