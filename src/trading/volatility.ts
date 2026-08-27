@@ -6,9 +6,16 @@
 // sized from these decides when a position is closed, so the arithmetic is kept
 // somewhere it can be tested directly rather than inferred from live behaviour.
 
-/** One closed candle. Open and volume are not needed to measure range. */
+/**
+ * One candle.
+ *
+ * Open is optional because nothing here measures with it -- true range is high,
+ * low and the previous close -- but the coach is shown candles as candles, and
+ * a bar without its open cannot be read as one.
+ */
 export interface Candle {
   timestamp: number;
+  open?: number;
   high: number;
   low: number;
   close: number;
