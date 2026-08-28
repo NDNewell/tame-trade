@@ -912,6 +912,22 @@ export class ExchangeClient {
    * so an exchange that publishes a candle a moment late is retried rather
    * than polled flat out.
    */
+  /** Requests already on the wire, so five callers share one of them. */
+  private candleInFlight = new Map<string, Promise<Candle[]>>();
+  /** Series that just failed, and when they may be asked for again. */
+  private candleFailure = new Map<string, number>();
+  /**
+   * How long a failed series is left alone.
+   *
+   * The reason this exists is a feedback loop rather than politeness. A throw
+   * never populated the cache, so a series that failed was re-requested by
+   * every pass that wanted it -- and once the rate limiter's queue backs up,
+   * every candle fetch fails, which means every pass asks again, which fills
+   * the queue further. The client talked itself into 'throttle queue is over
+   * maxCapacity (1000)' and stayed there.
+   */
+  private static readonly CANDLE_RETRY_MS = 30_000;
+
   private async getCandles(
     market: string,
     timeframe: string,
@@ -930,7 +946,37 @@ export class ExchangeClient {
     const cached = this.candleCache.get(key);
     if (cached && Date.now() < cached.until) return cached.candles;
 
-    const raw = await this.exchange!.fetchOHLCV(market, timeframe, undefined, limit);
+    // Recently failed. Whatever is held stands, and nothing goes on the wire.
+    const quiet = this.candleFailure.get(key);
+    if (quiet !== undefined && Date.now() < quiet) return cached?.candles ?? [];
+
+    // The range panel, the ATR cache and the coach's history all want the same
+    // series, and before this they each asked for it. One request, shared.
+    const already = this.candleInFlight.get(key);
+    if (already) return already;
+
+    const request = this.fetchCandleSeries(market, timeframe, limit, key).finally(() => {
+      this.candleInFlight.delete(key);
+    });
+    this.candleInFlight.set(key, request);
+    return request;
+  }
+
+  /** The work behind getCandles. Always goes to the exchange. */
+  private async fetchCandleSeries(
+    market: string,
+    timeframe: string,
+    limit: number,
+    key: string
+  ): Promise<Candle[]> {
+    let raw: unknown[];
+    try {
+      raw = await this.exchange!.fetchOHLCV(market, timeframe, undefined, limit);
+    } catch (error) {
+      this.candleFailure.set(key, Date.now() + ExchangeClient.CANDLE_RETRY_MS);
+      throw error;
+    }
+    this.candleFailure.delete(key);
 
     const candles = raw.map((row: any) => ({
       timestamp: Number(row[0]),
@@ -4241,14 +4287,40 @@ export class ExchangeClient {
    * bar of that size closes -- so the weekly series is read about once a week,
    * and the cost of the whole ladder amortises to almost nothing.
    */
+  private coachWarmRunning = false;
+  private coachWarmAt = 0;
+  /**
+   * How often the ladder is walked at all.
+   *
+   * Each series refuses to refetch until a bar of its own size has closed, so
+   * walking the ladder is usually free -- but 'usually' was doing the work.
+   * There was no guard against a second walk starting while the first was still
+   * going, and none against walking it again thirty seconds later, so a slow
+   * exchange turned one pass into several overlapping ones. A minute is more
+   * often than any series here can change.
+   */
+  private static readonly COACH_WARM_MS = 60_000;
+
   async warmCoachCandles(market?: string): Promise<void> {
     const symbol = market ?? this.lastFollowedMarket;
     if (!symbol || !this.exchange) return;
 
-    for (const { timeframe, count } of ExchangeClient.COACH_SERIES) {
-      await this.getCandles(symbol, timeframe, ExchangeClient.coachDepth(count)).catch(
-        () => undefined
-      );
+    // One walk at a time, and not again straight away. Both matter: the first
+    // stops passes overlapping when the exchange is slow, the second stops the
+    // sweep asking every thirty seconds for series that change hourly.
+    if (this.coachWarmRunning) return;
+    if (Date.now() - this.coachWarmAt < ExchangeClient.COACH_WARM_MS) return;
+
+    this.coachWarmRunning = true;
+    try {
+      for (const { timeframe, count } of ExchangeClient.COACH_SERIES) {
+        await this.getCandles(symbol, timeframe, ExchangeClient.coachDepth(count)).catch(
+          () => undefined
+        );
+      }
+    } finally {
+      this.coachWarmRunning = false;
+      this.coachWarmAt = Date.now();
     }
   }
 
