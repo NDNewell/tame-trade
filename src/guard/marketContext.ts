@@ -102,16 +102,55 @@ const signed = (value: number | undefined, digits = 2): string | undefined => {
  */
 const coarse = (timeframe: string): boolean => /[dwM]$/.test(timeframe);
 
-/** UTC, and to the minute unless the candles are daily or larger. */
+/**
+ * A candle's time, on the clock the reader is actually using.
+ *
+ * Intraday bars are stamped in local time. The exchange sends UTC and this
+ * block used to pass it straight through, so the coach would discuss "the 08-27
+ * 08:00 four-hour low" while the screen beside it said 02:00 -- and every other
+ * time in the application, the activity log and the session history included,
+ * is already local.
+ *
+ * Daily bars and coarser keep the exchange's date, and that is not an
+ * inconsistency. A daily bar opens at 00:00 UTC and is *named* by that day
+ * everywhere price is discussed; six hours west of UTC it starts at 18:00 the
+ * evening before, so converting its label renames it. Calling the 08-26 daily
+ * bar "08-25" would put every level the coach cites one day out from every
+ * chart the operator could check it against.
+ */
 function stamp(at: number, daily: boolean): string {
   const when = new Date(at);
-  const date = `${when.getUTCFullYear()}-${String(when.getUTCMonth() + 1).padStart(2, '0')}-${String(
-    when.getUTCDate()
+
+  if (daily) {
+    return `${when.getUTCFullYear()}-${String(when.getUTCMonth() + 1).padStart(2, '0')}-${String(
+      when.getUTCDate()
+    ).padStart(2, '0')}`;
+  }
+
+  const date = `${String(when.getMonth() + 1).padStart(2, '0')}-${String(when.getDate()).padStart(
+    2,
+    '0'
+  )}`;
+  return `${date} ${String(when.getHours()).padStart(2, '0')}:${String(
+    when.getMinutes()
   ).padStart(2, '0')}`;
-  if (daily) return date;
-  return `${date.slice(5)} ${String(when.getUTCHours()).padStart(2, '0')}:${String(
-    when.getUTCMinutes()
-  ).padStart(2, '0')}`;
+}
+
+/**
+ * What to call the clock, so nothing has to guess at it.
+ *
+ * Named rather than left implicit: a candle stamped 02:00 with no zone beside
+ * it invites the reader to assume the exchange's, and the whole point of the
+ * change is that it is not.
+ */
+function zoneLabel(at: number): string {
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const offset = -new Date(at).getTimezoneOffset();
+  const sign = offset >= 0 ? '+' : '-';
+  const hours = String(Math.floor(Math.abs(offset) / 60)).padStart(2, '0');
+  const minutes = String(Math.abs(offset) % 60).padStart(2, '0');
+
+  return `${zone ? `${zone}, ` : ''}UTC${sign}${hours}:${minutes}`;
 }
 
 /**
@@ -134,7 +173,10 @@ export function describeMarket(context: MarketContext, includeCandles = true): s
     num(context.spread) && `spread ${num(context.spread)}`,
   ].filter(Boolean);
 
-  out.push(`MARKET, read at ${stamp(context.at, false)} UTC`);
+  out.push(
+    `MARKET, read at ${stamp(context.at, false)} — clock times are the ` +
+      `operator's own (${zoneLabel(context.at)})`
+  );
   out.push(top.join('  '));
   if (context.funding) out.push(`funding ${context.funding}`);
 
@@ -210,7 +252,12 @@ export function describeMarket(context: MarketContext, includeCandles = true): s
 
   if (includeCandles && context.series.length > 0) {
     out.push('');
-    out.push('CANDLES  open high low close, oldest first, times UTC');
+    out.push(
+      'CANDLES  open high low close, oldest first. Times on the intraday sizes ' +
+        "are the operator's local clock; daily and larger keep the date the " +
+        'exchange names the bar by, because that is what the bar is called ' +
+        'everywhere price is discussed.'
+    );
     out.push(
       'Each size is listed with how many bars it carries and the span they ' +
         'cover, so a level can be judged against how long price has respected it.'
@@ -239,8 +286,8 @@ export function describeMarket(context: MarketContext, includeCandles = true): s
       for (const candle of series.candles) {
         const when = new Date(candle.at);
         const date = stamp(candle.at, true);
-        const clock = `${String(when.getUTCHours()).padStart(2, '0')}:${String(
-          when.getUTCMinutes()
+        const clock = `${String(when.getHours()).padStart(2, '0')}:${String(
+          when.getMinutes()
         ).padStart(2, '0')}`;
 
         const label = daily
