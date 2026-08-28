@@ -19,7 +19,6 @@
 
 import { BehaviourId, atLeast } from './behaviours.js';
 import { Coach, ThreadTurn } from './coach.js';
-import { CoachBlock } from '../ui/coachBlocks.js';
 import { CoachLog, CoachOccasion } from './coachLog.js';
 import { Finding } from './guardrails.js';
 import { MarketContext } from './marketContext.js';
@@ -38,20 +37,7 @@ export interface CoachEntry {
   kind: CoachEntryKind;
   text: string;
   at: number;
-  /**
-   * The reply as the coach divided it, when it arrived divided.
-   *
-   * `text` is kept alongside because it is what the transcript stores and what
-   * a later turn is shown as history: a conversation reads back as prose, not
-   * as a structure. The blocks are for the panel, which is the only thing that
-   * needs to know where one point ends.
-   */
-  blocks?: CoachBlock[];
 }
-
-/** Blocks rendered back to prose, for the archive and for the model's own history. */
-export const blocksToText = (blocks: CoachBlock[]): string =>
-  blocks.map((block) => block.text).join('\n\n');
 
 export interface CoachThreadOptions {
   coach: Coach;
@@ -100,15 +86,6 @@ export class CoachThread {
   private now: () => number;
   private nudgeIntervalMs: number;
   private log: CoachLog | undefined;
-  /**
-   * How wide the panel's prose column is.
-   *
-   * Told to the coach so a block's length limit is measured in rows of the
-   * panel it is actually going into. A default is carried for tests and for the
-   * moment before the workspace has drawn itself; being a few columns out costs
-   * a split in a slightly different place and nothing else.
-   */
-  private paneWidthColumns = 40;
   /** Stamped onto each turn so a transcript says what was being traded. */
   private subject: string | undefined;
 
@@ -134,14 +111,6 @@ export class CoachThread {
     this.log = log;
   }
 
-  paneWidth(): number {
-    return this.paneWidthColumns;
-  }
-
-  /** The panel's prose width, as the frame worked it out. */
-  setPaneWidth(width: number): void {
-    if (Number.isFinite(width) && width >= 8) this.paneWidthColumns = Math.floor(width);
-  }
 
   /** Which market the conversation is about, for the record. */
   setSubject(market: string | undefined): void {
@@ -218,18 +187,14 @@ export class CoachThread {
       const market = await this.market(0).catch(() => undefined);
 
       const written = await this.coach
-        .converse(text, history, this.snapshot(), this.findings(), market, this.paneWidthColumns)
+        .converse(text, history, this.snapshot(), this.findings(), market)
         .catch(() => undefined);
 
-      if (written === undefined) {
-        this.push(
-          'system',
-          'The coach could not answer that one. The numbers above are unchanged.',
-          'answer'
-        );
-      } else {
-        this.push('coach', blocksToText(written), 'answer', undefined, written);
-      }
+      this.push(
+        written === undefined ? 'system' : 'coach',
+        written ?? 'The coach could not answer that one. The numbers above are unchanged.',
+        'answer'
+      );
     } finally {
       this.inFlight--;
       this.revision++;
@@ -293,9 +258,9 @@ export class CoachThread {
    * voice -- which is what it used to be, and which is why it rendered without
    * a speaker or any structure at all.
    */
-  speak(blocks: CoachBlock[], occasion: CoachOccasion = 'debrief'): void {
-    if (blocks.length === 0) return;
-    this.push('coach', blocksToText(blocks), occasion, undefined, blocks);
+  speak(text: string, occasion: CoachOccasion = 'debrief'): void {
+    if (!text.trim()) return;
+    this.push('coach', text, occasion);
   }
 
   clear(): void {
@@ -315,11 +280,10 @@ export class CoachThread {
     kind: CoachEntryKind,
     text: string,
     occasion: CoachOccasion = 'system',
-    behaviour?: string,
-    blocks?: CoachBlock[]
+    behaviour?: string
   ): void {
     const at = this.now();
-    this.entries.push({ kind, text, at, blocks });
+    this.entries.push({ kind, text, at });
     if (this.entries.length > MAX_ENTRIES) this.entries.shift();
     this.revision++;
 

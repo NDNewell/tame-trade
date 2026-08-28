@@ -6,7 +6,7 @@
 import { ExchangeClient } from '../exchange/exchangeClient.js';
 import { ActivityLog } from './activityLog.js';
 import { Screen } from './screen.js';
-import { ConfirmationView, NO_VALUE, TerminalView, coachProseWidth } from './frame.js';
+import { ConfirmationView, NO_VALUE, TerminalView } from './frame.js';
 import { PositionRiskResult } from '../trading/positionRisk.js';
 import { RANGE_WINDOWS } from '../trading/volatility.js';
 import { describeOrders } from '../trading/orderView.js';
@@ -266,13 +266,9 @@ export class Workspace {
     const thread = guard.getThread();
     const active = guard.activeFindings();
 
-    // Told each time the panel is drawn, so a resized terminal changes where
-    // the next reply's blocks are cut. Only the frame knows the column.
-    const screen = this.screen;
-    if (screen) thread.setPaneWidth(coachProseWidth(screen.size()));
 
     return {
-      coach: thread.all().map(({ kind, text, blocks }) => ({ kind, text, blocks })),
+      coach: thread.all().map(({ kind, text }) => ({ kind, text })),
       coachBusy: thread.busy(),
       guard: {
         count: active.length,

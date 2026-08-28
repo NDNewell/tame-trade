@@ -780,7 +780,7 @@ export class UserInterface {
       this.workspace?.showCoach();
 
       const written = await guard.debrief().catch(() => undefined);
-      if (written && written.length > 0) thread.speak(written);
+      if (written) thread.speak(written);
       else thread.note('Nothing to say about this session yet.');
       this.workspace?.showCoach();
       return;
