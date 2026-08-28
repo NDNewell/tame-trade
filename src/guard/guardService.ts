@@ -14,7 +14,6 @@
 
 import { BehaviourId, BEHAVIOURS } from './behaviours.js';
 import { Coach, KeySource } from './coach.js';
-import { CoachBlock } from '../ui/coachBlocks.js';
 import { CoachLog } from './coachLog.js';
 import { CoachThread } from './coachThread.js';
 import { SessionHistory } from './history.js';
@@ -534,13 +533,8 @@ export class GuardService {
     return written ?? finding.detail;
   }
 
-  async debrief(findings: Finding[] = []): Promise<CoachBlock[] | undefined> {
-    return this.coach.debrief(
-      this.snapshot(),
-      findings,
-      await this.marketContext(0),
-      this.thread.paneWidth()
-    );
+  async debrief(findings: Finding[] = []): Promise<string | undefined> {
+    return this.coach.debrief(this.snapshot(), findings, await this.marketContext(0));
   }
 
   /** The catalogue entry behind a flag, for `guard explain`. */

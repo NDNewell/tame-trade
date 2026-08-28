@@ -22,12 +22,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 
 import { Finding } from './guardrails.js';
-import {
-  COACH_BLOCK_TYPES,
-  CoachBlock,
-  coachBlocks,
-  limitCoachBlocks,
-} from '../ui/coachBlocks.js';
 import { MarketContext, describeMarket } from './marketContext.js';
 import { SessionSnapshot } from './sessionJournal.js';
 
@@ -103,9 +97,11 @@ Plain sentences, second person, American spelling. Brevity is the point.
 
 OUTPUT
 
-You return blocks. Each block is one point, usually two sentences and rarely more than three — the panel is a narrow column, and a block that runs past about five lines is split in half by the application, which breaks the point you were making. Two full sentences beat four fragments. The application draws everything — spacing, headings, color — so write prose only: no markdown, no bullet characters, no headings of your own, no blank-line tricks.
+Write it as you would write it. Paragraphs where paragraphs help, a short list where the items really are separate, one sentence where that is the whole answer. There are no required sections and no headings you have to use; reach for one only where you would have reached for it anyway.
 
-Most blocks are "answer": ordinary prose, no heading. A short reply is one such block and nothing more. The named kinds — structure, action, risk, context, funding, sizing, session — are for a reply that genuinely covers separate ground, and a block takes one only if it is about that and nothing else. Labelling a direct answer turns it into a report. Lead with the answer; the ground it rests on follows.`;
+The panel is a narrow column of a terminal, so some things do not survive it. Blank lines between paragraphs, "- " at the start of a list item, and **bold** around a word or two are rendered as written. Tables, code fences, nested lists and long headings are flattened into prose instead, so do not build an answer that depends on them.
+
+Keep it short. This is read between trades, and a reply that fills the panel is one the operator will scroll past.`;
 
 /** One side of the coach thread, as the panel and the model both see it. */
 export interface ThreadTurn {
@@ -203,67 +199,6 @@ function marketBlock(market: MarketContext | undefined, candles = true): string 
 }
 
 /**
- * The shape a spoken reply must take.
- *
- * Constrained by the API rather than requested in the brief. Asking for blank
- * lines between points worked perhaps half the time -- a model being terse, or
- * answering something short, would return one paragraph, and the panel went
- * back to being a slab. A schema is not a request.
- *
- * `type` carries meaning rather than presentation: the renderer decides whether
- * a type earns a heading, what colour it takes, and how much space sits around
- * it. Nothing here says how anything looks, and none of it is ever shown to the
- * operator as written.
- */
-const REPLY_FORMAT = {
-  type: 'json_schema' as const,
-  schema: {
-    type: 'object',
-    properties: {
-      blocks: {
-        type: 'array',
-        minItems: 1,
-        // No maxItems: the API rejects it outright for arrays in an output
-        // format ('property maxItems is not supported'), and it does so as a
-        // 400 on every call rather than by ignoring the field -- so the ceiling
-        // is stated in the description, where the model reads it, instead.
-        description:
-          'The reply, split into the points it makes. One point per block, ' +
-          'usually two sentences and rarely more than three. A run of ' +
-          'single-sentence blocks reads as a list rather than an argument; a ' +
-          'block longer than about five short lines gets split and stops being ' +
-          'one point. At most six blocks in a reply.',
-        items: {
-          type: 'object',
-          properties: {
-            type: {
-              type: 'string',
-              enum: [...COACH_BLOCK_TYPES],
-              description:
-                "What the block is. 'answer' for ordinary prose, which is most " +
-                'of them and the only one a short reply needs. The named kinds ' +
-                'are for a reply that genuinely covers separate ground; use one ' +
-                'only when the block really is about that and nothing else.',
-            },
-            text: {
-              type: 'string',
-              description:
-                'The prose. Plain sentences, no markdown, no bullet characters, ' +
-                'no heading of your own -- the application draws the heading from ' +
-                'the type.',
-            },
-          },
-          required: ['type', 'text'],
-          additionalProperties: false,
-        },
-      },
-    },
-    required: ['blocks'],
-    additionalProperties: false,
-  },
-};
-
-/**
  * The web search tool, offered on the two calls that can afford it.
  *
  * Offered rather than required. It is a tool the model may decline, and the
@@ -327,36 +262,6 @@ function guardTurn(
     `and the corrective if the same sentence carries both. No question, no ` +
     `encouragement, no preamble.`
   );
-}
-
-/**
- * The whole blocks out of a reply that was cut off part-way through one.
- *
- * Deliberately a scan for complete objects rather than a JSON repair: guessing
- * where a truncated string was going to end means inventing the end of a
- * sentence about the operator's money. What survives intact is kept and the
- * rest is dropped.
- */
-export function salvageBlocks(text: string): CoachBlock[] {
-  if (!text.trimStart().startsWith('{') || !text.includes('"blocks"')) return [];
-
-  const out: CoachBlock[] = [];
-  const pattern = /\{\s*"type"\s*:\s*"([a-z]+)"\s*,\s*"text"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}/g;
-
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(text)) !== null) {
-    const type = (COACH_BLOCK_TYPES as readonly string[]).includes(match[1])
-      ? (match[1] as CoachBlock['type'])
-      : ('answer' as const);
-    try {
-      const body = JSON.parse(`"${match[2]}"`) as string;
-      if (body.trim()) out.push({ type, text: body.trim() });
-    } catch {
-      // One unreadable block costs one block, not the reply.
-    }
-  }
-
-  return out;
 }
 
 /** Where the key in use came from, or why there isn't one. */
@@ -428,9 +333,8 @@ export class Coach {
   async debrief(
     snapshot: SessionSnapshot,
     findings: Finding[] = [],
-    market?: MarketContext,
-    width = 40
-  ): Promise<CoachBlock[] | undefined> {
+    market?: MarketContext
+  ): Promise<string | undefined> {
     if (!this.client) return undefined;
 
     if (snapshot.trades.length === 0 && findings.length === 0) {
@@ -438,20 +342,15 @@ export class Coach {
       return undefined;
     }
 
-    return this.askBlocks(
+    return this.ask(
       `Here is the session's journal.\n\n${facts(snapshot, findings)}\n\n` +
         `And the market it was traded in.\n\n${marketBlock(market)}\n\n` +
-        // Budgeted in blocks rather than words. A word count and a block count
-        // are two ceilings on the same thing, and 'at most 150 words' across
-        // five blocks of two to four sentences is a contradiction the model has
-        // to resolve by ignoring one of them.
-        `Write the debrief in three to five blocks. Lead with the one thing that ` +
+        `Write the debrief. Lead with the one thing that ` +
         `most affected the outcome. If guardrails fired and were overridden, say ` +
         `what the journal shows happened next, without implying causation it does ` +
         `not support. Close with the single change worth making tomorrow, stated ` +
         `as an instruction rather than a suggestion.`,
       6000,
-      width,
       [],
       // The debrief already costs a pause, and 'what actually moved it today'
       // is half of what makes one worth reading.
@@ -498,9 +397,8 @@ export class Coach {
     history: ThreadTurn[],
     snapshot: SessionSnapshot,
     findings: Finding[] = [],
-    market?: MarketContext,
-    width = 40
-  ): Promise<CoachBlock[] | undefined> {
+    market?: MarketContext
+  ): Promise<string | undefined> {
     if (!this.client) return undefined;
 
     const turns: Anthropic.MessageParam[] = history.map((turn) => ({
@@ -508,21 +406,18 @@ export class Coach {
       content: turn.text,
     }));
 
-    return this.askBlocks(
+    return this.ask(
       `Here is the session as the journal has it.\n\n${facts(snapshot, findings)}\n\n` +
         `And the market as it stands.\n\n${marketBlock(market)}\n\n` +
         `The operator asks: ${question}\n\n` +
-        `Answer it. One or two blocks for a straightforward question; more only ` +
-        `if it genuinely covers separate ground, and never more than six. Ground ` +
-        `every claim in what you were shown or found; where the answer needs ` +
-        `something you have neither, name what is missing and answer the part ` +
-        `you can rather than guessing at the rest.`,
+        `Answer it. Ground every claim in what you were shown or found; where ` +
+        `the answer needs something you have neither, name what is missing and ` +
+        `answer the part you can rather than guessing at the rest.`,
       // Generous, because it is a ceiling rather than a target and because
       // running out of it is what produced a panel full of raw JSON: a search
       // spends output tokens on its queries before the answer starts, and a
       // reply cut off mid-string is a reply that cannot be parsed at all.
       8000,
-      width,
       turns,
       // A typed question is the one call where the operator is waiting on
       // purpose and where the answer may genuinely lie outside the terminal.
@@ -555,65 +450,10 @@ export class Coach {
    * network blip into a broken confirmation panel, and the panel's job -- to
    * show the operator an order before it is sent -- does not depend on it.
    */
-  /**
-   * A spoken reply, as blocks.
-   *
-   * Constrained to the schema, then checked anyway. A response that comes back
-   * unparseable, or as prose because the format was refused or unsupported, is
-   * put through the same text splitter the panel has always had rather than
-   * being dropped -- the operator asked a question and is owed the answer,
-   * laid out as well as it can be.
-   *
-   * `width` is the column the prose will be wrapped into, so the length limit
-   * is measured in rows of the panel it is actually going to.
-   */
-  private async askBlocks(
-    question: string,
-    maxTokens: number,
-    width: number,
-    history: Anthropic.MessageParam[] = [],
-    search = false
-  ): Promise<CoachBlock[] | undefined> {
-    const written = await this.ask(question, maxTokens, history, REPLY_FORMAT, search);
-    if (written === undefined) return undefined;
-
-    try {
-      const parsed = JSON.parse(written) as { blocks?: Array<{ type?: string; text?: string }> };
-      const blocks = (parsed.blocks ?? [])
-        .filter((block) => typeof block?.text === 'string' && block.text.trim().length > 0)
-        .map((block) => ({
-          // An unrecognised type is prose. It is a heading we would otherwise
-          // invent, and an invented heading is worse than none.
-          type: (COACH_BLOCK_TYPES as readonly string[]).includes(String(block.type))
-            ? (block.type as CoachBlock['type'])
-            : ('answer' as const),
-          text: String(block.text).trim(),
-        }));
-
-      // The model decided where the points divide; the application decides only
-      // how long one may run. Re-splitting them by subject here -- which is what
-      // the fallback splitter does -- broke coherent blocks into fragments.
-      if (blocks.length > 0) return limitCoachBlocks(blocks, width);
-    } catch {
-      // Not JSON, or not whole. Handled below.
-    }
-
-    // A reply cut off mid-string parses as nothing, and the raw text is the
-    // schema's own JSON -- which is exactly the formatting metadata that must
-    // never reach the operator. So the complete objects are recovered and the
-    // truncated tail is dropped: a slightly short answer beats a panel full of
-    // braces.
-    const salvaged = salvageBlocks(written);
-    if (salvaged.length > 0) return limitCoachBlocks(salvaged, width);
-
-    return coachBlocks(written, width);
-  }
-
   private async ask(
     question: string,
     maxTokens: number,
     history: Anthropic.MessageParam[] = [],
-    format?: typeof REPLY_FORMAT,
     search = false
   ): Promise<string | undefined> {
     if (!this.client) return undefined;
@@ -644,7 +484,7 @@ export class Coach {
         model: this.model,
         max_tokens: maxTokens,
         thinking: { type: 'adaptive' as const },
-        output_config: format ? { effort: 'medium' as const, format } : { effort: 'medium' as const },
+        output_config: { effort: 'medium' as const },
         system,
         messages: [
           ...history,

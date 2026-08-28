@@ -12,7 +12,7 @@
 // textual label so colour is never the only carrier of meaning.
 
 import { formatOutput as fo, Color, FontStyle } from '../utils/formatOutput.js';
-import { CoachBlock, CoachBlockType, coachBlocks, headingFor } from './coachBlocks.js';
+import { CoachNode, coachNodes } from './coachBlocks.js';
 import { wrapText } from './wrap.js';
 
 /** Below this the desktop composition can't hold together. */
@@ -169,14 +169,6 @@ export interface ConfirmationView {
 export interface CoachEntryView {
   kind: 'operator' | 'coach' | 'system';
   text: string;
-  /**
-   * The reply as the coach divided it, when it arrived divided.
-   *
-   * Preferred over `text` when present. `text` remains the fallback for the
-   * operator's own lines, for the panel's voice, and for a reply that came back
-   * as prose because the format was refused.
-   */
-  blocks?: CoachBlock[];
 }
 
 /**
@@ -838,20 +830,14 @@ const COACH_LABEL: Paint = { color: 'gray', font: 'bold' };
 const COACH_GUARD: Paint = { color: 'yellow', font: 'bold' };
 
 /**
- * How a section label inside a response is painted.
+ * A heading the coach chose to write, when it chose to write one.
  *
  * Unbolded, so it sits below the speaker label above it -- who is talking
- * outranks what they are talking about. Two of them borrow a hue the
- * application already spends on that meaning: a RISK heading is cautionary
- * information like Position Risk, and an ACTION heading names something live
- * like WORKING. The rest stay neutral, because inventing a colour for
- * 'STRUCTURE' would put a fifth meaning into a palette that has four.
+ * outranks what they are talking about -- and in the neutral shade, because the
+ * coach picks these words itself now and a palette that assigned meaning to
+ * them would be guessing at what it meant.
  */
-const coachSectionPaint = (type: CoachBlockType): Paint => {
-  if (type === 'risk') return 'yellow';
-  if (type === 'action') return 'cyan';
-  return 'gray';
-};
+const COACH_HEADING: Paint = 'gray';
 
 const blankCoachLine = (): CoachLine => ({ segments: [] });
 const plainCoachLine = (text: string, paint: Paint | undefined): CoachLine => ({
@@ -889,8 +875,23 @@ const COACH_TOKENS: Array<{ pattern: RegExp; paint: (match: string) => Paint | u
  * Earlier patterns win where two overlap, which is why the signed amount is
  * listed first: '-26.16 USDT' is a negative amount before it is anything else.
  */
-function coachSegments(text: string, base: Paint | undefined): CoachSegment[] {
+function coachSegments(
+  text: string,
+  base: Paint | undefined,
+  emphasis: string[] = []
+): CoachSegment[] {
   const claims: Array<{ start: number; end: number; paint: Paint | undefined }> = [];
+
+  // What the coach asked to be emphasised, claimed first so a value inside a
+  // bolded phrase still takes its own colour rather than the phrase's weight.
+  for (const phrase of emphasis) {
+    if (phrase.length === 0) continue;
+    let from = text.indexOf(phrase);
+    while (from !== -1) {
+      claims.push({ start: from, end: from + phrase.length, paint: { color: 'brightWhite' } });
+      from = text.indexOf(phrase, from + phrase.length);
+    }
+  }
 
   for (const { pattern, paint } of COACH_TOKENS) {
     pattern.lastIndex = 0;
@@ -898,7 +899,20 @@ function coachSegments(text: string, base: Paint | undefined): CoachSegment[] {
     while ((match = pattern.exec(text)) !== null) {
       const start = match.index;
       const end = start + match[0].length;
-      if (claims.some((claim) => start < claim.end && end > claim.start)) continue;
+      // A value that falls inside an emphasised phrase takes the value's
+      // colour: '+8,139 USDT' is green wherever it appears, and the emphasis
+      // around it is the coach's way of pointing at it, not of recolouring it.
+      const inside = claims.findIndex(
+        (claim) => start >= claim.start && end <= claim.end
+      );
+      if (inside !== -1) {
+        const outer = claims[inside];
+        claims.splice(inside, 1);
+        if (outer.start < start) claims.push({ ...outer, end: start });
+        if (outer.end > end) claims.push({ ...outer, start: end });
+      } else if (claims.some((claim) => start < claim.end && end > claim.start)) {
+        continue;
+      }
       claims.push({ start, end, paint: paint(match[0]) });
     }
   }
@@ -921,23 +935,35 @@ function coachSegments(text: string, base: Paint | undefined): CoachSegment[] {
   return segments;
 }
 
-/** Lays one block into rows: its label, if it has one, then its prose. */
-function putCoachBlock(out: CoachLine[], block: CoachBlock, width: number): void {
-  const heading = headingFor(block.type);
-  if (heading) out.push(plainCoachLine(heading, coachSectionPaint(block.type)));
-  for (const row of wrapText(block.text, width)) {
-    out.push({ segments: coachSegments(row, COACH_TEXT) });
+/** Lays one piece of a reply into rows. */
+function putCoachNode(out: CoachLine[], node: CoachNode, width: number): void {
+  if (node.kind === 'heading') {
+    for (const row of wrapText(node.text, width)) out.push(plainCoachLine(row, COACH_HEADING));
+    return;
   }
+
+  // A list item hangs under its own first character rather than under the
+  // marker, so the marker column reads as a column.
+  const marker = node.kind === 'bullet';
+  const room = marker ? Math.max(1, width - 2) : width;
+
+  wrapText(node.text, room).forEach((row, index) => {
+    const segments = coachSegments(row, COACH_TEXT, node.emphasis);
+    out.push({
+      segments: marker
+        ? [{ text: index === 0 ? '· ' : '  ', paint: MUTED }, ...segments]
+        : segments,
+    });
+  });
 }
 
 /**
  * A speaker's turn: who said it, then what they said.
  *
- * The operator's own line is one block -- it is a question, and questions are
- * not structured. The coach's is however many blocks it separated its answer
- * into, one blank row between each, and that blank row is inserted here rather
- * than taken from the reply: the application owns the spacing, so a response
- * that arrived with none still reads with the same rhythm as one that did.
+ * The blank row between pieces is inserted here rather than taken from the
+ * reply, so the rhythm is the same whether or not the coach pressed return --
+ * but where it did press return, that is exactly where the break falls. The
+ * application owns the spacing; the coach owns the shape.
  */
 function coachTurn(
   out: CoachLine[],
@@ -945,8 +971,7 @@ function coachTurn(
   labelPaint: Paint,
   text: string,
   width: number,
-  structured: boolean,
-  given?: CoachBlock[]
+  structured: boolean
 ): void {
   out.push(plainCoachLine(label, labelPaint));
 
@@ -957,12 +982,17 @@ function coachTurn(
     return;
   }
 
-  // Divided by the coach where it said so, and by the block layer where it did
-  // not. Either way the blank row between blocks is put in here.
-  const blocks = given && given.length > 0 ? given : coachBlocks(text, width);
-  blocks.forEach((block, index) => {
-    if (index > 0) out.push(blankCoachLine());
-    putCoachBlock(out, block, width);
+  const nodes = coachNodes(text, width);
+  nodes.forEach((node, index) => {
+    // Consecutive list items belong to one list and are not separated; a
+    // heading sits directly above the thing it heads.
+    const previous = nodes[index - 1];
+    const joined =
+      previous !== undefined &&
+      ((previous.kind === 'bullet' && node.kind === 'bullet') || previous.kind === 'heading');
+
+    if (index > 0 && !joined) out.push(blankCoachLine());
+    putCoachNode(out, node, width);
   });
 }
 
@@ -1006,7 +1036,7 @@ function coachPaneLines(view: TerminalView, width: number): CoachLine[] {
       // conversation and giving it one implies it is.
       for (const row of wrapText(entry.text, width)) out.push(plainCoachLine(row, MUTED));
     } else {
-      coachTurn(out, 'COACH', COACH_LABEL, entry.text, width, true, entry.blocks);
+      coachTurn(out, 'COACH', COACH_LABEL, entry.text, width, true);
     }
   }
 
@@ -1133,13 +1163,15 @@ function windowCoach(lines: CoachLine[], rows: number, offset = 0): CoachLine[] 
   const window = lines.slice(Math.max(0, end - rows), end);
 
   // A window that happens to begin on a separator would spend its first row on
-  // nothing, so that one is dropped and the row goes back to the text above it.
-  while (window.length > 0 && coachLineText(window[0]).length === 0) {
-    const earlier = lines[end - window.length - 1];
-    window.shift();
-    if (earlier !== undefined) window.unshift(earlier);
-    else break;
-  }
+  // nothing, so leading separators are dropped.
+  //
+  // Dropped rather than backfilled. Pulling the line above in to replace one is
+  // what the first version did, and because it shifted and unshifted in the
+  // same step the window never got shorter -- two blank rows at the boundary
+  // put it in a loop that never ended, which in a renderer means the terminal
+  // stops. Losing a row to a gap is a far smaller price than that, and the gap
+  // only appears while the pane is scrolled.
+  while (window.length > 0 && coachLineText(window[0]).length === 0) window.shift();
 
   return window;
 }
