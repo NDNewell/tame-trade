@@ -362,8 +362,40 @@ export class Workspace {
     });
   }
 
+  /** Whether a refresh is still running, so the next tick does not stack on it. */
+  private refreshing = false;
+
+  /**
+   * One pass over the exchange, on a two-second timer.
+   *
+   * Guarded against overlapping itself, which is the whole of this comment.
+   * Each pass issues half a dozen requests, and the timer fired whether or not
+   * the previous pass had finished -- so the moment a pass took longer than two
+   * seconds, a second one started on top of it, then a third. Every pass in
+   * flight adds its requests to the same rate-limited queue, which makes each
+   * one slower, which starts more of them. That is not a slow client, it is a
+   * client accelerating away from an exchange that answers at a fixed rate, and
+   * it ends where it ended: 'throttle queue is over maxCapacity (1000)' and
+   * every read failing.
+   *
+   * A skipped tick costs two seconds of staleness. The alternative costs the
+   * session.
+   */
   private async refresh(): Promise<void> {
     if (!this.screen || !this.market) return;
+    if (this.refreshing) return;
+
+    this.refreshing = true;
+    try {
+      await this.refreshOnce();
+    } finally {
+      this.refreshing = false;
+    }
+  }
+
+  private async refreshOnce(): Promise<void> {
+    const screen = this.screen;
+    if (!screen || !this.market) return;
 
     // The full form, settlement suffix included. It is the only place the
     // market is named now, so it names it completely.
@@ -410,7 +442,7 @@ export class Workspace {
       // among them with no period reads as a total.
       const fundingCost = cost ? `${signed(cost.daily)}/24h` : undefined;
 
-      this.screen.update({
+      screen.update({
         ...this.coachState(),
         header: this.header(),
         ranges: mergeRanges(ranges, tick),

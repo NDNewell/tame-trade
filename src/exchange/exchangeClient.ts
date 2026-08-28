@@ -1761,6 +1761,7 @@ export class ExchangeClient {
       });
 
       state.filledSoFar.set(id, filled);
+      this.invalidatePosition(market);
 
       const complete =
         status === 'closed' ||
@@ -2317,7 +2318,55 @@ export class ExchangeClient {
     return marketInfo.precision.price ?? 0;
   }
 
+  /** Position reads on the wire, so simultaneous callers share one. */
+  private positionInFlight = new Map<string, Promise<Position | undefined>>();
+  private positionCache = new Map<string, { at: number; position: Position | undefined }>();
+  /**
+   * How long a position read is reused.
+   *
+   * Short enough that nothing on screen is visibly behind -- the panel repaints
+   * every two seconds and this is under one -- and long enough that the several
+   * things which each want the position during a single pass ask for it once.
+   * The workspace reads it directly and then reads it again inside the risk
+   * calculation, and the guard's market block wants it too, so one pass was
+   * three requests for one answer on the endpoint that was failing.
+   */
+  private static readonly POSITION_CACHE_MS = 900;
+
+  /**
+   * Drops the held position for a market.
+   *
+   * Called the moment a fill is seen. Under a second of staleness is invisible
+   * on a panel that repaints every two, but it is not invisible immediately
+   * after a fill -- that is exactly when the size on screen is being checked
+   * against what was just done, and showing the previous size for even half a
+   * second there is the one moment it would be believed.
+   */
+  private invalidatePosition(market: string): void {
+    this.positionCache.delete(market);
+  }
+
   async getPositionStructure(symbol: string): Promise<Position | undefined> {
+    const cached = this.positionCache.get(symbol);
+    if (cached && Date.now() - cached.at < ExchangeClient.POSITION_CACHE_MS) {
+      return cached.position;
+    }
+
+    const already = this.positionInFlight.get(symbol);
+    if (already) return already;
+
+    const request = this.readPositionStructure(symbol)
+      .then((position) => {
+        this.positionCache.set(symbol, { at: Date.now(), position });
+        return position;
+      })
+      .finally(() => this.positionInFlight.delete(symbol));
+
+    this.positionInFlight.set(symbol, request);
+    return request;
+  }
+
+  private async readPositionStructure(symbol: string): Promise<Position | undefined> {
     let positionStructure: Position | undefined = {
       symbol: '',
       contracts: 0,
@@ -4600,9 +4649,27 @@ export class ExchangeClient {
    * sweeping everything would mean a position query per market per thirty
    * seconds, and the behaviours this catches are about the thing being traded.
    */
+  private guardSweepRunning = false;
+
   private async runGuardSweep(): Promise<void> {
     const market = this.lastFollowedMarket;
     if (!market) return;
+
+    // One at a time, for the same reason the trail review is: a pass that
+    // outlasts its interval must not have the next one start on top of it.
+    // Every sweep reads the position, the equity and the market, and passes
+    // stacking on a rate-limited queue is how a slow exchange becomes an
+    // unusable one.
+    if (this.guardSweepRunning) return;
+    this.guardSweepRunning = true;
+    try {
+      await this.guardSweepPass(market);
+    } finally {
+      this.guardSweepRunning = false;
+    }
+  }
+
+  private async guardSweepPass(market: string): Promise<void> {
 
     const position = await this.positionContextFor(market).catch(() => undefined);
     const summary = await this.equityFor(market);
