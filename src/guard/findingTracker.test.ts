@@ -96,18 +96,48 @@ check('   and it does not clear twice',
   clearing.update([], NOW + 60_000).length === 0,
   'a second empty sweep has nothing left to report');
 
+// A condition measured against a threshold sits either side of it as the mark
+// moves. This used to be announced every time it crossed back, on the reasoning
+// that it had genuinely re-started -- which is true, and still made six log
+// lines in six minutes saying the same thing about the same afternoon.
 const returning = new FindingTracker();
 returning.update([finding('profit-giveback', 'notice')], NOW);
 returning.update([], NOW + 30_000);
 const back = returning.update([finding('profit-giveback', 'notice')], NOW + 60_000);
 
-check('   a condition that comes back is announced again',
-  back.length === 1 && back[0].kind === 'appeared',
-  'it genuinely re-started; that is not the same as never having stopped');
+check('   a condition that flaps back within the quiet period says nothing',
+  back.length === 0,
+  'it is on the status line, which is rewritten in place; the log is for news');
 
-check('   and its clock restarts',
-  returning.active()[0].since === NOW + 60_000,
-  'since measures this occurrence, not the first one ever');
+check('   but it is active again, and its clock restarts',
+  returning.any() && returning.active()[0].since === NOW + 60_000,
+  'silence is about what is said, never about what is measured');
+
+check('   and it is announced again once the quiet period has passed',
+  returning.update([], NOW + 20 * 60_000).length === 0 &&
+    returning.update([finding('profit-giveback', 'notice')], NOW + 21 * 60_000)[0]?.kind ===
+      'appeared',
+  'a condition returning much later is news again');
+
+// Getting worse always breaks through, however recently it was mentioned.
+const worsening = new FindingTracker();
+worsening.update([finding('profit-giveback', 'notice')], NOW);
+worsening.update([], NOW + 30_000);
+const louder = worsening.update([finding('profit-giveback', 'hold')], NOW + 60_000);
+
+check('   a condition that comes back worse is announced whatever the quiet period',
+  louder.length === 1 && louder[0].kind === 'appeared',
+  'the quiet period suppresses repetition, never escalation');
+
+// Nothing was said when it appeared, so there is nothing to say has stopped.
+const quiet = new FindingTracker();
+quiet.update([finding('profit-giveback', 'notice')], NOW);
+quiet.update([], NOW + 30_000);
+quiet.update([finding('profit-giveback', 'notice')], NOW + 60_000);
+
+check('   and a suppressed condition does not announce its own clearing',
+  quiet.update([], NOW + 90_000).length === 0,
+  'a bare "cleared" for something never announced reads as a fault in the guard');
 
 // --- several at once -------------------------------------------------------
 

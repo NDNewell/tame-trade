@@ -56,6 +56,15 @@ interface Tracked {
   since: number;
   /** The last sweep on which it was still true, to detect disappearance. */
   seen: number;
+  /**
+   * Whether *this* occurrence was announced.
+   *
+   * Per occurrence rather than per behaviour, because the two answers differ:
+   * a condition can flap back inside the quiet period, go unannounced, and then
+   * end -- and an ending announced for something the operator was never told
+   * about reads as a fault in the guard.
+   */
+  spoken: boolean;
 }
 
 /**
@@ -68,9 +77,32 @@ interface Tracked {
  * The numbers are still shown; they are just shown by the status line, which
  * can be rewritten in place, rather than by appending to a log that cannot.
  */
+/**
+ * How long a behaviour stays quiet after it has been announced.
+ *
+ * A condition measured against a threshold does not cross it once. Give-back
+ * sits either side of its limit as the mark moves, so it appeared, cleared,
+ * appeared and cleared again inside six minutes -- six log lines and, while
+ * unprompted remarks were on, several model calls, all saying the same thing
+ * about the same afternoon.
+ *
+ * The condition is real each time and the measurement is not in question. What
+ * is in question is whether it is news, and the second time inside a quarter of
+ * an hour it is not: it is on the status line, where it belongs, being
+ * rewritten in place.
+ */
+const REANNOUNCE_QUIET_MS = 15 * 60_000;
+
 export class FindingTracker {
   private tracked = new Map<BehaviourId, Tracked>();
   private sweeps = 0;
+  /**
+   * When each behaviour was last reported, and at what severity.
+   *
+   * Kept after the finding clears, which is the whole point: it is the
+   * re-appearance that has to be judged against it.
+   */
+  private announced = new Map<BehaviourId, { at: number; severity: Severity }>();
 
   /**
    * Folds one sweep's findings in, and says what changed.
@@ -97,6 +129,10 @@ export class FindingTracker {
     for (const [id, previous] of this.tracked) {
       if (incoming.has(id)) continue;
       this.tracked.delete(id);
+      // Nothing was said when it appeared, so there is nothing to say has
+      // stopped. A bare 'cleared' for a condition the operator was never told
+      // about reads as a fault in the guard rather than as news.
+      if (!previous.spoken) continue;
       transitions.push({ kind: 'cleared', behaviour: id, finding: previous.finding });
     }
 
@@ -104,13 +140,26 @@ export class FindingTracker {
       const previous = this.tracked.get(id);
 
       if (!previous) {
+        // Announced unless the same behaviour has just been announced and has
+        // not got worse. It is still tracked, still shown on the status line,
+        // and will still escalate -- it just does not say the same thing again.
+        const last = this.announced.get(id);
+        const settled = last === undefined || now - last.at >= REANNOUNCE_QUIET_MS;
+        const worseThanSaid = last !== undefined && !atLeast(last.severity, finding.severity);
+        const speak = settled || worseThanSaid;
+
         this.tracked.set(id, {
           finding,
           severity: finding.severity,
           since: now,
           seen: now,
+          spoken: speak,
         });
-        transitions.push({ kind: 'appeared', behaviour: id, finding });
+
+        if (speak) {
+          this.announced.set(id, { at: now, severity: finding.severity });
+          transitions.push({ kind: 'appeared', behaviour: id, finding });
+        }
         continue;
       }
 
@@ -124,6 +173,8 @@ export class FindingTracker {
       previous.seen = now;
 
       if (worse) {
+        this.announced.set(id, { at: now, severity: finding.severity });
+        previous.spoken = true;
         transitions.push({ kind: 'escalated', behaviour: id, finding, from });
       }
     }
@@ -162,6 +213,10 @@ export class FindingTracker {
    */
   reset(): void {
     this.tracked.clear();
+    // The quiet period goes with it. Reset means the guard stopped looking and
+    // started again, and what it finds on the way back in is news whether or
+    // not the same thing was reported before it stopped.
+    this.announced.clear();
   }
 
   /** How many sweeps have been folded in. Exposed for tests and diagnostics. */

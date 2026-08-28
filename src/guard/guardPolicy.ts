@@ -102,6 +102,21 @@ export interface GuardPolicy {
   autoExit: BehaviourId[];
 
   /**
+   * Whether the coach may speak without being asked.
+   *
+   * Off. Every unprompted remark is a model call the operator did not ask for
+   * and is paying for, and a guardrail that flaps around its threshold can
+   * make several of them in a quarter of an hour. The condition is already on
+   * the status line and in the activity log; the coach adding a sentence about
+   * it is the one part of that which costs money.
+   *
+   * The panel still answers anything typed into it, and the confirmation
+   * sentence still explains a held order -- that one is a reply to something
+   * the operator just did.
+   */
+  coachRemarks: boolean;
+
+  /**
    * Per-behaviour overrides of the catalogue's default severity.
    *
    * This is how an operator turns the whole thing into a coach that never
@@ -146,6 +161,7 @@ export const DEFAULT_POLICY: GuardPolicy = {
 
   lockoutMs: 30 * MINUTE,
   autoExit: [],
+  coachRemarks: false,
   severity: {},
   muted: [],
 };
@@ -185,6 +201,7 @@ export function resolvePolicy(stored: Partial<GuardPolicy> | undefined): GuardPo
     stored?.severity && typeof stored.severity === 'object' ? stored.severity : {};
   merged.muted = Array.isArray(stored?.muted) ? stored!.muted : [];
   merged.autoExit = Array.isArray(stored?.autoExit) ? stored!.autoExit : [];
+  merged.coachRemarks = stored?.coachRemarks === true;
 
   // A threshold stored as a non-number would compare false against everything
   // and quietly disable its detector.
