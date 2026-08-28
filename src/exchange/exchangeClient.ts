@@ -30,9 +30,21 @@ import {
   advanceHighWaterMark,
   TrailSide,
 } from '../trading/adaptiveTrail.js';
-import { buildTrailTag, readTrailTag } from '../trading/trailTag.js';
+import { buildTrailTag, readTrailTag, TrailTag } from '../trading/trailTag.js';
 import { describeExchangeError, isMissingOrderError } from '../utils/exchangeErrors.js';
 import { classifyOrderStatus, staleOrderIds } from './orderCacheRules.js';
+import { GuardService } from '../guard/guardService.js';
+import { OrderProposal, PositionContext } from '../guard/detectors.js';
+import { GuardVerdict } from '../guard/guardrails.js';
+import { MarketContext, MarketSeries } from '../guard/marketContext.js';
+import { describeOrders } from '../trading/orderView.js';
+import { resolvePolicy, GuardPolicy } from '../guard/guardPolicy.js';
+import {
+  describeExitPlan,
+  ExitUrgency,
+  planExit,
+} from '../trading/exitPlan.js';
+import { ExitExecutionPort, ExitExecutor } from '../trading/exitExecutor.js';
 import { NotificationManager } from '../utils/notificationManager.js';
 import { NType } from '../utils/notificationManager.js';
 
@@ -82,6 +94,15 @@ export class ExchangeClient {
   private supportedExchanges: string[] | null = null;
   exchange: Exchange | null = null;
   exchangeManager: ConfigManager;
+  /**
+   * Behavioural guardrails.
+   *
+   * Created eagerly and unconditionally: it must be able to record from the
+   * very first fill, and a journal with a hole in it at the start of the
+   * session is one that cannot say what the session's typical size was.
+   */
+  private guard = new GuardService();
+  private guardSweepTimer: NodeJS.Timeout | null = null;
   private ws: WebSocket | null = null;
   private eventEmitter: EventEmitter;
   private chaseLimitOrderActive: boolean = false;
@@ -95,7 +116,13 @@ export class ExchangeClient {
   private chaseDeadline: number | undefined = undefined;
   private tickerStreams = new Map<
     string,
-    { price: number | undefined; at: number; running: boolean }
+    {
+      price: number | undefined;
+      bid?: number;
+      ask?: number;
+      at: number;
+      running: boolean;
+    }
   >();
   /**
    * Mark, index and funding come from one call, cached: funding moves every few
@@ -106,9 +133,13 @@ export class ExchangeClient {
     string,
     { at: number; mark?: number; index?: number; funding?: number }
   >();
+  /** Markets with a background order refresh already running. */
+  private orderResyncInFlight = new Set<string>();
   /** Keyed by market, timeframe and period; valid until the next candle closes. */
   private atrCache = new Map<string, { until: number; value?: number }>();
   private rangeCache = new Map<string, { at: number; ranges: PriceRangeView[] }>();
+  /** Markets with a background range refresh already running. */
+  private rangeRefreshInFlight = new Set<string>();
   private candleCache = new Map<string, { until: number; candles: Candle[] }>();
   /** Markets known to carry an adaptive trail, so the monitor knows where to look. */
   private adaptiveMarkets = new Set<string>();
@@ -129,11 +160,14 @@ export class ExchangeClient {
   private trailReviewRunning = false;
   /** Trails already announced as resumed, so a restart says so once. */
   private trailResumeAnnounced = new Set<string>();
+  /** Delayed trails that have reached their arming price and begun trailing. */
+  private armedTrails = new Set<string>();
   /** Looked up once per session; it does not change while connected. */
   private accountLabel: string | undefined;
   private equityCache:
     | { at: number; currency: string; balance?: number; equity?: number }
     | undefined;
+  private equityRefreshInFlight = false;
   private accountLookupDone = false;
   /** The market being followed, so account lookups know which wallet to ask for. */
   private lastFollowedMarket: string | undefined;
@@ -165,6 +199,12 @@ export class ExchangeClient {
     this.supportedExchanges = [];
     this.eventEmitter = new EventEmitter();
     this.chaseLimitOrderActive = false;
+
+    // The guard knows nothing about exchanges by design, so what the coach may
+    // see of the market arrives as a function rather than as a dependency. It
+    // resolves to undefined until a market is being followed, which is exactly
+    // what a coach asked about the market before one is chosen should be told.
+    this.guard.setMarketSource(() => this.getMarketContext().catch(() => undefined));
   }
 
   static getInstance(): ExchangeClient {
@@ -309,6 +349,7 @@ export class ExchangeClient {
     await this.loadExchanges();
     await this.loadFatFingerLimit();
     await this.loadConfirmThreshold();
+    await this.loadGuardPolicy();
     this.setEventListeners();
 
     // Call the time synchronization method here
@@ -481,6 +522,8 @@ export class ExchangeClient {
     leverage?: number;
     effectiveLeverage?: number;
     liquidation?: number;
+    /** Position value in the settlement currency, as the exchange reports it. */
+    notional?: number;
     currency: string;
   } | null> {
     const position = await this.getPositionStructure(market);
@@ -508,6 +551,9 @@ export class ExchangeClient {
         currency
       ),
       liquidation: Number(info.liquidationPrice) || undefined,
+      notional: Number.isFinite(Number(position.notional ?? info.valueRv))
+        ? Math.abs(Number(position.notional ?? info.valueRv))
+        : undefined,
       currency,
     };
   }
@@ -716,7 +762,38 @@ export class ExchangeClient {
   }
 
   /** Open orders for display. Uses the live view; completeness isn't critical. */
+  /**
+   * The order list for the screen, which never waits on the exchange.
+   *
+   * Redrawing is on a two-second timer, and a reconciliation lands in the
+   * middle of that every twenty seconds. Awaiting it there stalled the whole
+   * frame -- position, market and orders all repaint together -- for as long as
+   * the request took.
+   *
+   * So the cache answers immediately and the refresh happens behind it. What is
+   * shown is at worst one cycle old, and everything this process does to orders
+   * updates the cache directly, so the operator's own actions still appear at
+   * once.
+   */
   async getOpenOrdersForDisplay(market: string): Promise<Order[]> {
+    const state = this.orderStreams.get(market);
+
+    if (state?.healthy === true) {
+      // snapshotAt only moves when a refresh finishes, so without this the
+      // two-second redraw would start a new one on every tick while the first
+      // was still running.
+      if (
+        Date.now() - state.snapshotAt > ExchangeClient.ORDER_RESYNC_MS &&
+        !this.orderResyncInFlight.has(market)
+      ) {
+        this.orderResyncInFlight.add(market);
+        void this.getLiveOpenOrders(market)
+          .catch(() => undefined)
+          .finally(() => this.orderResyncInFlight.delete(market));
+      }
+      return Array.from(state.orders.values());
+    }
+
     try {
       return await this.getLiveOpenOrders(market);
     } catch {
@@ -732,6 +809,25 @@ export class ExchangeClient {
    * quoting with room to spare.
    */
   private static readonly CANDLE_LIMIT = 100;
+  /**
+   * The kline limits the exchange will accept.
+   *
+   * Not a range: anything between two of these is rejected outright with
+   * 'Please double check input arguments', which is what happened the first
+   * time the coach's history was deepened and 182 daily candles were asked for.
+   * A request over a thousand is silently capped rather than refused, which is
+   * the more dangerous of the two failures -- so the snap below is upward into
+   * this set and never past its end.
+   */
+  private static readonly CANDLE_LIMITS = [5, 10, 50, 100, 500, 1000];
+
+  /** The smallest accepted limit that satisfies a wanted depth. */
+  private static snapLimit(wanted: number): number {
+    return (
+      ExchangeClient.CANDLE_LIMITS.find((limit) => limit >= wanted) ??
+      ExchangeClient.CANDLE_LIMITS[ExchangeClient.CANDLE_LIMITS.length - 1]
+    );
+  }
   /** How long to hold a failed volatility read before trying again. */
   private static readonly ATR_RETRY_MS = 30000;
   /**
@@ -767,7 +863,21 @@ export class ExchangeClient {
   /** The period ATR is quoted at essentially everywhere. */
   private static readonly RANGE_ATR_PERIOD = 14;
   private static readonly CANDLE_CACHE_MIN_MS = 15000;
-  private static readonly CANDLE_CACHE_MAX_MS = 300000;
+  /**
+   * The longest a candle series is held, whatever its size says.
+   *
+   * Was five minutes flat, which was defensible when every series was a hundred
+   * bars and the coarse ones were only read for ATR. It stopped being
+   * defensible when the coach's history went to five hundred daily and weekly
+   * bars: a weekly candle cannot change more than once a week, and refetching
+   * five hundred of them twelve times an hour spends the rate limit to be told
+   * the same thing.
+   *
+   * The real bound is the next close, and the forming bar is dropped before
+   * anything reads the series, so nothing in a held series can change before
+   * then. This is the backstop over that, not the rule.
+   */
+  private static readonly CANDLE_CACHE_MAX_MS = 3600000;
 
   /** Mark price, index price and funding rate, refreshed at a sensible interval. */
   /**
@@ -802,20 +912,75 @@ export class ExchangeClient {
    * so an exchange that publishes a candle a moment late is retried rather
    * than polled flat out.
    */
-  private async getCandles(market: string, timeframe: string): Promise<Candle[]> {
-    const key = `${market}|${timeframe}`;
+  /** Requests already on the wire, so five callers share one of them. */
+  private candleInFlight = new Map<string, Promise<Candle[]>>();
+  /** Series that just failed, and when they may be asked for again. */
+  private candleFailure = new Map<string, number>();
+  /**
+   * How long a failed series is left alone.
+   *
+   * The reason this exists is a feedback loop rather than politeness. A throw
+   * never populated the cache, so a series that failed was re-requested by
+   * every pass that wanted it -- and once the rate limiter's queue backs up,
+   * every candle fetch fails, which means every pass asks again, which fills
+   * the queue further. The client talked itself into 'throttle queue is over
+   * maxCapacity (1000)' and stayed there.
+   */
+  private static readonly CANDLE_RETRY_MS = 30_000;
+
+  private async getCandles(
+    market: string,
+    timeframe: string,
+    wanted = ExchangeClient.CANDLE_LIMIT
+  ): Promise<Candle[]> {
+    // Snapped here as well as at the call sites, so no caller can send a value
+    // the exchange refuses.
+    const limit = ExchangeClient.snapLimit(wanted);
+
+    // The depth is part of the key. A deep series and a shallow one on the same
+    // timeframe are different answers with different costs, and letting a
+    // hundred-candle read satisfy a request for six months -- or the reverse,
+    // pulling a thousand candles to measure ATR(14) -- would be wrong in one
+    // direction or wasteful in the other.
+    const key = `${market}|${timeframe}|${limit}`;
     const cached = this.candleCache.get(key);
     if (cached && Date.now() < cached.until) return cached.candles;
 
-    const raw = await this.exchange!.fetchOHLCV(
-      market,
-      timeframe,
-      undefined,
-      ExchangeClient.CANDLE_LIMIT
-    );
+    // Recently failed. Whatever is held stands, and nothing goes on the wire.
+    const quiet = this.candleFailure.get(key);
+    if (quiet !== undefined && Date.now() < quiet) return cached?.candles ?? [];
+
+    // The range panel, the ATR cache and the coach's history all want the same
+    // series, and before this they each asked for it. One request, shared.
+    const already = this.candleInFlight.get(key);
+    if (already) return already;
+
+    const request = this.fetchCandleSeries(market, timeframe, limit, key).finally(() => {
+      this.candleInFlight.delete(key);
+    });
+    this.candleInFlight.set(key, request);
+    return request;
+  }
+
+  /** The work behind getCandles. Always goes to the exchange. */
+  private async fetchCandleSeries(
+    market: string,
+    timeframe: string,
+    limit: number,
+    key: string
+  ): Promise<Candle[]> {
+    let raw: unknown[];
+    try {
+      raw = await this.exchange!.fetchOHLCV(market, timeframe, undefined, limit);
+    } catch (error) {
+      this.candleFailure.set(key, Date.now() + ExchangeClient.CANDLE_RETRY_MS);
+      throw error;
+    }
+    this.candleFailure.delete(key);
 
     const candles = raw.map((row: any) => ({
       timestamp: Number(row[0]),
+      open: Number(row[1]),
       high: Number(row[2]),
       low: Number(row[3]),
       close: Number(row[4]),
@@ -829,8 +994,15 @@ export class ExchangeClient {
     const nextClose =
       last !== undefined ? last.timestamp + 2 * intervalMs : now;
 
+    // Never longer than one bar of this size: on a fast timeframe the backstop
+    // above would otherwise hold a minute candle for an hour.
+    const ceiling = Math.min(
+      ExchangeClient.CANDLE_CACHE_MAX_MS,
+      Math.max(ExchangeClient.CANDLE_CACHE_MIN_MS, intervalMs)
+    );
+
     const until = Math.min(
-      now + ExchangeClient.CANDLE_CACHE_MAX_MS,
+      now + ceiling,
       Math.max(now + ExchangeClient.CANDLE_CACHE_MIN_MS, nextClose)
     );
 
@@ -849,9 +1021,37 @@ export class ExchangeClient {
    */
   async getPriceRanges(market: string): Promise<PriceRangeView[]> {
     const cached = this.rangeCache.get(market);
-    if (cached && Date.now() - cached.at <= ExchangeClient.RANGE_CACHE_MS) {
-      return cached.ranges;
+    const fresh = cached && Date.now() - cached.at <= ExchangeClient.RANGE_CACHE_MS;
+    if (fresh) return cached!.ranges;
+
+    // Nine candle series, each a request the exchange rate-limits. Awaiting
+    // that on the redraw stalled the whole frame -- position, orders and market
+    // repaint together -- for as long as it took, every time the cache lapsed.
+    //
+    // Once there is something to show, showing it wins. Ranges are measured
+    // over minutes to a month; a few seconds of staleness is invisible in the
+    // numbers and very visible in the redraw.
+    // Refreshed in the background whether or not there is anything cached yet,
+    // and the caller is answered immediately either way.
+    //
+    // The first call used to await the computation, which meant the first
+    // populated frame of a session waited on nine rate-limited candle requests
+    // -- and since the workspace reads price, position, orders and ranges
+    // together, everything else waited with it. The panel now shows '--' for a
+    // few seconds instead, which is what it has to show anyway, and the values
+    // that were ready are on screen while the slow ones arrive.
+    if (!this.rangeRefreshInFlight.has(market)) {
+      this.rangeRefreshInFlight.add(market);
+      void this.computePriceRanges(market)
+        .catch(() => undefined)
+        .finally(() => this.rangeRefreshInFlight.delete(market));
     }
+
+    return cached?.ranges ?? [];
+  }
+
+  /** The work behind getPriceRanges. Always goes to the exchange. */
+  private async computePriceRanges(market: string): Promise<PriceRangeView[]> {
 
     const latest = await this.getReferencePrice(market);
 
@@ -983,6 +1183,66 @@ export class ExchangeClient {
     return Number.isFinite(seconds) && seconds > 0 ? seconds : undefined;
   }
 
+  /** '8h', '4h', '1h' -- how the interval reads rather than how it is stored. */
+  private static intervalLabel(seconds: number): string {
+    if (seconds % 3600 === 0) return `${seconds / 3600}h`;
+    if (seconds % 60 === 0) return `${seconds / 60}m`;
+    return `${seconds}s`;
+  }
+
+  /**
+   * What the next funding payment costs, or pays, on the position as it stands.
+   *
+   * The rate is the honest figure and the annualised one says whether it
+   * matters over time, but neither answers the question actually being asked,
+   * which is how much money moves at the next payment. A hundredth of a percent
+   * sounds like nothing until it is read against a six-figure notional.
+   *
+   * Signed from the operator's side: negative is paid out, positive is
+   * received. A positive rate means longs pay shorts, so a long notional
+   * against a positive rate is a cost -- which is why the notional arrives
+   * signed rather than as a size.
+   *
+   * Linear contracts only. An inverse contract settles in the base asset and
+   * the arithmetic is a different one; returning the linear answer for it would
+   * be a confident wrong number rather than a missing one.
+   */
+  fundingCost(
+    market: string,
+    signedNotional: number | undefined
+  ): { amount: number; daily: number; currency: string; interval: string } | undefined {
+    if (signedNotional === undefined || !Number.isFinite(signedNotional)) return undefined;
+    if (signedNotional === 0) return undefined;
+
+    const info = this.availableMarkets?.[market];
+    if ((info as any)?.inverse === true) return undefined;
+
+    const rate = this.fundingCache.get(market)?.funding;
+    if (rate === undefined || !Number.isFinite(rate)) return undefined;
+
+    const seconds = this.fundingIntervalSeconds(market);
+    if (seconds === undefined) return undefined;
+
+    // Negated so the sign reads from the operator's side rather than the
+    // market's: what they pay is money leaving.
+    const amount = -(signedNotional * rate);
+
+    return {
+      amount,
+      // A day's worth, which is the figure worth reading. One payment of nine
+      // dollars sounds like a rounding error; the same position costing
+      // twenty-nine a day is a number that can be weighed against the trade.
+      //
+      // Scaled from the current rate, which assumes it holds across the day's
+      // remaining payments. It will not exactly -- the rate is re-struck each
+      // interval -- but it is the same assumption the annualised figure beside
+      // it already makes, and the alternative is a number nobody can act on.
+      daily: amount * (86400 / seconds),
+      currency: String(info?.settle ?? info?.quote ?? ''),
+      interval: ExchangeClient.intervalLabel(seconds),
+    };
+  }
+
   private formatFunding(market: string, rate: number): string {
     const perInterval = `${(rate * 100).toFixed(4)}%`;
     const interval = this.fundingIntervalSeconds(market);
@@ -1067,13 +1327,36 @@ export class ExchangeClient {
     equity?: number;
   }> {
     const cached = this.equityCache;
-    if (
+    const fresh =
       cached &&
       cached.currency === currency &&
-      Date.now() - cached.at <= ExchangeClient.EQUITY_CACHE_MS
-    ) {
+      Date.now() - cached.at <= ExchangeClient.EQUITY_CACHE_MS;
+
+    if (fresh) return { balance: cached!.balance, equity: cached!.equity };
+
+    // A balance read and a positions read, both rate-limited. Same reasoning as
+    // the ranges: once there is a figure to show, showing it beats holding the
+    // frame for a fresher one.
+    if (cached && cached.currency === currency) {
+      if (!this.equityRefreshInFlight) {
+        this.equityRefreshInFlight = true;
+        void this.computeAccountSummary(currency)
+          .catch(() => undefined)
+          .finally(() => {
+            this.equityRefreshInFlight = false;
+          });
+      }
       return { balance: cached.balance, equity: cached.equity };
     }
+
+    return this.computeAccountSummary(currency);
+  }
+
+  /** The work behind getAccountSummary. Always goes to the exchange. */
+  private async computeAccountSummary(currency: string): Promise<{
+    balance?: number;
+    equity?: number;
+  }> {
 
     let balance: number | undefined;
     let equity: number | undefined;
@@ -1123,6 +1406,12 @@ export class ExchangeClient {
       }
     }
 
+    // The peak this session is measured from these samples, so one is recorded
+    // whenever a real figure is available. An incomplete equity is deliberately
+    // not journalled: a peak set by a number that was quietly short would make
+    // every later give-back reading wrong.
+    if (equity !== undefined) this.guard.recordEquity(equity, currency);
+
     this.equityCache = { at: Date.now(), currency, balance, equity };
     return { balance, equity };
   }
@@ -1155,15 +1444,24 @@ export class ExchangeClient {
     change?: string;
   }> {
     const last = await this.getReferencePrice(market);
-    let bid: number | undefined;
-    let ask: number | undefined;
 
-    try {
-      const book = await this.exchange!.fetchL2OrderBook(market, 1);
-      bid = book.bids?.[0]?.[0];
-      ask = book.asks?.[0]?.[0];
-    } catch {
-      // Book unavailable this tick; the rest of the view is still worth showing.
+    // Top of book from the streamed ticker, which already carries it. This was
+    // fetchL2OrderBook on every redraw -- a rate-limited request every two
+    // seconds for two numbers arriving on a socket we were already holding
+    // open. The fetch remains as a fallback for the first tick and for a feed
+    // that has gone quiet.
+    const streamed = this.tickerStreams.get(market);
+    let bid = streamed?.bid;
+    let ask = streamed?.ask;
+
+    if (bid === undefined || ask === undefined) {
+      try {
+        const book = await this.exchange!.fetchL2OrderBook(market, 1);
+        bid = book.bids?.[0]?.[0];
+        ask = book.asks?.[0]?.[0];
+      } catch {
+        // Book unavailable this tick; the rest of the view is still worth showing.
+      }
     }
 
     const spread =
@@ -1259,7 +1557,13 @@ export class ExchangeClient {
     if (!this.exchange?.has?.['watchTicker']) return;
     if (this.tickerStreams.get(market)?.running) return;
 
-    const state = { price: undefined as number | undefined, at: 0, running: true };
+    const state = {
+      price: undefined as number | undefined,
+      bid: undefined as number | undefined,
+      ask: undefined as number | undefined,
+      at: 0,
+      running: true,
+    };
     this.tickerStreams.set(market, state);
 
     void (async () => {
@@ -1272,6 +1576,13 @@ export class ExchangeClient {
             state.price = last;
             state.at = Date.now();
           }
+
+          // Top of book arrives on the same message, and saves a request for it
+          // on every redraw.
+          const bid = Number(ticker.bid);
+          const ask = Number(ticker.ask);
+          if (Number.isFinite(bid) && bid > 0) state.bid = bid;
+          if (Number.isFinite(ask) && ask > 0) state.ask = ask;
         } catch (error) {
           // The feed is a shortcut, not a dependency. Stop the loop and let
           // callers fall back to fetching, rather than surfacing an error for
@@ -1429,7 +1740,28 @@ export class ExchangeClient {
     // Structured rather than prose: the row is columns the eye can run down,
     // and the market isn't repeated because it is already in the header.
     if (filled > previouslyFilled) {
+      // The guardrails' whole memory is built from this: only the *new* part of
+      // a partial fill is journalled, or a working order that reports its
+      // running total on every update would be counted several times over and
+      // the session would look far larger than it was.
+      this.guard.recordFill({
+        market,
+        side: String(update.side ?? '').toLowerCase() === 'buy' ? 'buy' : 'sell',
+        size: filled - previouslyFilled,
+        price: Number(rawPrice ?? 0),
+        at: eventTime,
+        contractSize: (this.availableMarkets?.[market] as any)?.contractSize ?? 1,
+        inverse: (this.availableMarkets?.[market] as any)?.inverse === true,
+        // What this fill is, as opposed to what it looked like from here. The
+        // `filledSoFar` map below is per-stream, so a reconnect starts a fresh
+        // one and replays fills it has already reported; naming them lets the
+        // journal recognise the ones it has already counted.
+        orderId: id,
+        filledTotal: filled,
+      });
+
       state.filledSoFar.set(id, filled);
+      this.invalidatePosition(market);
 
       const complete =
         status === 'closed' ||
@@ -1444,6 +1776,7 @@ export class ExchangeClient {
     }
 
     if (status === 'canceled' && filled === 0) {
+      this.guard.recordOrderCancelled(market, id);
       NotificationManager.notify('', NType.INFO, 'ORDER', eventTime, {
         side: side.toUpperCase(),
         quantity: this.formatQuantity(Number(update.amount ?? 0)),
@@ -1617,6 +1950,56 @@ export class ExchangeClient {
     if (existing) this.reconcileOrderCache(existing, orders, params);
 
     return orders;
+  }
+
+  /**
+   * Puts an order this process has just placed into the cached list.
+   *
+   * Only orders that are actually working: a market order that filled on the
+   * way in is not an open order, and adding it would put a phantom in the panel
+   * -- the mirror image of the bug this exists to prevent.
+   */
+  private rememberPlacedOrder(market: string, order: any): void {
+    const state = this.orderStreams.get(market);
+    if (!state || !order?.id) return;
+
+    const disposition = classifyOrderStatus(order.status);
+    if (disposition === 'finished') return;
+
+    // An unknown status from a placement response is treated as working: the
+    // exchange has just accepted the order, so the one thing we do know is that
+    // it existed a moment ago. The next reconciliation corrects it if not.
+    this.guard.recordOrderPlaced(market, String(order.id));
+
+    state.orders.set(String(order.id), order as Order);
+    if (!state.filledSoFar.has(String(order.id))) {
+      state.filledSoFar.set(String(order.id), Number(order.filled ?? 0));
+    }
+  }
+
+  /**
+   * Drops orders this process has just cancelled from the cached list.
+   *
+   * The cache is refreshed against the exchange periodically, which is right
+   * for drift nobody caused. A cancellation is not drift: we know the order is
+   * gone the moment the exchange accepts it, and continuing to show it is worse
+   * here than anywhere else -- a cancelled stop on screen reads as protection
+   * that no longer exists.
+   *
+   * The next read is also forced to go to the exchange, so anything else the
+   * cancellation changed is picked up rather than waiting out the interval.
+   */
+  private forgetCancelledOrders(market: string, ids: Array<string | undefined>): void {
+    const state = this.orderStreams.get(market);
+    if (!state) return;
+
+    for (const id of ids) {
+      if (id === undefined) continue;
+      state.orders.delete(String(id));
+      state.filledSoFar.delete(String(id));
+    }
+
+    state.snapshotAt = 0;
   }
 
   /**
@@ -1855,6 +2238,12 @@ export class ExchangeClient {
       // Call the underlying exchange method with market, remaining original args, and the final combined params
       const order = await (this.exchange as any)[method](market, ...originalArgs, finalParams);
 
+      // Into the cached list immediately. The exchange has accepted it, so it
+      // exists; waiting for the next reconciliation to discover that left a new
+      // order missing from the panel for up to twenty seconds. The same
+      // reasoning as forgetting a cancelled one, in the other direction.
+      this.rememberPlacedOrder(market, order);
+
       // What comes back here is the exchange accepting the request, not the
       // outcome. Whether it fills, and for how much, arrives on the order feed —
       // so this reports acceptance only, and announceOrderUpdate reports the
@@ -1929,7 +2318,55 @@ export class ExchangeClient {
     return marketInfo.precision.price ?? 0;
   }
 
+  /** Position reads on the wire, so simultaneous callers share one. */
+  private positionInFlight = new Map<string, Promise<Position | undefined>>();
+  private positionCache = new Map<string, { at: number; position: Position | undefined }>();
+  /**
+   * How long a position read is reused.
+   *
+   * Short enough that nothing on screen is visibly behind -- the panel repaints
+   * every two seconds and this is under one -- and long enough that the several
+   * things which each want the position during a single pass ask for it once.
+   * The workspace reads it directly and then reads it again inside the risk
+   * calculation, and the guard's market block wants it too, so one pass was
+   * three requests for one answer on the endpoint that was failing.
+   */
+  private static readonly POSITION_CACHE_MS = 900;
+
+  /**
+   * Drops the held position for a market.
+   *
+   * Called the moment a fill is seen. Under a second of staleness is invisible
+   * on a panel that repaints every two, but it is not invisible immediately
+   * after a fill -- that is exactly when the size on screen is being checked
+   * against what was just done, and showing the previous size for even half a
+   * second there is the one moment it would be believed.
+   */
+  private invalidatePosition(market: string): void {
+    this.positionCache.delete(market);
+  }
+
   async getPositionStructure(symbol: string): Promise<Position | undefined> {
+    const cached = this.positionCache.get(symbol);
+    if (cached && Date.now() - cached.at < ExchangeClient.POSITION_CACHE_MS) {
+      return cached.position;
+    }
+
+    const already = this.positionInFlight.get(symbol);
+    if (already) return already;
+
+    const request = this.readPositionStructure(symbol)
+      .then((position) => {
+        this.positionCache.set(symbol, { at: Date.now(), position });
+        return position;
+      })
+      .finally(() => this.positionInFlight.delete(symbol));
+
+    this.positionInFlight.set(symbol, request);
+    return request;
+  }
+
+  private async readPositionStructure(symbol: string): Promise<Position | undefined> {
     let positionStructure: Position | undefined = {
       symbol: '',
       contracts: 0,
@@ -2174,7 +2611,12 @@ export class ExchangeClient {
     // Cancel the orders within the range
     if (ordersToCancel.length > 0) {
       const cancelPromises = ordersToCancel.map((order) =>
-        this.exchange!.cancelOrder(order.id, market, isHyperliquid ? hyperliquidParams : undefined)
+        this.exchange!
+          .cancelOrder(order.id, market, isHyperliquid ? hyperliquidParams : undefined)
+          .then((result) => {
+            this.forgetCancelledOrders(market, [order.id]);
+            return result;
+          })
       );
       await Promise.all(cancelPromises);
       console.log(`${ordersToCancel.length} limit orders have been canceled.`);
@@ -2255,7 +2697,12 @@ export class ExchangeClient {
       const results = await Promise.allSettled(
         limitOrders.map((order) =>
           // The wallet parameter was omitted here while the fetch above used it.
-          this.exchange!.cancelOrder(order.id, symbol, walletAddress ? { user: walletAddress } : undefined)
+          this.exchange!
+            .cancelOrder(order.id, symbol, walletAddress ? { user: walletAddress } : undefined)
+            .then((result) => {
+              this.forgetCancelledOrders(symbol, [order.id]);
+              return result;
+            })
         )
       );
 
@@ -2299,6 +2746,25 @@ export class ExchangeClient {
         stopOrders.map((order) => this.exchange!.cancelOrder(order.id, symbol, params))
       );
 
+      const cancelled = stopOrders.filter(
+        (_, index) => results[index].status === 'fulfilled'
+      );
+
+      this.forgetCancelledOrders(
+        symbol,
+        cancelled.map((order) => order.id)
+      );
+
+      // Only the ones that actually went. A refused cancel left the stop in
+      // place, and recording it as pulled would have the guard reporting
+      // protection that was never removed.
+      void this.noteStopsCancelled(
+        symbol,
+        cancelled.map((order) =>
+          Number((order as any).triggerPrice ?? (order as any).info?.stopPxRp ?? order.stopPrice ?? 0)
+        )
+      );
+
       const failed = results.filter((r) => r.status === 'rejected').length;
       for (const result of results) {
         if (result.status === 'rejected') {
@@ -2330,6 +2796,7 @@ export class ExchangeClient {
     this.currentChaseOrderId = undefined;
     try {
       await this.exchange!.cancelOrder(targetId, market, params);
+      this.forgetCancelledOrders(market, [targetId]);
     } catch (error: any) {
         // Check if it's a benign OrderNotFound error
         const errorMessage = String(error.message || '');
@@ -3807,6 +4274,720 @@ export class ExchangeClient {
    * lookup in the common case, and a second timer per order would multiply the
    * ways this can be left running after the order it watched is gone.
    */
+
+  // ==========================================================================
+  // Behavioural guardrails
+  //
+  // The rules themselves are in src/guard and know nothing about exchanges.
+  // This section is only the plumbing: it hands the guard what it needs to
+  // measure, and carries out what it decides.
+  // ==========================================================================
+
+  /** How often open positions and the session are reconsidered. */
+  private static readonly GUARD_SWEEP_MS = 30_000;
+
+  getGuard(): GuardService {
+    return this.guard;
+  }
+
+  /**
+   * How much history of each size the coach is shown.
+   *
+   * The ladder runs from the last hour to the last few years, because the
+   * questions being asked run that far: where to put a stop is a question about
+   * the last few bars, whether to hold over a weekend is a question about the
+   * last few months, and 'is this level still the level' is a question about
+   * where price has spent its time since it was.
+   *
+   * It used to be four sizes and a hundred and eight bars in total, which was
+   * chosen to cost nothing -- those were the sizes the range panel already had
+   * in cache. That reasoning survives for the fine end and not the coarse: a
+   * hundred daily candles is three months, and a position held through a
+   * quarter is one the coach can only see the end of.
+   *
+   * So the coarse sizes are fetched to their own depth, on their own schedule,
+   * in the background. A daily candle changes once a day; a weekly one once a
+   * week. Nothing here is ever read on the path of a coach call.
+   */
+  private static readonly COACH_SERIES: Array<{ timeframe: string; count: number }> = [
+    { timeframe: '1m', count: 60 }, //  1 hour, to the minute
+    { timeframe: '5m', count: 72 }, //  6 hours
+    { timeframe: '15m', count: 96 }, // 1 day
+    { timeframe: '1h', count: 96 }, //  4 days
+    { timeframe: '4h', count: 120 }, // 20 days
+    { timeframe: '1d', count: 180 }, // 6 months
+    { timeframe: '1w', count: 104 }, // 2 years
+    { timeframe: '1M', count: 48 }, //  4 years
+  ];
+
+  /**
+   * How deep each of those has to be fetched, given the bar still forming and
+   * the limits the exchange is willing to be asked for.
+   */
+  private static coachDepth(count: number): number {
+    return ExchangeClient.snapLimit(count + 2);
+  }
+
+  /**
+   * Keeps the coach's candle history warm.
+   *
+   * Called from the sweep, never from a coach call. Each size is refreshed only
+   * when its own cache has lapsed, which for the coarse ones is roughly when a
+   * bar of that size closes -- so the weekly series is read about once a week,
+   * and the cost of the whole ladder amortises to almost nothing.
+   */
+  private coachWarmRunning = false;
+  private coachWarmAt = 0;
+  /**
+   * How often the ladder is walked at all.
+   *
+   * Each series refuses to refetch until a bar of its own size has closed, so
+   * walking the ladder is usually free -- but 'usually' was doing the work.
+   * There was no guard against a second walk starting while the first was still
+   * going, and none against walking it again thirty seconds later, so a slow
+   * exchange turned one pass into several overlapping ones. A minute is more
+   * often than any series here can change.
+   */
+  private static readonly COACH_WARM_MS = 60_000;
+
+  async warmCoachCandles(market?: string): Promise<void> {
+    const symbol = market ?? this.lastFollowedMarket;
+    if (!symbol || !this.exchange) return;
+
+    // One walk at a time, and not again straight away. Both matter: the first
+    // stops passes overlapping when the exchange is slow, the second stops the
+    // sweep asking every thirty seconds for series that change hourly.
+    if (this.coachWarmRunning) return;
+    if (Date.now() - this.coachWarmAt < ExchangeClient.COACH_WARM_MS) return;
+
+    this.coachWarmRunning = true;
+    try {
+      for (const { timeframe, count } of ExchangeClient.COACH_SERIES) {
+        await this.getCandles(symbol, timeframe, ExchangeClient.coachDepth(count)).catch(
+          () => undefined
+        );
+      }
+    } finally {
+      this.coachWarmRunning = false;
+      this.coachWarmAt = Date.now();
+    }
+  }
+
+  /**
+   * What the coach is shown of the market.
+   *
+   * Built from what is already held rather than by fetching: the candle cache
+   * is read but never filled here, and the range panel's cache is used as it
+   * stands. A coach call must not put nine candle requests on the wire, and it
+   * certainly must not do so behind a confirmation panel that is waiting on it.
+   *
+   * Position and price are read live, because they are the two things that are
+   * worthless stale and both are cheap -- the ticker is streamed and the
+   * position is one call the panel is already making every couple of seconds.
+   */
+  async getMarketContext(market?: string): Promise<MarketContext | undefined> {
+    const symbol = market ?? this.lastFollowedMarket;
+    if (!symbol || !this.exchange) return undefined;
+
+    const info: any = this.availableMarkets?.[symbol] ?? {};
+
+    const [price, position, risk, orders] = await Promise.all([
+      this.getDisplayPrice(symbol).catch(() => ({}) as Awaited<
+        ReturnType<ExchangeClient['getDisplayPrice']>
+      >),
+      this.getPositionView(symbol).catch(() => null),
+      this.getPositionRisk(symbol).catch(() => undefined),
+      this.getOpenOrdersForDisplay(symbol).catch(() => []),
+    ]);
+
+    // Cached only. An empty panel is better than a coach that rate-limits the
+    // client it lives inside.
+    const ranges = this.rangeCache.get(symbol)?.ranges ?? [];
+
+    const series: MarketSeries[] = [];
+    for (const { timeframe, count } of ExchangeClient.COACH_SERIES) {
+      const cached = this.candleCache.get(
+        `${symbol}|${timeframe}|${ExchangeClient.coachDepth(count)}`
+      )?.candles;
+      if (!cached || cached.length === 0) continue;
+
+      // The bar still forming is dropped: its high, low and close are all
+      // provisional, and a coach reading it as a closed bar is reading a bar
+      // that has not happened yet.
+      const intervalMs = this.exchange.parseTimeframe(timeframe) * 1000;
+      const closed = closedCandles(cached, Date.now(), intervalMs);
+
+      series.push({
+        timeframe,
+        candles: closed.slice(-count).map((candle) => ({
+          at: candle.timestamp,
+          open: candle.open ?? candle.close,
+          high: candle.high,
+          low: candle.low,
+          close: candle.close,
+        })),
+      });
+    }
+
+    const spread =
+      price.bid !== undefined && price.ask !== undefined ? price.ask - price.bid : undefined;
+
+    return {
+      market: symbol,
+      at: Date.now(),
+      base: info.base,
+      quote: info.quote,
+      last: price.last,
+      bid: price.bid,
+      ask: price.ask,
+      mark: price.mark,
+      index: price.index,
+      spread,
+      funding: price.funding,
+      ranges: ranges.map(({ label, high, low, atr }) => ({ label, high, low, atr })),
+      position: position
+        ? {
+            side: position.side,
+            size: position.size,
+            entry: position.entry,
+            mark: position.mark,
+            unrealizedPnl: position.unrealizedPnl,
+            leverage: position.leverage,
+            effectiveLeverage: position.effectiveLeverage,
+            liquidation: position.liquidation,
+            plannedRisk: risk?.totalRisk,
+            coverage: risk?.coveragePercentage,
+            ...(() => {
+              const cost = this.fundingCost(
+                symbol,
+                position.notional === undefined
+                  ? undefined
+                  : position.side === 'SHORT'
+                    ? -position.notional
+                    : position.notional
+              );
+              return cost
+                ? {
+                    fundingCost: cost.amount,
+                    fundingDaily: cost.daily,
+                    fundingInterval: cost.interval,
+                  }
+                : {};
+            })(),
+            currency: position.currency,
+          }
+        : undefined,
+      // Read once, by the same function the panel uses. The coach and the
+      // screen therefore cannot disagree about what is protecting the position.
+      orders: describeOrders(orders, {
+        isTrailArmed: (id) => this.isTrailArmed(id),
+        chaseOrderId: this.getCurrentChaseOrderId(),
+      }),
+      series,
+    };
+  }
+
+  async loadGuardPolicy(): Promise<void> {
+    try {
+      const stored = await this.exchangeManager.getGuardPolicy();
+      this.guard.setPolicy(resolvePolicy(stored));
+      // Read here rather than at construction because the coach's key lives in
+      // the same file as the thresholds, and this is the one place that file is
+      // opened on the way into a session. A key entered on the home menu is
+      // therefore live on the next 'Start Trading' without restarting.
+      this.guard.setApiKey(await this.exchangeManager.getAnthropicKey());
+      this.guard.load();
+    } catch {
+      // Defaults stand. A profile that cannot be read must not leave the
+      // application without guardrails *and* without saying so, so this is a
+      // warning rather than silence.
+      NotificationManager.diagnostic(
+        '[ExchangeClient] Could not read guardrail settings; defaults are in use.'
+      );
+      this.guard.load();
+    }
+  }
+
+  async saveGuardPolicy(policy: GuardPolicy): Promise<void> {
+    this.guard.setPolicy(policy);
+    await this.exchangeManager.setGuardPolicy(policy);
+  }
+
+  /**
+   * The position as the guard needs to see it.
+   *
+   * `openedAt` comes from this session's own journal rather than from the
+   * exchange. That is deliberate: a position opened before Tame started has no
+   * known age here, and `noStop` treats an unknown age as 'say nothing' -- which
+   * is far better than flagging every pre-existing position the moment the
+   * application connects.
+   */
+  private async positionContextFor(market: string): Promise<PositionContext | undefined> {
+    const position = await this.getPositionView(market).catch(() => null);
+    if (!position || !(position.size > 0) || position.entry === undefined) return undefined;
+
+    const side = position.side.toLowerCase() === 'long' ? 'long' : 'short';
+    const risk = await this.getPositionRisk(market).catch(() => undefined);
+    const mark = await this.getMarkPriceForTrail(market).catch(() => undefined);
+
+    const info: any = this.availableMarkets?.[market] ?? {};
+    const contractSize = Number(info.contractSize ?? 1);
+    const notional =
+      info.inverse === true
+        ? position.size * contractSize
+        : mark !== undefined
+          ? position.size * contractSize * mark
+          : undefined;
+
+    const journalled = this.guard
+      .snapshot()
+      .openPositions.find((open) => open.market === market);
+
+    return {
+      market,
+      side,
+      size: position.size,
+      entryPrice: position.entry,
+      markPrice: mark,
+      unrealizedPnl: position.unrealizedPnl,
+      notional,
+      hasProtectiveStop: (risk?.protectedQuantity ?? 0) > 0,
+      plannedRisk: risk?.totalRisk,
+      openedAt: journalled?.openedAt,
+    };
+  }
+
+  /**
+   * What the guard makes of an order that has not been sent.
+   *
+   * Called by the command layer, which owns the confirmation prompt. A verdict
+   * of 'allow' with findings attached is the ordinary case for a notice: the
+   * order goes, and the observation is logged alongside it.
+   */
+  async reviewProposal(proposal: OrderProposal): Promise<GuardVerdict> {
+    const position = await this.positionContextFor(proposal.market).catch(() => undefined);
+    const summary = await this.equityFor(proposal.market);
+
+    return this.guard.review({
+      proposal,
+      position,
+      priceMove: await this.recentMoveFor(proposal.market).catch(() => undefined),
+      equity: summary?.equity,
+      currency: this.availableMarkets?.[proposal.market]?.quote,
+    });
+  }
+
+  /**
+   * Equity in the currency this market settles in.
+   *
+   * The percentage checks -- risk per trade, leverage -- divide by this, so
+   * taking equity in the wrong currency would not fail, it would silently
+   * produce a number off by the exchange rate. Undefined when the settle
+   * currency is unknown, which the detectors treat as 'no claim'.
+   */
+  private async equityFor(market: string): Promise<{ equity?: number } | undefined> {
+    const settle = (this.availableMarkets?.[market] as any)?.settle;
+    if (!settle) return undefined;
+    return this.getAccountSummary(String(settle)).catch(() => undefined);
+  }
+
+  /**
+   * Percentage move over the chase window, from candles already being cached.
+   *
+   * Returns undefined rather than zero when it cannot be worked out. Zero is a
+   * claim that the market has not moved, which would be a lie that happens to
+   * silence the detector.
+   */
+  private async recentMoveFor(market: string): Promise<
+    { percent: number; overMs: number } | undefined
+  > {
+    const windowMs = this.guard.getPolicy().chaseWindowMs;
+
+    try {
+      const candles = await this.getCandles(market, '1m');
+      if (!candles || candles.length < 2) return undefined;
+
+      // One bar more than the window: the move is measured from the close
+      // *before* the window opened, not from the close of its first bar, which
+      // would silently discard that bar's own movement.
+      const bars = Math.max(2, Math.round(windowMs / 60_000));
+      const slice = candles.slice(-(bars + 1));
+      const base = Number(slice[0]?.close);
+      const latest = Number(slice[slice.length - 1]?.close);
+      if (!(base > 0) || !(latest > 0)) return undefined;
+
+      return {
+        percent: ((latest - base) / base) * 100,
+        overMs: (slice.length - 1) * 60_000,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  startGuardSweep(): void {
+    if (this.guardSweepTimer) return;
+
+    this.guardSweepTimer = setInterval(() => {
+      void this.runGuardSweep().catch(() => {
+        // The sweep is advisory. It must never be the reason a session ends.
+      });
+    }, ExchangeClient.GUARD_SWEEP_MS);
+
+    this.guardSweepTimer.unref?.();
+  }
+
+  stopGuardSweep(): void {
+    if (this.guardSweepTimer) clearInterval(this.guardSweepTimer);
+    this.guardSweepTimer = null;
+  }
+
+  /**
+   * One pass over the session and whatever position is on screen.
+   *
+   * Scoped to the followed market rather than every position on the account:
+   * sweeping everything would mean a position query per market per thirty
+   * seconds, and the behaviours this catches are about the thing being traded.
+   */
+  private guardSweepRunning = false;
+
+  private async runGuardSweep(): Promise<void> {
+    const market = this.lastFollowedMarket;
+    if (!market) return;
+
+    // One at a time, for the same reason the trail review is: a pass that
+    // outlasts its interval must not have the next one start on top of it.
+    // Every sweep reads the position, the equity and the market, and passes
+    // stacking on a rate-limited queue is how a slow exchange becomes an
+    // unusable one.
+    if (this.guardSweepRunning) return;
+    this.guardSweepRunning = true;
+    try {
+      await this.guardSweepPass(market);
+    } finally {
+      this.guardSweepRunning = false;
+    }
+  }
+
+  private async guardSweepPass(market: string): Promise<void> {
+
+    const position = await this.positionContextFor(market).catch(() => undefined);
+    const summary = await this.equityFor(market);
+
+    // Keeps the coach's view of the market warm. The two things it says without
+    // being asked -- the confirmation panel's sentence and an unprompted remark
+    // -- both arrive at moments that cannot wait for a read, so the read
+    // happens here, on a timer, where waiting costs nothing.
+    void this.guard.refreshMarket();
+    // And the history behind it. Each size refuses to refetch until a bar of
+    // its own size has closed, so this is a no-op on almost every sweep.
+    void this.warmCoachCandles(market);
+
+    const { transitions, interventions } = this.guard.sweep(
+      position ? [position] : [],
+      summary?.equity,
+      this.availableMarkets?.[market]?.quote
+    );
+
+    // Only the edges are logged. What is merely still true is on the guard
+    // status line, which is rewritten in place -- a standing breach re-derived
+    // every thirty seconds is one fact, and reporting it as a hundred and
+    // twenty events an hour buried every fill and cancel between them.
+    for (const transition of transitions) {
+      const finding = transition.finding;
+      if (!finding) continue;
+
+      // Notices are already visible in the panel's own numbers and on the
+      // status line. They are tracked so they can escalate, but they do not
+      // announce themselves in either direction.
+      if (finding.severity === 'notice') continue;
+
+      if (transition.kind === 'cleared') {
+        NotificationManager.notify(
+          `${finding.behaviour.title}: cleared.`,
+          NType.INFO,
+          'SYSTEM'
+        );
+        continue;
+      }
+
+      NotificationManager.notify(
+        transition.kind === 'escalated'
+          ? `${finding.behaviour.title} (now ${finding.severity}): ${finding.detail}`
+          : `${finding.behaviour.title}: ${finding.detail}`,
+        NType.ERROR,
+        'WARNING'
+      );
+
+      // The coach is told only if the operator has asked for it to be. An
+      // unprompted remark is a model call nobody requested and somebody pays
+      // for, and a condition that flaps around its threshold can produce
+      // several inside a quarter of an hour. What the guardrail found is
+      // already on the status line and on the row above this one.
+      if (this.guard.getPolicy().coachRemarks) {
+        void this.guard
+          .getThread()
+          .nudge(finding)
+          .catch(() => undefined);
+      }
+    }
+
+    for (const intervention of interventions) {
+      if (intervention.type === 'lockout') {
+        this.guard.lockout(intervention.until, intervention.behaviour, intervention.reason);
+        NotificationManager.notify(
+          `New entries are stopped for ${Math.ceil(
+            (intervention.until - Date.now()) / 60_000
+          )} minutes. ${intervention.reason} ` +
+            `Closing and protective orders are unaffected. Lift it with 'guard unlock'.`,
+          NType.ERROR,
+          'WARNING'
+        );
+        continue;
+      }
+
+      await this.offerAssistedExit(intervention.market, intervention.urgency, intervention.reason, intervention.authorised);
+    }
+  }
+
+  /**
+   * Works out how the position would be left, and either says so or does it.
+   *
+   * The plan is always computed and always shown. An operator who has not
+   * authorised the guard to act still gets the useful half -- a worked-out exit
+   * they can run themselves with 'guard exit' -- rather than a warning and a
+   * shrug.
+   */
+  private async offerAssistedExit(
+    market: string,
+    urgency: ExitUrgency,
+    reason: string,
+    authorised: boolean
+  ): Promise<void> {
+    const plan = await this.buildExitPlan(market, urgency);
+    if (!plan) return;
+
+    const currency = this.availableMarkets?.[market]?.quote ?? '';
+
+    // Recorded whether or not it is run. A plan that was offered and declined
+    // is a decision, and it is the half of the exchange that leaves no other
+    // trace: the plan that runs at least leaves fills behind it.
+    this.guard.recordExitPlanned(
+      market,
+      urgency,
+      plan.plan.slices.length,
+      plan.plan.slices.reduce((total, slice) => total + slice.size, 0),
+      `${describeExitPlan(plan.plan, currency)}${authorised ? '' : ' (offered, not run)'}`
+    );
+
+    if (!authorised) {
+      NotificationManager.notify(
+        `${reason} A worked exit is ready: ${describeExitPlan(plan.plan, currency)} ` +
+          `Run it with 'guard exit', or authorise it in future with 'guard autoexit <behaviour>'.`,
+        NType.INFO,
+        'WARNING'
+      );
+      return;
+    }
+
+    NotificationManager.notify(
+      `${reason} Closing the position: ${describeExitPlan(plan.plan, currency)}`,
+      NType.ERROR,
+      'WARNING'
+    );
+
+    await this.runExitPlan(market, plan.side, plan.plan);
+  }
+
+  /**
+   * Tells the guard a protective stop moved, and which way.
+   *
+   * Which way is the whole point: the trail moves stops toward entry many times
+   * an hour and that must never be flagged, while a stop moved away from entry
+   * is the behaviour most worth catching. The side is read from the position
+   * rather than inferred from the prices, because 'lower' means safer for a
+   * short and worse for a long.
+   */
+  private async noteStopMoved(market: string, from: number, to: number): Promise<void> {
+    if (!(from > 0) || !(to > 0) || from === to) return;
+
+    const position = await this.getPositionView(market).catch(() => null);
+    if (!position || !(position.size > 0)) return;
+
+    this.guard.recordStopMoved(
+      market,
+      position.side.toLowerCase() === 'long' ? 'long' : 'short',
+      from,
+      to,
+      position.entry
+    );
+  }
+
+  /**
+   * Tells the guard a protective stop was cancelled while a position was open.
+   *
+   * Whether the position was losing is recorded at the moment of the cancel,
+   * not worked out later: by the time a sweep runs the position may be green
+   * again, and 'they pulled the stop while it was underwater' would quietly
+   * become false.
+   */
+  private async noteStopsCancelled(market: string, triggers: number[]): Promise<void> {
+    if (triggers.length === 0) return;
+
+    const position = await this.getPositionView(market).catch(() => null);
+    if (!position || !(position.size > 0)) return;
+
+    const underwater = (position.unrealizedPnl ?? 0) < 0;
+    for (const trigger of triggers) {
+      if (trigger > 0) this.guard.recordStopCancelled(market, trigger, underwater);
+    }
+  }
+
+  /** The plan for leaving a market, or nothing if there is no position. */
+  async buildExitPlan(
+    market: string,
+    urgency: ExitUrgency
+  ): Promise<{ plan: ReturnType<typeof planExit>; side: 'long' | 'short' } | undefined> {
+    const position = await this.positionContextFor(market).catch(() => undefined);
+    if (!position || !(position.size > 0)) return undefined;
+
+    const tick = await this.getMarketPrecision(market).catch(() => 0);
+
+    let bestBid = position.markPrice ?? 0;
+    let bestAsk = position.markPrice ?? 0;
+    try {
+      const ticker = await this.exchange!.fetchTicker(market);
+      if (Number(ticker.bid) > 0) bestBid = Number(ticker.bid);
+      if (Number(ticker.ask) > 0) bestAsk = Number(ticker.ask);
+    } catch {
+      // No book. The planner treats a zero spread as nothing to earn by
+      // resting, which collapses it toward crossing -- the right default when
+      // we cannot see what we would be resting inside of.
+    }
+
+    const atr = await this.getAtr(market, ExchangeClient.RANGE_ATR_PERIOD, '5m').catch(
+      () => undefined
+    );
+
+    return {
+      side: position.side,
+      plan: planExit(
+        {
+          side: position.side,
+          size: position.size,
+          markPrice: position.markPrice ?? bestBid,
+          bestBid,
+          bestAsk,
+          tick: tick > 0 ? tick : 0.01,
+          atr,
+        },
+        urgency
+      ),
+    };
+  }
+
+  /**
+   * The port the executor works through.
+   *
+   * Every child is reduce-only and every size is position-derived, so the
+   * fatfinger limit is deliberately not enforced on them -- the same exemption
+   * a stop gets, and for the same reason: an order that can only ever reduce
+   * exposure must always be placeable.
+   */
+  private exitPort(): ExitExecutionPort {
+    return {
+      book: async (market) => {
+        const ticker = await this.exchange!.fetchTicker(market);
+        const tick = await this.getMarketPrecision(market).catch(() => 0.01);
+        const bid = Number(ticker.bid);
+        const ask = Number(ticker.ask);
+        if (!(bid > 0) || !(ask > 0)) return undefined;
+        return { bestBid: bid, bestAsk: ask, tick: tick > 0 ? tick : 0.01 };
+      },
+      positionSize: (market) => this.getPositionSize(market),
+      placeReduceOnlyLimit: async (market, side, size, price) => {
+        const quantity = await this.getQuantityPrecision(market, size, {
+          enforceFatFinger: false,
+          price,
+        });
+        const order = await this.executeOrder('createOrder', market, 'limit', side, quantity, price, {
+          reduceOnly: true,
+        });
+        return order?.id ? String(order.id) : undefined;
+      },
+      placeReduceOnlyMarket: async (market, side, size) => {
+        const quantity = await this.getQuantityPrecision(market, size, {
+          enforceFatFinger: false,
+        });
+        const order = await this.executeOrder('createOrder', market, 'market', side, quantity, undefined, {
+          reduceOnly: true,
+        });
+        return order?.id ? String(order.id) : undefined;
+      },
+      cancelOrder: async (market, orderId) => {
+        await this.exchange!.cancelOrder(orderId, market);
+        this.forgetCancelledOrders(market, [orderId]);
+      },
+      filledOf: async (market, orderId) => {
+        const orders = await this.getLiveOpenOrders(market, undefined, true).catch(
+          () => [] as Order[]
+        );
+        const found = orders.find((order) => String(order.id) === orderId);
+        // Absent from the open list means it finished, and a finished child of
+        // a reduce-only exit has filled. Reporting zero would have the executor
+        // send the same quantity again.
+        if (!found) return Number.POSITIVE_INFINITY;
+        return Number(found.filled ?? 0);
+      },
+      say: (message, kind) =>
+        NotificationManager.notify(
+          message,
+          kind === 'good' ? NType.SUCCESS : kind === 'bad' ? NType.ERROR : NType.INFO,
+          kind === 'bad' ? 'WARNING' : 'ORDER'
+        ),
+      wait: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    };
+  }
+
+  private activeExit: ExitExecutor | null = null;
+
+  /** Whether an assisted exit is running, for 'guard exit stop'. */
+  isExiting(): boolean {
+    return this.activeExit?.isRunning() === true;
+  }
+
+  abortAssistedExit(): boolean {
+    if (!this.activeExit) return false;
+    this.activeExit.abort();
+    return true;
+  }
+
+  async runExitPlan(
+    market: string,
+    side: 'long' | 'short',
+    plan: ReturnType<typeof planExit>
+  ): Promise<void> {
+    if (this.isExiting()) {
+      NotificationManager.notify(
+        'An assisted exit is already running. Stop it with \'guard exit stop\' first.',
+        NType.ERROR,
+        'ERROR'
+      );
+      return;
+    }
+
+    // A fresh executor per run: abort is one-way by design, so a reused one
+    // would refuse to start after the first time it was stopped.
+    const executor = new ExitExecutor(this.exitPort());
+    this.activeExit = executor;
+
+    try {
+      await executor.run(market, side, plan, Date.now());
+    } finally {
+      this.activeExit = null;
+    }
+  }
+
   startTrailMonitor(): void {
     if (this.trailTimer) return;
     this.trailTimer = setInterval(() => {
@@ -3822,6 +5003,11 @@ export class ExchangeClient {
     }, ExchangeClient.TRAIL_CHECK_MS);
     // Long-lived timer; it must not be the reason the process stays alive.
     this.trailTimer.unref?.();
+  }
+
+  /** Whether a delayed trail has reached its arming price. */
+  isTrailArmed(orderId: string): boolean {
+    return this.armedTrails.has(orderId);
   }
 
   stopTrailMonitor(): void {
@@ -3854,6 +5040,7 @@ export class ExchangeClient {
             this.trailFailures.delete(id);
             this.abandonedTrails.delete(id);
             this.trailResumeAnnounced.delete(id);
+            this.armedTrails.delete(id);
           }
         }
 
@@ -4038,6 +5225,86 @@ export class ExchangeClient {
     }
   }
 
+  /**
+   * Replaces a managed stop with an exchange-run trailing stop.
+   *
+   * The new order goes on before the old one comes off. Two stops for a moment
+   * is harmless -- both close the whole position, so the second finds nothing
+   * to do -- whereas a gap between them is a moment with no protection at all,
+   * which is not a trade worth making to keep the panel tidy.
+   *
+   * The extreme the exchange starts from is the current price, and that is
+   * right here: arming happens because price has just reached the arming level,
+   * so there is no earlier high to carry across.
+   */
+  private async handOverToExchangeTrail(
+    market: string,
+    order: Order,
+    distance: number,
+    side: TrailSide
+  ): Promise<void> {
+    const id = String(order.id ?? '');
+    const info: any = (order as any).info ?? {};
+    const quantity = Number(info.orderQtyRq ?? 0);
+
+    const reference = await this.getMarkPriceForTrail(market);
+    if (reference === undefined) return;
+
+    const start = side === 'long' ? reference - distance : reference + distance;
+
+    try {
+      const replacement = await this.createStopOrder(
+        market,
+        start,
+        quantity > 0 ? quantity : undefined,
+        true,
+        false,
+        distance
+      );
+
+      if (!replacement?.id) throw new Error('the exchange did not return an order');
+
+      await this.exchange!
+        .cancelOrder(id, market)
+        .then(() => this.forgetCancelledOrders(market, [id]))
+        .catch((error: unknown) => {
+        // The trail is running; the old stop is the leftover. Say so plainly
+        // rather than leaving two stops on the book unexplained.
+        NotificationManager.notify(
+          `The exchange trail is running, but the original stop ${id.slice(0, 8)} could not be cancelled: ` +
+            `${(error as Error).message}. Cancel it manually.`,
+          NType.ERROR,
+          'ERROR'
+        );
+      });
+
+      this.trailHighWater.delete(id);
+      this.trailFailures.delete(id);
+
+      NotificationManager.notify(
+        `Handed to the exchange: trailing ${this.formatPriceForDisplay(market, distance)} ` +
+          `behind, from ${this.formatPriceForDisplay(market, start)}. ` +
+          `It keeps trailing whether or not Tame is running.`,
+        NType.SUCCESS,
+        'ORDER'
+      );
+    } catch (error) {
+      NotificationManager.notify(
+        `Could not hand trail ${id.slice(0, 8)} to the exchange: ${(error as Error).message}. ` +
+          `The original stop is still resting and unchanged.`,
+        NType.ERROR,
+        'ERROR'
+      );
+    }
+  }
+
+  /** How a trail's terms read in a message. */
+  private describeTrailTag(tag: TrailTag): string {
+    return tag.kind === 'atr'
+      ? `${tag.value}x ATR(${ExchangeClient.RANGE_ATR_PERIOD}) ${tag.timeframe}`
+      : `${tag.value} fixed`;
+  }
+
   private async reviewTrail(market: string, order: Order): Promise<void> {
     const id = String(order.id ?? '');
     if (!id || this.abandonedTrails.has(id)) return;
@@ -4052,13 +5319,19 @@ export class ExchangeClient {
     const mark = await this.getMarkPriceForTrail(market);
     if (mark === undefined) return;
 
-    const [atr, tick] = await Promise.all([
-      this.getAtr(market, ExchangeClient.RANGE_ATR_PERIOD, tag.timeframe).catch(() => undefined),
-      this.getMarketPrecision(market).catch(() => 0),
-    ]);
-    if (atr === undefined) return;
+    const tick = await this.getMarketPrecision(market).catch(() => 0);
 
-    const cushion = atr * tag.multiple;
+    // A fixed trail's distance is on the order; an ATR one is measured now.
+    let cushion: number | undefined = tag.kind === 'fixed' ? tag.value : undefined;
+    if (tag.kind === 'atr' && tag.timeframe) {
+      const atr = await this.getAtr(
+        market,
+        ExchangeClient.RANGE_ATR_PERIOD,
+        tag.timeframe
+      ).catch(() => undefined);
+      cushion = atr === undefined ? undefined : atr * tag.value;
+    }
+    if (cushion === undefined || !(cushion > 0)) return;
     const direction = side === 'long' ? 1 : -1;
 
     let high = this.trailHighWater.get(id);
@@ -4098,6 +5371,55 @@ export class ExchangeClient {
     high = advanceHighWaterMark(side, high, mark);
     if (high === undefined) return;
     this.trailHighWater.set(id, high);
+
+    // A delayed trail does nothing until the position has moved far enough to
+    // arm it. The test is against the high-water mark rather than the current
+    // price, so arming is sticky: once reached it stays reached, and a pullback
+    // cannot un-arm a trail that has already begun.
+    if (tag.armPrice !== undefined) {
+      if (direction * (high - tag.armPrice) < 0) return;
+
+      if (!this.armedTrails.has(id)) {
+        this.armedTrails.add(id);
+        // Journalled as well as announced. It is the moment a fixed stop starts
+        // following the position, and it is the only transition in the system
+        // that leaves no trace on the order itself -- the order is identical
+        // either side of it. Without this line a record of the day cannot say
+        // when, or whether, the trail ever began.
+        this.guard.recordTrailArmed(market, tag.armPrice, stop, id);
+        NotificationManager.notify(
+          `Trail armed at ${this.formatPriceForDisplay(market, tag.armPrice)} ` +
+            `(${this.describeTrailTag(tag)})`,
+          NType.SUCCESS,
+          'ORDER'
+        );
+      }
+
+      // A fixed distance has nothing left to recalculate, so from here the
+      // exchange runs it and keeps running it whether or not this process does.
+      // An ATR trail stays with us, because its distance keeps changing.
+      //
+      // But only while price is at its high. The exchange begins trailing from
+      // wherever price is when the order is placed, and knows nothing of any
+      // extreme before that -- so handing over during a pullback would set the
+      // stop a full distance below the current price rather than below the high
+      // it should be measured from. That is not hypothetical: a trail that
+      // armed while Tame was closed is discovered on restart, quite possibly
+      // after a retrace, and the high we just reconstructed would be discarded
+      // in the act of using it.
+      //
+      // So it stays managed here until price returns to its high-water mark, at
+      // which point the two agree and the hand-over costs nothing. Until then
+      // it trails from here, which is the same protection by a different means.
+      if (tag.kind === 'fixed') {
+        const room = Math.max(tick, 1e-8);
+        if (direction * (mark - high) >= -room) {
+          await this.handOverToExchangeTrail(market, order, tag.value, side);
+          return;
+        }
+      }
+
+    }
 
     const plan = planTrailStop(
       { side, highWaterMark: high, stop, mark },
@@ -4140,8 +5462,7 @@ export class ExchangeClient {
       NotificationManager.notify(
         `Trail raised ${this.formatPriceForDisplay(market, stop)} -> ` +
           `${this.formatPriceForDisplay(market, plan.stop)} ` +
-          `(${tag.multiple}x ATR(${ExchangeClient.RANGE_ATR_PERIOD}) ${tag.timeframe} ` +
-          `= ${this.formatPriceForDisplay(market, atr * tag.multiple)} behind ` +
+          `(${this.describeTrailTag(tag)} = ${this.formatPriceForDisplay(market, cushion)} behind ` +
           `${this.formatPriceForDisplay(market, high)})`,
         NType.SUCCESS,
         'ORDER'
@@ -4193,6 +5514,100 @@ export class ExchangeClient {
     return orders.filter((order) =>
       readTrailTag((order as any).clientOrderId ?? (order as any).info?.clOrdID)
     );
+  }
+
+  /**
+   * A stop now, which becomes a trail once the position has proved itself.
+   *
+   * The arming price is the stop plus the trail's distance -- the point at
+   * which trailing would first put the stop somewhere better than where it
+   * already is. Measuring from the entry instead held the stop still through a
+   * window where trailing would have raised it, and gained nothing: the two
+   * rules converge the moment the entry-based one arms and are identical from
+   * then on, so measuring from the entry could only ever be the same or worse.
+   *
+   * It also makes the order mean what it says. 'stop 98.50 trail 10' is a stop
+   * at 98.50 that trails ten behind, and it starts trailing exactly when
+   * trailing would move it. Nothing about the entry price comes into it.
+   *
+   * The distance and the arming price are both fixed at placement. Recomputing
+   * either later would move the arming price after the fact: adding to a
+   * position changes its average entry, and an ATR cushion changes every
+   * candle.
+   */
+  async createDelayedTrailOrder(
+    market: string,
+    stopPrice: number,
+    size: number | undefined,
+    spec: TrailSpec
+  ): Promise<Order | undefined> {
+    const position = await this.getPositionView(market);
+    if (!position || !(position.size > 0)) {
+      throw new Error('No open position to trail.');
+    }
+    // No entry price needed: arming is measured from the stop being placed, not
+    // from where the position was opened.
+    const existing = await this.findAdaptiveTrails(market);
+    if (existing.length > 0) {
+      throw new Error(
+        `A managed trail is already running on ${market} (${String(existing[0].id).slice(0, 8)}). ` +
+          `Cancel it first. No order was placed.`
+      );
+    }
+
+    const reference =
+      (await this.getMarkPriceForTrail(market)) ?? (await this.getReferencePrice(market));
+    if (reference === undefined) {
+      throw new Error(`No price available for ${market}, so the trail cannot be placed.`);
+    }
+
+    const distance = await this.resolveTrailDistance(market, spec, reference);
+    if (distance === undefined || !(distance > 0)) {
+      throw new Error(
+        spec.kind === 'atr'
+          ? `Could not measure ATR(${spec.period}) on ${spec.timeframe} for ${market}. No order was placed.`
+          : 'That trail works out to zero distance.'
+      );
+    }
+
+    const isLong = position.side.toUpperCase() === 'LONG';
+    const armPrice = isLong ? stopPrice + distance : stopPrice - distance;
+
+    const clientOrderId = buildTrailTag(
+      spec.kind === 'atr'
+        ? { kind: 'atr', value: spec.multiple, timeframe: spec.timeframe, armPrice }
+        : { kind: 'fixed', value: distance, armPrice }
+    );
+
+    const order = await this.createStopOrder(
+      market,
+      stopPrice,
+      size,
+      false,
+      true,
+      undefined,
+      clientOrderId,
+      true
+    );
+
+    if (order?.id) {
+      this.adaptiveMarkets.add(market);
+      this.trailHighWater.set(String(order.id), reference);
+    }
+
+    const already = isLong ? reference >= armPrice : reference <= armPrice;
+
+    NotificationManager.notify(
+      `Stop at ${this.formatPriceForDisplay(market, stopPrice)}; ` +
+        `trails ${describeTrailSpec(spec)} once price reaches ` +
+        `${this.formatPriceForDisplay(market, armPrice)} ` +
+        `(the stop plus ${this.formatPriceForDisplay(market, distance)})` +
+        (already ? '. Price is already there, so it arms on the next check.' : ''),
+      NType.INFO,
+      'ORDER'
+    );
+
+    return order;
   }
 
   async createTrailingStopOrder(
@@ -4305,7 +5720,8 @@ export class ExchangeClient {
     }
 
     const clientOrderId = buildTrailTag({
-      multiple: spec.multiple,
+      kind: 'atr',
+      value: spec.multiple,
       timeframe: spec.timeframe,
     });
 
@@ -4450,6 +5866,11 @@ export class ExchangeClient {
           // check here could only fail and leave the position with no stop.
           const newOrder = await this.createStopOrder(market, finalStopPrice, finalAmount, true, false);
           newOrderId = newOrder?.id; // Store the new order ID
+
+          // Only once the replacement exists: a cancel that was not followed by
+          // a new stop is a cancellation, not a move, and reporting it as a
+          // move would hide the more serious of the two.
+          void this.noteStopMoved(market, Number(stopOrder.stopPrice), finalStopPrice);
 
       } catch (replaceError) {
           console.error(`[ExchangeClient] Error during cancel/replace:`, replaceError);

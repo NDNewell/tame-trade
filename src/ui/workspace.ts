@@ -6,9 +6,10 @@
 import { ExchangeClient } from '../exchange/exchangeClient.js';
 import { ActivityLog } from './activityLog.js';
 import { Screen } from './screen.js';
-import { NO_VALUE, TerminalView } from './frame.js';
+import { ConfirmationView, NO_VALUE, TerminalView } from './frame.js';
 import { PositionRiskResult } from '../trading/positionRisk.js';
-import { readTrailTag } from '../trading/trailTag.js';
+import { RANGE_WINDOWS } from '../trading/volatility.js';
+import { describeOrders } from '../trading/orderView.js';
 
 const FOOTER = [
   'buy',
@@ -17,6 +18,8 @@ const FOOTER = [
   'limit',
   'trail',
   'cancel',
+  'guard',
+  'coach',
   'orders',
   'positions',
   'market',
@@ -72,6 +75,41 @@ const signed = (value: unknown): string => {
   return `${numeric >= 0 ? '+' : ''}${numeric.toFixed(2)}`;
 };
 
+/**
+ * Every period the panel will ever show, with nothing in it yet.
+ *
+ * The shell has to be the final shape from the first frame, so the columns come
+ * from the window definitions rather than from whatever the exchange has
+ * answered so far. Cells fill in individually as their timeframe arrives; one
+ * slow or failed daily request leaves one column reading '--' instead of
+ * withholding the whole block.
+ */
+const pendingRanges = (): TerminalView['ranges'] =>
+  RANGE_WINDOWS.map(({ label }) => ({
+    label,
+    high: NO_VALUE,
+    low: NO_VALUE,
+    atr: NO_VALUE,
+  }));
+
+/** What has arrived, laid into the full set of columns. */
+const mergeRanges = (
+  measured: Array<{ label: string; high?: number; low?: number; atr?: number }>,
+  tick: (value: unknown) => string
+): TerminalView['ranges'] => {
+  const byLabel = new Map(measured.map((range) => [range.label, range]));
+
+  return RANGE_WINDOWS.map(({ label }) => {
+    const range = byLabel.get(label);
+    return {
+      label,
+      high: range?.high === undefined ? NO_VALUE : tick(range.high),
+      low: range?.low === undefined ? NO_VALUE : tick(range.low),
+      atr: range?.atr === undefined ? NO_VALUE : tick(range.atr),
+    };
+  });
+};
+
 export function emptyView(): TerminalView {
   return {
     header: {
@@ -95,7 +133,7 @@ export function emptyView(): TerminalView {
       funding: NO_VALUE,
       spread: NO_VALUE,
     },
-    ranges: [],
+    ranges: pendingRanges(),
     position: null,
     orders: [],
     chase: null,
@@ -155,7 +193,16 @@ export class Workspace {
   constructor(
     private client: ExchangeClient,
     private onCommand: (command: string) => Promise<void>,
-    private onQuit: () => void
+    private onQuit: () => void,
+    /**
+     * A question typed at the coach prompt.
+     *
+     * Routed separately from the command line all the way down. The two
+     * prompts mean different things and merging them anywhere -- including
+     * here, where it would be convenient -- is how a question ends up being
+     * parsed as an order.
+     */
+    private onCoach: (question: string) => Promise<void> = async () => {}
   ) {}
 
   start(market: string): void {
@@ -173,7 +220,7 @@ export class Workspace {
     view.header.exchange = this.client.getSelectedExchangeName() ?? NO_VALUE;
     view.header.connection = 'CONNECTED';
 
-    this.screen = new Screen(view, this.onCommand, this.onQuit);
+    this.screen = new Screen(view, this.onCommand, this.onQuit, this.onCoach);
     this.screen.start();
 
     ActivityLog.getInstance().add('SYSTEM', `Connected to ${view.header.exchange}`);
@@ -186,10 +233,66 @@ export class Workspace {
     // Adaptive trails are the exchange's to run and ours to adjust; the monitor
     // reconsiders them as candles close.
     this.client.startTrailMonitor();
+    // The guardrails sweep for things no order is being placed about: a
+    // position left unprotected, a day quietly giving back its profit.
+    this.client.startGuardSweep();
 
     this.refreshTimer = setInterval(() => void this.refresh(), 2000);
     this.tickTimer = setInterval(() => this.tickCountdown(), 1000);
     void this.refresh();
+  }
+
+  /**
+   * Puts an order in front of the operator, or takes the panel away.
+   *
+   * The confirmation panel replaces the position/orders block rather than
+   * overlaying it, so there is no reading of a held order against a background
+   * of numbers that are about to change. Passing null restores the block.
+   */
+  showConfirmation(confirmation: ConfirmationView | null): void {
+    this.screen?.update({ confirmation });
+  }
+
+  /**
+   * The coach thread and the standing guardrail conditions, as the panel takes
+   * them.
+   *
+   * Pulled from the guard rather than pushed into the workspace, so the panel
+   * cannot drift out of step with what the guard actually holds. Both are in
+   * memory, so this costs nothing and is safe on the redraw path.
+   */
+  private coachState(): Pick<TerminalView, 'coach' | 'coachBusy' | 'guard'> {
+    const guard = this.client.getGuard();
+    const thread = guard.getThread();
+    const active = guard.activeFindings();
+
+
+    return {
+      coach: thread.all().map(({ kind, text }) => ({ kind, text })),
+      coachBusy: thread.busy(),
+      guard: {
+        count: active.length,
+        // Behaviour ids rather than titles: the status line is read at a glance
+        // and re-read all session, and the id is what `guard explain` takes.
+        // Severity is named only when it is worth acting on.
+        summary: active
+          .map(({ finding }) =>
+            finding.severity === 'notice'
+              ? finding.behaviour.id
+              : `${finding.behaviour.id} (${finding.severity})`
+          )
+          .join(', '),
+      },
+    };
+  }
+
+  /**
+   * Repaints the coach panel now, for a change that must not wait for the
+   * two-second refresh -- a question the operator just typed, or the answer
+   * landing. Everything else arrives on the next cycle.
+   */
+  showCoach(): void {
+    this.screen?.update(this.coachState());
   }
 
   /** The header as it currently stands, for partial updates. */
@@ -207,6 +310,10 @@ export class Workspace {
 
   setMarket(market: string): void {
     this.market = market;
+    // The transcript says what was being traded while it was being said. A
+    // conversation about sizing reads very differently against SOL than
+    // against BTC, and the market is not in the words.
+    this.client.getGuard().getThread().setSubject(market);
     // The figures are account-level but their unit follows the market's
     // settlement currency, so they are cleared until the next refresh rather
     // than shown against the previous market's unit.
@@ -229,6 +336,7 @@ export class Workspace {
     this.refreshTimer = null;
     this.tickTimer = null;
     this.client.stopTrailMonitor();
+    this.client.stopGuardSweep();
     this.screen?.stop();
     this.screen = null;
   }
@@ -254,8 +362,40 @@ export class Workspace {
     });
   }
 
+  /** Whether a refresh is still running, so the next tick does not stack on it. */
+  private refreshing = false;
+
+  /**
+   * One pass over the exchange, on a two-second timer.
+   *
+   * Guarded against overlapping itself, which is the whole of this comment.
+   * Each pass issues half a dozen requests, and the timer fired whether or not
+   * the previous pass had finished -- so the moment a pass took longer than two
+   * seconds, a second one started on top of it, then a third. Every pass in
+   * flight adds its requests to the same rate-limited queue, which makes each
+   * one slower, which starts more of them. That is not a slow client, it is a
+   * client accelerating away from an exchange that answers at a fixed rate, and
+   * it ends where it ended: 'throttle queue is over maxCapacity (1000)' and
+   * every read failing.
+   *
+   * A skipped tick costs two seconds of staleness. The alternative costs the
+   * session.
+   */
   private async refresh(): Promise<void> {
     if (!this.screen || !this.market) return;
+    if (this.refreshing) return;
+
+    this.refreshing = true;
+    try {
+      await this.refreshOnce();
+    } finally {
+      this.refreshing = false;
+    }
+  }
+
+  private async refreshOnce(): Promise<void> {
+    const screen = this.screen;
+    if (!screen || !this.market) return;
 
     // The full form, settlement suffix included. It is the only place the
     // market is named now, so it names it completely.
@@ -288,14 +428,24 @@ export class Workspace {
       const chaseOrderId = this.client.getCurrentChaseOrderId();
       const chaseDeadline = this.client.getChaseDeadline();
 
-      this.screen.update({
+      // Signed from the operator's side, so the panel can say whether the next
+      // payment is money leaving or arriving rather than only how much it is.
+      const signedNotional =
+        position && position.notional !== undefined
+          ? position.side === 'SHORT'
+            ? -position.notional
+            : position.notional
+          : undefined;
+      const cost = this.client.fundingCost(this.market, signedNotional);
+      // The period stays on the value even though it is always a day: every
+      // other figure in POSITION is a point-in-time reading, and a rate sitting
+      // among them with no period reads as a total.
+      const fundingCost = cost ? `${signed(cost.daily)}/24h` : undefined;
+
+      screen.update({
+        ...this.coachState(),
         header: this.header(),
-        ranges: ranges.map(({ label, high, low, atr }) => ({
-          label,
-          high: tick(high),
-          low: tick(low),
-          atr: tick(atr),
-        })),
+        ranges: mergeRanges(ranges, tick),
         market: {
           symbol,
           last: tick(price.last),
@@ -338,75 +488,35 @@ export class Workspace {
                   ? `${position.effectiveLeverage.toFixed(2)}x`
                   : NO_VALUE,
               liquidation: dash(position.liquidation),
+              funding: fundingCost,
+              fundingCurrency: cost?.currency,
             }
           : null,
-        orders: (this.lastOrders = orders.map((order) => {
-          const info = (order as any).info ?? {};
-          const trigger = (order as any).triggerPrice ?? info.stopPxRp ?? info.stopPxEp;
-          const size = Number(order.remaining ?? order.amount ?? 0);
-          const isTrigger = trigger !== undefined && Number(trigger) > 0;
-
-          // What the order is, kept separate from where it is in its life. The
-          // exchange conflates the two; the distinction is ours to present.
-          const type = isTrigger
-            ? 'STOP'
-            : String(order.type ?? 'LIMIT').toUpperCase();
-
-          // A trailing stop is a stop the exchange keeps moving. Without this
-          // it is indistinguishable from a fixed one in the panel, so there is
-          // no way to tell from the screen whether the trail actually took.
-          const peg = Number(info.pegOffsetValueRp ?? info.pegOffsetValueEp ?? 0);
-          const isTrailing =
-            peg !== 0 &&
-            String(info.pegPriceType ?? '').toLowerCase().includes('trailing');
-
-          // A trail this application moves, as opposed to one the exchange
-          // runs at a fixed distance. It carries no peg -- to the exchange it
-          // is an ordinary stop -- so the tag is the only thing that
-          // distinguishes it, and the distinction matters: only one of the two
-          // adjusts itself.
-          const adaptive =
-            readTrailTag((order as any).clientOrderId ?? info.clOrdID) !== undefined;
-
-          const filled = Number(order.filled ?? 0);
-          const status = isTrigger
-            ? 'WORKING'
-            : filled > 0 && size > 0
-            ? 'PARTIAL'
-            : String(order.status ?? 'open').toLowerCase() === 'open'
-            ? 'WORKING'
-            : String(order.status ?? '').toUpperCase();
-
-          return {
-            id: String(order.id ?? '').slice(0, 8),
-            side: String(order.side ?? '').toUpperCase(),
-            // An order covering the whole position carries a quantity of zero.
-            // 'ALL' says what that means; '0' reads as an empty order.
-            qty: size > 0 ? formatQuantity(size) : isTrigger ? 'ALL' : NO_VALUE,
-            price: isTrigger
-              ? tick(trigger)
-              : order.price !== undefined
-              ? tick(order.price)
+        orders: (this.lastOrders = describeOrders(orders, {
+          isTrailArmed: (id) => this.client.isTrailArmed(id),
+          chaseOrderId,
+        }).map((view) => ({
+          id: view.id.slice(0, 8),
+          side: view.side,
+          // An order covering the whole position carries a quantity of zero.
+          // 'ALL' says what that means; '0' reads as an empty order.
+          qty: view.wholePosition
+            ? 'ALL'
+            : view.quantity !== undefined
+              ? formatQuantity(view.quantity)
               : NO_VALUE,
-            type,
-            status,
-            // Only while a chase is actually running and working this order.
-            // CHASE is checked first: it means this process is working the
-            // order, which is a stronger claim than the exchange trailing it.
-            managed:
-              chaseOrderId && order.id === chaseOrderId
-                ? 'CHASE'
-                : adaptive
-                ? 'ATR'
-                : isTrailing
-                ? 'TRAIL'
-                : undefined,
-            expires:
-              chaseOrderId && order.id === chaseOrderId && chaseDeadline
-                ? countdown(chaseDeadline)
-                : undefined,
-          };
-        })),
+          price:
+            view.trigger !== undefined
+              ? tick(view.trigger)
+              : view.price !== undefined
+                ? tick(view.price)
+                : NO_VALUE,
+          type: view.type,
+          status: view.status,
+          managed: view.managed,
+          expires:
+            view.managed === 'CHASE' && chaseDeadline ? countdown(chaseDeadline) : undefined,
+        }))),
       });
     } catch (error) {
       ActivityLog.getInstance().add('WARNING', `Could not refresh: ${(error as Error).message}`);

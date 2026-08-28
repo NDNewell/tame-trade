@@ -5,6 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { AppError } from '../errors/appError.js';
 import { ErrorType } from '../errors/errorType.js';
+import { GuardPolicy } from '../guard/guardPolicy.js';
 
 export type ExchangeAuthType = 'apiKey' | 'privateKey';
 
@@ -28,6 +29,14 @@ export interface Profile {
   // Orders worth at least this much ask for confirmation before being sent.
   // Undefined means no order is ever held for confirmation.
   confirmAbove?: number;
+  // Guardrail thresholds. Stored as a partial: only what the operator changed
+  // is written, so a later version's new defaults reach an existing profile
+  // rather than being frozen at whatever this version happened to ship.
+  guard?: Partial<GuardPolicy>;
+  // Anthropic key for the coach. Kept beside the exchange credentials because
+  // it is the same kind of secret with the same handling: this file, mode 0700,
+  // never the repository. The coach is optional, so this usually isn't set.
+  anthropicApiKey?: string;
 }
 
 export class ConfigManager {
@@ -147,6 +156,62 @@ export class ConfigManager {
       delete profile.confirmAbove;
     } else {
       profile.confirmAbove = threshold;
+    }
+
+    await this.updateProfile(profile);
+  }
+
+  /**
+   * The stored guardrail settings, or nothing if none were ever changed.
+   *
+   * Deliberately not resolved against the defaults here -- `resolvePolicy` does
+   * that, and doing it in two places is how the two copies come to disagree.
+   */
+  async getGuardPolicy(): Promise<Partial<GuardPolicy> | undefined> {
+    if (!(await this.hasProfile())) return undefined;
+
+    const profile = await this.getProfile();
+    const stored = profile.guard;
+
+    return stored && typeof stored === 'object' ? stored : undefined;
+  }
+
+  async setGuardPolicy(policy: Partial<GuardPolicy> | undefined): Promise<void> {
+    const profile = await this.getProfile();
+
+    if (policy === undefined) {
+      delete profile.guard;
+    } else {
+      profile.guard = policy;
+    }
+
+    await this.updateProfile(profile);
+  }
+
+  /**
+   * The stored coach key, or nothing if none was entered.
+   *
+   * Returns undefined rather than the empty string for a cleared key, so a
+   * caller cannot accidentally construct a client with '' and get an
+   * authentication failure where it meant to get no coach at all.
+   */
+  async getAnthropicKey(): Promise<string | undefined> {
+    if (!(await this.hasProfile())) return undefined;
+
+    const stored = (await this.getProfile()).anthropicApiKey;
+    return typeof stored === 'string' && stored.trim().length > 0
+      ? stored.trim()
+      : undefined;
+  }
+
+  async setAnthropicKey(key: string | undefined): Promise<void> {
+    const profile = await this.getProfile();
+    const trimmed = key?.trim();
+
+    if (!trimmed) {
+      delete profile.anthropicApiKey;
+    } else {
+      profile.anthropicApiKey = trimmed;
     }
 
     await this.updateProfile(profile);

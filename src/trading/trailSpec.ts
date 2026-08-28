@@ -154,8 +154,9 @@ export function parseTrailSpec(argument: string): TrailSpec | TrailSpecError {
   return { kind: 'absolute', distance };
 }
 
-export const isTrailSpecError = (
-  value: TrailSpec | TrailSpecError
+/** Works for anything the parsers in this module can return. */
+export const isTrailSpecError = <T extends object>(
+  value: T | TrailSpecError
 ): value is TrailSpecError => 'error' in value;
 
 /** How the trail reads in the order panel and the activity log. */
@@ -168,4 +169,70 @@ export function describeTrailSpec(spec: TrailSpec): string {
     case 'atr':
       return `${spec.multiple}x ATR(${spec.period}) ${spec.timeframe}`;
   }
+}
+
+/** A stop placed now that becomes a trail later. */
+export interface DelayedTrailCommand {
+  /** Where the stop rests until the trail arms. */
+  stopPrice: number;
+  /** Optional size; absent means the whole position. */
+  size?: number;
+  /** How it will trail once armed. */
+  trail: TrailSpec;
+}
+
+/**
+ * Reads `stop <price> [size] trail <spec>`.
+ *
+ * Returns undefined -- not an error -- when the words are not this form at all,
+ * so the caller can fall through to the ordinary stop command. An error is
+ * reserved for input that clearly meant to be a delayed trail and could not be
+ * read, which must never be guessed at: it decides where a position is closed.
+ */
+export function parseDelayedTrail(
+  command: string
+): DelayedTrailCommand | TrailSpecError | undefined {
+  const words = command.trim().split(/\s+/);
+  if (words[0]?.toLowerCase() !== 'stop') return undefined;
+
+  const at = words.findIndex((word) => word.toLowerCase() === 'trail');
+  if (at === -1) return undefined;
+
+  const before = words.slice(1, at);
+  const after = words.slice(at + 1);
+
+  if (before.length === 0) {
+    return { error: "Give a stop price before 'trail', as in 'stop 97 trail 10'." };
+  }
+  if (before.length > 2) {
+    return { error: `Too many arguments before 'trail' in '${command.trim()}'.` };
+  }
+
+  const stopPrice = Number(before[0]);
+  if (!Number.isFinite(stopPrice) || stopPrice <= 0) {
+    return { error: `'${before[0]}' is not a usable stop price.` };
+  }
+
+  let size: number | undefined;
+  if (before.length === 2) {
+    size = Number(before[1]);
+    if (!Number.isFinite(size) || size <= 0) {
+      return { error: `'${before[1]}' is not a usable size.` };
+    }
+  }
+
+  if (after.length === 0) {
+    return { error: "Give a trail after 'trail', as in 'stop 97 trail 10'." };
+  }
+
+  const trail = parseTrailSpec(after.join(' '));
+  if (isTrailSpecError(trail)) return trail;
+
+  return { stopPrice, size, trail };
+}
+
+/** How a delayed trail's arming reads in the log. */
+export function describeDelayedTrail(command: DelayedTrailCommand): string {
+  const size = command.size === undefined ? 'the whole position' : `${command.size}`;
+  return `stop at ${command.stopPrice} on ${size}, then trail ${describeTrailSpec(command.trail)}`;
 }

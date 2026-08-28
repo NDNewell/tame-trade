@@ -12,6 +12,8 @@
 // textual label so colour is never the only carrier of meaning.
 
 import { formatOutput as fo, Color, FontStyle } from '../utils/formatOutput.js';
+import { CoachNode, coachNodes } from './coachBlocks.js';
+import { wrapText } from './wrap.js';
 
 /** Below this the desktop composition can't hold together. */
 export const MIN_WIDTH = 72;
@@ -79,6 +81,28 @@ export interface PositionView {
   /** What the position is actually levered at now, as against the setting. */
   effectiveLeverage: string;
   liquidation: string;
+  /**
+   * What funding moves over a day, signed from the operator's side.
+   *
+   * Belongs here rather than beside the rate in MARKET, and not only because
+   * the rate's cell is too narrow to hold it: the rate is a property of the
+   * instrument and is true whether or not anything is held, while this is a
+   * cost of holding this position at this size. It appears when there is a
+   * position and disappears with it, which is exactly what the panel is for.
+   *
+   * A day rather than a payment. One payment reads as a rounding error at any
+   * size worth taking; the daily figure is the one that can be set against the
+   * move being waited for.
+   */
+  funding?: string;
+  /**
+   * The unit funding settles in, which goes in the label rather than the value.
+   *
+   * The value is a rate -- an amount over a period -- so it has two things to
+   * carry already. Hanging the currency off it as well made the one field on
+   * the panel that reads as a sentence rather than a number.
+   */
+  fundingCurrency?: string;
 }
 
 export interface OrderRowView {
@@ -136,6 +160,32 @@ export interface ConfirmationView {
   prompt: string;
 }
 
+/**
+ * One exchange in the coach thread, before it is wrapped to a panel width.
+ *
+ * Unwrapped on purpose: only the frame knows how wide the panel turned out,
+ * and text wrapped anywhere else would have to be re-wrapped here anyway.
+ */
+export interface CoachEntryView {
+  kind: 'operator' | 'coach' | 'system';
+  text: string;
+}
+
+/**
+ * What the guardrails currently hold to be true.
+ *
+ * This is the half of the guard's output that is a *condition* rather than an
+ * event: a position sized past the risk limit stays sized past it until it is
+ * closed. It belongs somewhere that can be rewritten in place, which is what
+ * this is -- the activity log gets the moment it started and the moment it
+ * ends, and nothing in between.
+ */
+export interface GuardStatusView {
+  count: number;
+  /** Already ordered worst first, e.g. 'risk-per-trade (hold), give-back'. */
+  summary: string;
+}
+
 export interface TerminalView {
   header: HeaderView;
   ranges: RangeColumnView[];
@@ -157,6 +207,38 @@ export interface TerminalView {
    * follows the tail.
    */
   activityOffset?: number;
+  /**
+   * The coach conversation, oldest first. An empty thread renders an invitation
+   * rather than an empty box, so the panel explains itself without a help page.
+   */
+  coach?: CoachEntryView[];
+  /**
+   * How far the coach panel is scrolled back from the newest line. Zero follows
+   * the tail. Counted in painted rows rather than in exchanges, because an
+   * answer that wrapped to six rows is six rows of scrolling.
+   */
+  coachOffset?: number;
+  /** A reply is outstanding. The panel says so rather than looking finished. */
+  coachBusy?: boolean;
+  /**
+   * Standing guardrail conditions.
+   *
+   * Rendered inside the coach column as an intervention rather than as a
+   * heading of its own: GUARD is something the coach is telling the operator,
+   * and putting it level with COACH made the two read as rival section labels.
+   */
+  guard?: GuardStatusView;
+  /** What has been typed at the coach prompt, kept apart from the command line. */
+  coachInput?: string;
+  /**
+   * Which prompt a keystroke reaches.
+   *
+   * Two prompts need an answer to this, and the answer has to be visible: the
+   * focused one keeps its cyan caret and the other dims. Defaults to the
+   * command line, because that is the one an operator reaches for without
+   * looking.
+   */
+  focus?: 'command' | 'coach';
   footer: string[];
   footerRight: string;
 }
@@ -183,18 +265,22 @@ interface BoxChars {
   h: string; v: string;
   tl: string; tr: string; bl: string; br: string;
   teeDown: string; teeUp: string; teeLeft: string; teeRight: string;
+  /** Where one block's divider closes and the next one's opens. */
+  cross: string;
 }
 
 const UNICODE_BOX: BoxChars = {
   h: '─', v: '│',
   tl: '┌', tr: '┐', bl: '└', br: '┘',
   teeDown: '┬', teeUp: '┴', teeLeft: '┤', teeRight: '├',
+  cross: '┼',
 };
 
 const ASCII_BOX: BoxChars = {
   h: '-', v: '|',
   tl: '+', tr: '+', bl: '+', br: '+',
   teeDown: '+', teeUp: '+', teeLeft: '+', teeRight: '+',
+  cross: '+',
 };
 
 const box: BoxChars = canRenderUnicode() ? UNICODE_BOX : ASCII_BOX;
@@ -450,11 +536,13 @@ export function planHeight(height: number, hasChase: boolean) {
     1 + // border
     1 + // border under the split block
     (hasChase ? chaseRows + 1 : 0) + // chase + its border
-    1 + // border above command
-    1 + // command entry
-    1 + // border
-    1 + // footer
+    1 + // border above the input row
+    1 + // the two input prompts, side by side
     1; // bottom border
+  // Two rows shorter than it was. The static command-reference footer and the
+  // border above it are gone: they cost two rows of a fixed-height screen to
+  // repeat a list that does not change and cannot be acted on, and the activity
+  // log is the region that most obviously wanted them.
 
   // Range is the panel that yields when the terminal is short. It is a
   // reference rather than something an order depends on, and the alternative is
@@ -467,7 +555,7 @@ export function planHeight(height: number, hasChase: boolean) {
 
   // The position panel wants ten rows (label, gap, eight fields). Give it that
   // when there's room, and let activity take the remainder.
-  const splitRows = Math.max(MIN_SPLIT_ROWS, Math.min(12, flexible - 4));
+  const splitRows = Math.max(MIN_SPLIT_ROWS, Math.min(13, flexible - 4));
   const activityRows = Math.max(MIN_ACTIVITY_ROWS, flexible - splitRows - 1); // -1 for its label
 
   return { splitRows, activityRows, showRanges };
@@ -589,6 +677,7 @@ function rangeBlock(
   const span = Math.max(8, Math.min(12, available));
 
   const heading = new Line(width).put(2, 'RANGE', SECTION, start);
+
   const high = new Line(width).put(2, 'High', LABEL, start);
   const low = new Line(width).put(2, 'Low', LABEL, start);
   // Named with its period so it cannot be mistaken for a range of 14 anything.
@@ -611,9 +700,10 @@ function rangeBlock(
 function confirmationBlock(
   confirmation: ConfirmationView,
   width: number,
-  rows: number
+  rows: number,
+  stop = width - 1
 ): Line[] {
-  const inner = width - 1;
+  const inner = stop;
   const lines: Line[] = [];
   const valueCol = 21;
 
@@ -621,7 +711,11 @@ function confirmationBlock(
     const left = edge === 'top' ? box.tl : edge === 'bottom' ? box.bl : box.teeRight;
     const right = edge === 'top' ? box.tr : edge === 'bottom' ? box.br : box.teeLeft;
     const line = new Line(width, false);
-    line.put(0, left + box.h.repeat(width - 2) + right, undefined, width);
+    // Runs to the column's own edge, not the frame's: when the coach sits
+    // beside it this rule must close against the divider like every other one.
+    const run = Math.max(0, stop - 1);
+    line.put(0, left + box.h.repeat(run) + right, undefined, width);
+    if (stop < width - 1) line.put(width - 1, box.v, undefined, width);
     return line;
   };
 
@@ -637,25 +731,587 @@ function confirmationBlock(
     new Line(width).put(2, confirmation.prompt, 'yellow', inner),
   ];
 
+  // Exactly `rows`, no more: the caller has budgeted them out of a fixed-height
+  // frame, and a block that returns more than it was given pushes the command
+  // line off the bottom of the screen.
   lines.push(border());
-  for (let row = 0; row < Math.max(rows, body.length); row++) {
-    if (body[row]) lines.push(body[row]);
-    else if (row < rows) lines.push(new Line(width));
-  }
+  for (let row = 0; row < rows; row++) lines.push(body[row] ?? new Line(width));
 
   return lines;
 }
 
+/**
+ * Below this the coach goes under the activity log rather than beside it.
+ *
+ * Splitting the region costs the log its right-hand half, and the activity
+ * columns run to about column 54 before the message even starts. Halving an
+ * eighty-column terminal would leave the message with six characters, so the
+ * threshold is set where both halves are still worth reading.
+ */
+const COACH_SPLIT_WIDTH = 120;
+
+/** Content rows the stacked coach band gets, on top of its border and label. */
+const COACH_BAND_ROWS = 3;
+
+/**
+ * The coach sidebar's share of the terminal, and what the left column needs.
+ *
+ * The share is a ceiling rather than a target. What actually decides the split
+ * is the trading side's content: the position panel needs room for its longest
+ * label and value, the orders table needs room for eight columns, and whatever
+ * is left over is the coach's.
+ */
+const COACH_MAX_SHARE = 0.32;
+/** Prose narrower than this wraps to a tall thin wall and is harder to read. */
+const COACH_MIN_PANE = 28;
+
+/**
+ * Columns POSITION needs: values start at 21 and the widest of them -- a signed
+ * PnL with its unit -- runs to about sixteen, with a couple to spare so nothing
+ * sits flush against the divider.
+ */
+const POSITION_NEED = 40;
+/** An order id trimmed to where it still identifies an order at a glance. */
+const ORDER_ID_MIN = 4;
+
+/**
+ * Where the vertical divider sits, or null when the terminal cannot afford one.
+ *
+ * The sidebar is permanent by design, but permanence cannot conjure columns: on
+ * a terminal narrow enough that a quarter of it is unreadable, the coach goes
+ * back under the log rather than making both halves useless.
+ */
+function coachColumn(width: number): number | null {
+  if (width < COACH_SPLIT_WIDTH) return null;
+
+  const wanted = POSITION_NEED + 2 + ORDER_COLUMNS + ORDER_EXPIRY_WIDTH + ORDER_ID_MIN;
+  const minimum = POSITION_NEED + 2 + ORDER_COLUMNS + ORDER_ID_MIN;
+
+  const ceiling = Math.round(width * COACH_MAX_SHARE);
+  let column = Math.max(wanted, width - 1 - ceiling);
+
+  // Where honouring the full table would leave the coach unreadable, the table
+  // gives the columns back -- it degrades by dropping EXPIRES, which it already
+  // knows how to do, whereas the coach has no graceful way to be too narrow.
+  if (width - 1 - column < COACH_MIN_PANE) {
+    column = Math.max(minimum, width - 1 - COACH_MIN_PANE);
+  }
+
+  return column;
+}
+
+/** One run of text inside a coach row, with the role it plays. */
+interface CoachSegment {
+  text: string;
+  paint: Paint | undefined;
+}
+
+/**
+ * A row of the coach pane.
+ *
+ * Segments rather than one string and one colour, because a sentence in the
+ * coach's own voice may quote a value that already means something elsewhere on
+ * screen. '+5,599.47 USDT' is green wherever it appears; the sentence around it
+ * is not, and colouring the whole line green to accommodate one token would
+ * make an observation about profit look like a profit.
+ */
+interface CoachLine {
+  segments: CoachSegment[];
+}
+
+/** Coach prose: legible, and one step below the operator's own text. */
+const COACH_TEXT: Paint = 'white';
+/** What the operator said. The brightest ordinary prose in the pane. */
+const COACH_YOU_TEXT: Paint = 'brightWhite';
+/** Speaker labels. Small, uppercase, and never competing with trading data. */
+const COACH_YOU_LABEL: Paint = 'cyan';
+const COACH_LABEL: Paint = { color: 'gray', font: 'bold' };
+/** Autonomous interventions, in the colour caution already has here. */
+const COACH_GUARD: Paint = { color: 'yellow', font: 'bold' };
+
+/**
+ * A heading the coach chose to write, when it chose to write one.
+ *
+ * Unbolded, so it sits below the speaker label above it -- who is talking
+ * outranks what they are talking about -- and in the neutral shade, because the
+ * coach picks these words itself now and a palette that assigned meaning to
+ * them would be guessing at what it meant.
+ */
+const COACH_HEADING: Paint = 'gray';
+
+const blankCoachLine = (): CoachLine => ({ segments: [] });
+const plainCoachLine = (text: string, paint: Paint | undefined): CoachLine => ({
+  segments: [{ text, paint }],
+});
+const coachLineText = (line: CoachLine): string =>
+  line.segments.map((segment) => segment.text).join('');
+
+/**
+ * Values inside coach prose that already carry a meaning elsewhere on screen.
+ *
+ * Deliberately narrow. Only tokens whose colour is unambiguous anywhere they
+ * appear are listed: a signed amount, a side, a lifecycle state. Words like
+ * 'risk' or 'stop' are not here, because they are ordinary English in a
+ * sentence far more often than they are a reference to the Position Risk field,
+ * and a renderer guessing at that would paint half the paragraph amber.
+ */
+const COACH_TOKENS: Array<{ pattern: RegExp; paint: (match: string) => Paint | undefined }> = [
+  {
+    // The sign has to be a sign. Without the lookbehind the hyphen in a date or
+    // a range is read as a minus and half of it turns red -- '08-17' became
+    // '08' plus a negative seventeen, and '102.70-105.45' likewise.
+    pattern: /(?<![\d.,])[+−-][\d,]+(?:\.\d+)?(?:\s*(?:USDT|USD|SOL|BTC|ETH))?/g,
+    paint: (match) => (match.trim().startsWith('+') ? 'green' : 'red'),
+  },
+  {
+    pattern: /Position Risk\s+[\d,]+(?:\.\d+)?(?:\s*(?:USDT|USD))?/g,
+    paint: () => 'yellow',
+  },
+  { pattern: /\b(?:LONG|BUY)\b/g, paint: () => 'green' },
+  { pattern: /\b(?:SHORT|SELL|ERROR|REJECTED)\b/g, paint: () => 'red' },
+  { pattern: /\b(?:WORKING|PARTIAL|TRAIL|ARM|CHASE)\b/g, paint: () => 'cyan' },
+];
+
+/**
+ * Splits a line into segments, letting known values take their own colour.
+ *
+ * Earlier patterns win where two overlap, which is why the signed amount is
+ * listed first: '-26.16 USDT' is a negative amount before it is anything else.
+ */
+/**
+ * Spans nothing may colour part of.
+ *
+ * A date is one token to a reader and several to a regular expression. The
+ * lookbehind on the signed-amount pattern already stops the common case, and
+ * this is the belt to that pair of braces: whatever a date or a clock time
+ * contains, no rule gets to paint a piece of it.
+ */
+const COACH_RESERVED = /\b\d{4}-\d{2}-\d{2}\b|\b\d{2}-\d{2}\b|\b\d{1,2}:\d{2}(?::\d{2})?\b/g;
+
+function coachSegments(
+  text: string,
+  base: Paint | undefined,
+  emphasis: string[] = []
+): CoachSegment[] {
+  const claims: Array<{
+    start: number;
+    end: number;
+    paint: Paint | undefined;
+    /** Whether a value found inside it may take its own colour. */
+    splittable?: boolean;
+  }> = [];
+
+  COACH_RESERVED.lastIndex = 0;
+  let reserved: RegExpExecArray | null;
+  while ((reserved = COACH_RESERVED.exec(text)) !== null) {
+    claims.push({
+      start: reserved.index,
+      end: reserved.index + reserved[0].length,
+      paint: base,
+    });
+  }
+
+  // What the coach asked to be emphasised, claimed first so a value inside a
+  // bolded phrase still takes its own colour rather than the phrase's weight.
+  for (const phrase of emphasis) {
+    if (phrase.length === 0) continue;
+    let from = text.indexOf(phrase);
+    while (from !== -1) {
+      claims.push({
+        start: from,
+        end: from + phrase.length,
+        paint: { color: 'brightWhite' },
+        splittable: true,
+      });
+      from = text.indexOf(phrase, from + phrase.length);
+    }
+  }
+
+  for (const { pattern, paint } of COACH_TOKENS) {
+    pattern.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(text)) !== null) {
+      const start = match.index;
+      const end = start + match[0].length;
+      // A value that falls inside an emphasised phrase takes the value's
+      // colour: '+8,139 USDT' is green wherever it appears, and the emphasis
+      // around it is the coach's way of pointing at it, not of recolouring it.
+      // Only an emphasised phrase yields to a value inside it. A reserved span
+      // -- a date, a clock time -- is one token and is never broken up.
+      const inside = claims.findIndex(
+        (claim) => claim.splittable === true && start >= claim.start && end <= claim.end
+      );
+      if (inside !== -1) {
+        const outer = claims[inside];
+        claims.splice(inside, 1);
+        if (outer.start < start) claims.push({ ...outer, end: start });
+        if (outer.end > end) claims.push({ ...outer, start: end });
+      } else if (claims.some((claim) => start < claim.end && end > claim.start)) {
+        continue;
+      }
+      claims.push({ start, end, paint: paint(match[0]) });
+    }
+  }
+
+  if (claims.length === 0) return [{ text, paint: base }];
+
+  claims.sort((a, b) => a.start - b.start);
+
+  const segments: CoachSegment[] = [];
+  let cursor = 0;
+  for (const claim of claims) {
+    if (claim.start > cursor) {
+      segments.push({ text: text.slice(cursor, claim.start), paint: base });
+    }
+    segments.push({ text: text.slice(claim.start, claim.end), paint: claim.paint });
+    cursor = claim.end;
+  }
+  if (cursor < text.length) segments.push({ text: text.slice(cursor), paint: base });
+
+  return segments;
+}
+
+/** Lays one piece of a reply into rows. */
+function putCoachNode(out: CoachLine[], node: CoachNode, width: number): void {
+  if (node.kind === 'heading') {
+    for (const row of wrapText(node.text, width)) out.push(plainCoachLine(row, COACH_HEADING));
+    return;
+  }
+
+  // A list item hangs under its own first character rather than under the
+  // marker, so the marker column reads as a column.
+  const marker = node.kind === 'bullet';
+  const room = marker ? Math.max(1, width - 2) : width;
+
+  wrapText(node.text, room).forEach((row, index) => {
+    const segments = coachSegments(row, COACH_TEXT, node.emphasis);
+    out.push({
+      segments: marker
+        ? [{ text: index === 0 ? '· ' : '  ', paint: MUTED }, ...segments]
+        : segments,
+    });
+  });
+}
+
+/**
+ * A speaker's turn: who said it, then what they said.
+ *
+ * The blank row between pieces is inserted here rather than taken from the
+ * reply, so the rhythm is the same whether or not the coach pressed return --
+ * but where it did press return, that is exactly where the break falls. The
+ * application owns the spacing; the coach owns the shape.
+ */
+function coachTurn(
+  out: CoachLine[],
+  label: string,
+  labelPaint: Paint,
+  text: string,
+  width: number,
+  structured: boolean
+): void {
+  out.push(plainCoachLine(label, labelPaint));
+
+  if (!structured) {
+    for (const row of wrapText(text, width)) {
+      out.push({ segments: coachSegments(row, COACH_YOU_TEXT) });
+    }
+    return;
+  }
+
+  const nodes = coachNodes(text, width);
+  nodes.forEach((node, index) => {
+    // Consecutive list items belong to one list and are not separated; a
+    // heading sits directly above the thing it heads.
+    const previous = nodes[index - 1];
+    const joined =
+      previous !== undefined &&
+      ((previous.kind === 'bullet' && node.kind === 'bullet') || previous.kind === 'heading');
+
+    if (index > 0 && !joined) out.push(blankCoachLine());
+    putCoachNode(out, node, width);
+  });
+}
+
+/**
+ * The pane's contents, top to bottom.
+ *
+ * A standing guard condition leads, because it is the one thing here that was
+ * not asked for and is therefore the one thing that has to announce itself. It
+ * is not given a speaker label: GUARD already says what kind of thing it is,
+ * and 'COACH / GUARD 2' would read as two headings arguing about which is the
+ * heading.
+ */
+function coachPaneLines(view: TerminalView, width: number): CoachLine[] {
+  const out: CoachLine[] = [];
+  const guard = view.guard;
+
+  if (guard && guard.count > 0) {
+    // Hyphens out: 'leverage-creep' is an identifier and 'LEVERAGE CREEP' is
+    // what it means, and this line is read rather than matched against.
+    const headline = `GUARD ${guard.count} · ${guard.summary.toUpperCase().replace(/-/g, ' ')}`;
+    for (const line of wrapText(headline, width)) out.push(plainCoachLine(line, COACH_GUARD));
+    // A wider gap after an intervention than between ordinary turns: it arrived
+    // uninvited and the conversation resumes underneath it.
+    out.push(blankCoachLine());
+  }
+
+  const entries = view.coach ?? [];
+
+  if (entries.length === 0 && out.length === 0) {
+    out.push(plainCoachLine('Ask below.', MUTED));
+    return out;
+  }
+
+  for (const entry of entries) {
+    if (out.length > 0) out.push(blankCoachLine());
+
+    if (entry.kind === 'operator') {
+      coachTurn(out, 'YOU', COACH_YOU_LABEL, entry.text, width, false);
+    } else if (entry.kind === 'system') {
+      // The panel's own voice takes no speaker label. It is not a party to the
+      // conversation and giving it one implies it is.
+      for (const row of wrapText(entry.text, width)) out.push(plainCoachLine(row, MUTED));
+    } else {
+      coachTurn(out, 'COACH', COACH_LABEL, entry.text, width, true);
+    }
+  }
+
+  if (view.coachBusy) {
+    out.push(blankCoachLine());
+    out.push(plainCoachLine('thinking...', MUTED));
+  }
+
+  return out;
+}
+
+/**
+ * The thread flattened for the narrow stacked band.
+ *
+ * Kept separate from the pane because the band is three rows: speaker labels
+ * and paragraph breaks would spend all three on structure and leave none for
+ * what was said.
+ */
+function coachLines(view: TerminalView, width: number): CoachLine[] {
+  const entries = view.coach ?? [];
+  const out: CoachLine[] = [];
+
+  if (entries.length === 0) {
+    return [plainCoachLine("Ask with 'coach <question>'", MUTED)];
+  }
+
+  for (const entry of entries) {
+    if (out.length > 0) out.push(blankCoachLine());
+
+    if (entry.kind === 'operator') {
+      const wrapped = wrapText(entry.text, Math.max(1, width - 2));
+      wrapped.forEach((text, index) =>
+        out.push(plainCoachLine(`${index === 0 ? '> ' : '  '}${text}`, 'cyan'))
+      );
+      continue;
+    }
+
+    const paint = entry.kind === 'system' ? MUTED : VALUE;
+    for (const text of wrapText(entry.text, width)) {
+      out.push({ segments: coachSegments(text, paint) });
+    }
+  }
+
+  if (view.coachBusy) out.push(plainCoachLine('thinking...', MUTED));
+
+  return out;
+}
+
+/**
+ * How many rows the coach prompt may grow to before it starts scrolling.
+ *
+ * It grows upward into its own column, which costs the conversation a row for
+ * each one it takes. A few is worth it -- a question you cannot read back is a
+ * question you retype -- but a pasted paragraph must not swallow the pane, so
+ * past this the block shows its tail and the earlier text scrolls out of sight
+ * above, exactly as an over-long line does in a shell.
+ */
+const COACH_INPUT_MAX_ROWS = 6;
+
+/**
+ * The coach prompt's text, wrapped to its column.
+ *
+ * Exported because two places need the same answer and must not compute it
+ * twice: the frame paints these rows, and the screen puts the real cursor at
+ * the end of the last of them. A wrap that disagreed between the two would park
+ * the cursor somewhere other than where the next character lands.
+ */
+export function coachInputRows(
+  size: Size,
+  text: string
+): { rows: string[]; truncated: boolean } {
+  const width = Math.max(MIN_WIDTH, size.width);
+  const column = coachColumn(width);
+  if (column === null) return { rows: [text], truncated: false };
+
+  // The marker sits at the pane's left padding and the text two columns past
+  // it, so a wrapped line hangs under the first rather than under the '>'. The
+  // trailing column is the same one the conversation above leaves: text flush
+  // against a border reads as though it has been cut off.
+  const room = Math.max(1, width - column - 6);
+  const wrapped = wrapText(text, room);
+  if (wrapped.length === 0) return { rows: [''], truncated: false };
+
+  return {
+    rows: wrapped.slice(-COACH_INPUT_MAX_ROWS),
+    truncated: wrapped.length > COACH_INPUT_MAX_ROWS,
+  };
+}
+
+/** Paints one coach row into a line, segment by segment. */
+function putCoachLine(line: Line, col: number, row: CoachLine, limit: number): Line {
+  let cursor = col;
+  for (const segment of row.segments) {
+    if (cursor >= limit) break;
+    line.put(cursor, segment.text, segment.paint, limit);
+    cursor += segment.text.length;
+  }
+  return line;
+}
+
+/**
+ * The slice of the thread to show, given how far back the panel is scrolled.
+ *
+ * Zero offset shows the tail, which is the part worth the rows.
+ */
+function windowCoach(lines: CoachLine[], rows: number, offset = 0): CoachLine[] {
+  if (lines.length <= rows) return lines;
+
+  // The separators stay.
+  //
+  // They used to be dropped once the thread outgrew the pane, on the reasoning
+  // that a blank row is worth less than the sentence it displaces. That was
+  // wrong, and wrong in a way that only showed up in use: the thread outgrows
+  // the pane after about two exchanges, so in practice the blank rows were
+  // almost never there. Every separator this file carefully inserts -- between
+  // blocks, between speakers, after a guard -- was being filtered out one step
+  // before it reached the screen, and the panel collapsed into the slab it was
+  // built to avoid.
+  //
+  // The rows a separator costs are the cheapest rows in the pane. What they buy
+  // is the only structure the panel has.
+  const back = Math.min(Math.max(0, offset), Math.max(0, lines.length - rows));
+  const end = lines.length - back;
+  const window = lines.slice(Math.max(0, end - rows), end);
+
+  // A window that happens to begin on a separator would spend its first row on
+  // nothing, so leading separators are dropped.
+  //
+  // Dropped rather than backfilled. Pulling the line above in to replace one is
+  // what the first version did, and because it shifted and unshifted in the
+  // same step the window never got shorter -- two blank rows at the boundary
+  // put it in a loop that never ended, which in a renderer means the terminal
+  // stops. Losing a row to a gap is a far smaller price than that, and the gap
+  // only appears while the pane is scrolled.
+  while (window.length > 0 && coachLineText(window[0]).length === 0) window.shift();
+
+  return window;
+}
+
+/**
+ * How far back the panel can be scrolled, so the caller can say so.
+ *
+ * Measured the same way `windowCoach` measures it -- separators dropped -- or
+ * the panel would report rows that scrolling cannot reach.
+ */
+function coachDepth(lines: CoachLine[], rows: number): number {
+  if (lines.length <= rows) return 0;
+  return Math.max(0, lines.length - rows);
+}
+
+/** Rows the stacked band would take, borders and label included. Zero if idle. */
+function coachBandCost(view: TerminalView): number {
+  return (view.coach ?? []).length === 0 ? 0 : COACH_BAND_ROWS + 2;
+}
+
+/** side, qty, price, type, status, mode -- everything but the id and the expiry. */
+const ORDER_COLUMNS = 5 + 8 + 9 + 7 + 8 + 7;
+const ORDER_EXPIRY_WIDTH = 8;
+
+/** How many rows one event may occupy in the log. */
+const ACTIVITY_MAX_ROWS = 2;
+
+/** Where an event's message begins, which is where a wrapped tail lines up. */
+const ACT_TIME = 2;
+const ACT_EVENT = 18;
+const ACT_SIDE = 26;
+const ACT_QTY = 32;
+const ACT_PRICE = 43;
+const ACT_STATUS = 54;
+
+/** The message column of a wide-layout row, columns included or not. */
+function messageColumn(event: ActivityRowView): number {
+  const detail = event.detail;
+  if (!detail) return ACT_SIDE;
+  return detail.status ? ACT_STATUS + detail.status.length + 2 : ACT_STATUS;
+}
+
+/**
+ * One painted row: an event, or the continuation of one whose message ran past
+ * the region.
+ */
+interface ActivityLine {
+  event: ActivityRowView;
+  /** The part of the message this row carries. */
+  text: string;
+  /** False on continuation rows, which repeat neither the time nor the columns. */
+  head: boolean;
+}
+
+/**
+ * Events expanded into the rows they will occupy.
+ *
+ * A guardrail warning is a sentence rather than a field, and clipping it at the
+ * region's edge loses the half that says what to do about it. Wrapping happens
+ * here, before the region is windowed, so the row count and the scroll offset
+ * both count what is actually on screen rather than what was logged.
+ */
+function wrapActivity(
+  activity: ActivityRowView[],
+  stop: number,
+  column: (event: ActivityRowView) => number
+): ActivityLine[] {
+  const out: ActivityLine[] = [];
+
+  for (const event of activity) {
+    const pieces = wrapText(event.message, Math.max(1, stop - column(event)));
+    // No message, but the columns of a trade event still have something to say.
+    if (pieces.length === 0) {
+      out.push({ event, text: '', head: true });
+      continue;
+    }
+
+    // Two rows at most. Messages are condensed before they get here, so this is
+    // a backstop rather than the mechanism -- but the log's value is that a
+    // session can be scanned, and one event that takes six rows destroys that
+    // for the twenty events it pushes off the top.
+    const shown = pieces.slice(0, ACTIVITY_MAX_ROWS);
+    if (pieces.length > ACTIVITY_MAX_ROWS) {
+      const last = shown.length - 1;
+      const room = Math.max(1, stop - column(event));
+      shown[last] = `${shown[last].slice(0, Math.max(0, room - 1)).trimEnd()}…`;
+    }
+
+    shown.forEach((text, index) => out.push({ event, text, head: index === 0 }));
+  }
+
+  return out;
+}
+
 /** The slice of activity to show, given how far back the view is scrolled. */
 function windowActivity(
-  activity: ActivityRowView[],
-  rows: number,
+  rows: ActivityLine[],
+  height: number,
   offset: number
-): ActivityRowView[] {
-  const maxOffset = Math.max(0, activity.length - rows);
+): ActivityLine[] {
+  const maxOffset = Math.max(0, rows.length - height);
   const back = Math.min(Math.max(0, offset), maxOffset);
-  const end = activity.length - back;
-  return activity.slice(Math.max(0, end - rows), end);
+  const end = rows.length - back;
+  return rows.slice(Math.max(0, end - height), end);
 }
 
 /**
@@ -669,52 +1325,75 @@ function windowActivity(
  * Events without structured data keep their message, rather than being padded
  * with placeholders into a shape they don't have.
  */
-function activityRow(
-  event: ActivityRowView,
-  width: number,
-  inner: number
-): Line {
-  const line = new Line(width);
-  const cTime = 2;
-  const cEvent = 18;
-  const cSide = 26;
-  const cQty = 32;
-  const cPrice = 43;
-  const cStatus = 54;
+/**
+ * Painted into a line that may already hold something else.
+ *
+ * `stop` is where the row must end -- the full inner width normally, the
+ * divider when the coach is sitting beside it. Everything below clips to it, so
+ * a message wraps against the divider instead of running through the panel next
+ * to it.
+ */
+function paintActivity(line: Line, row: ActivityLine, stop: number): Line {
+  const inner = stop;
+  const event = row.event;
+
+  // A continuation sits under the message it belongs to with its columns left
+  // empty, so one event reads as one block rather than as several events.
+  if (!row.head) return line.put(messageColumn(event), row.text, VALUE, inner);
 
   line
-    .put(cTime, event.time, MUTED, cEvent)
-    .put(cEvent, event.category, categoryColor(event.category), cSide);
+    .put(ACT_TIME, event.time, MUTED, ACT_EVENT)
+    .put(ACT_EVENT, event.category, categoryColor(event.category), ACT_SIDE);
 
   const detail = event.detail;
   if (!detail) {
-    line.put(cSide, event.message, VALUE, inner);
+    line.put(ACT_SIDE, row.text, VALUE, inner);
     return line;
   }
 
-  if (detail.side) line.put(cSide, detail.side, sideColor(detail.side), cQty);
-  if (detail.quantity) line.putRight(cPrice - 2, detail.quantity, VALUE, cQty);
-  if (detail.price) line.putRight(cStatus - 2, detail.price, VALUE, cPrice);
-  if (detail.status) line.put(cStatus, detail.status, statusColor(detail.status), inner);
+  if (detail.side) line.put(ACT_SIDE, detail.side, sideColor(detail.side), ACT_QTY);
+  if (detail.quantity) line.putRight(ACT_PRICE - 2, detail.quantity, VALUE, ACT_QTY);
+  if (detail.price) line.putRight(ACT_STATUS - 2, detail.price, VALUE, ACT_PRICE);
+  if (detail.status) line.put(ACT_STATUS, detail.status, statusColor(detail.status), inner);
 
   // Anything the columns don't cover follows them rather than being lost.
-  if (event.message) {
-    const after = detail.status ? cStatus + detail.status.length + 2 : cStatus;
-    line.put(after, event.message, VALUE, inner);
+  if (row.text) line.put(messageColumn(event), row.text, VALUE, inner);
+
+  return line;
+}
+
+/**
+ * The ACTIVITY heading, and how far back the log is scrolled.
+ *
+ * It used to carry the coach's label and the standing guard conditions as well,
+ * because the coach shared this row's block and there was nowhere else to put
+ * them. Both now live in the coach column -- the label at its own top, the
+ * guard as the intervention it is -- so this row says one thing again.
+ */
+function activityLabel(
+  view: TerminalView,
+  width: number,
+  rows: number,
+  total: number,
+  stop: number = width - 2,
+  divider?: number
+): Line {
+  const line = new Line(width).put(2, 'ACTIVITY', SECTION, stop);
+  if (divider !== undefined && divider > 0) line.divider(divider);
+
+  const offset = view.activityOffset ?? 0;
+  if (offset > 0) {
+    const behind = Math.min(offset, Math.max(0, total - rows));
+    line.put(12, `scrolled back ${behind}`, 'yellow', stop);
   }
 
   return line;
 }
 
-function activityLabel(view: TerminalView, width: number, rows: number): Line {
-  const line = new Line(width).put(2, 'ACTIVITY', SECTION);
-  const offset = view.activityOffset ?? 0;
-
-  if (offset > 0) {
-    const behind = Math.min(offset, Math.max(0, view.activity.length - rows));
-    line.put(12, `scrolled back ${behind}`, 'yellow', width - 2);
-  }
-
+/** The stacked band's own label, which carries the same scroll marker. */
+function coachBandLabel(width: number, behind: number): Line {
+  const line = new Line(width).put(2, 'COACH', SECTION);
+  if (behind > 0) line.put(10, `scrolled back ${behind}`, 'yellow', width - 2);
   return line;
 }
 
@@ -799,6 +1478,10 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
     (1 + Math.max(1, positionFields.length)) + 1 + // position
     (2 + Math.max(1, orderRows)) + 1 + // orders
     chaseRows +
+    // The coach band, when there is a conversation to put in it. It was left
+    // out, so a thread on a short terminal grew the frame past the bottom of
+    // the screen and took the command line with it.
+    coachBandCost(view) +
     1 + 1 + 1 + 1 + 1; // activity label, command, borders, footer
   const available = Math.max(MIN_HEIGHT, size.height);
 
@@ -908,18 +1591,45 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
   }
 
   lines.push(border());
-  lines.push(activityLabel(view, width, activityRows));
-  const visible = windowActivity(activity, activityRows, view.activityOffset ?? 0);
-  for (let row = 0; row < activityRows; row++) {
+
+  // Never beside the log at this width -- there is barely room for the log --
+  // so the coach takes a band beneath it, and only when it has something to say.
+  // The band's rows are already out of the budget above, so the log takes what
+  // is left rather than subtracting them a second time.
+  const bandCost = coachBandCost(view);
+  const logRows = Math.max(1, activityRows);
+
+  const wrapped = wrapActivity(activity, inner, () => 21);
+  lines.push(activityLabel(view, width, logRows, wrapped.length));
+  const visible = windowActivity(wrapped, logRows, view.activityOffset ?? 0);
+  for (let row = 0; row < logRows; row++) {
     const line = new Line(width);
-    const event = visible[row];
-    if (event) {
-      line
-        .put(2, event.time.slice(0, 11), 'gray', 14)
-        .put(14, event.category, categoryColor(event.category), 21)
-        .put(21, event.message, VALUE, inner);
+    const entry = visible[row];
+    if (entry) {
+      if (entry.head) {
+        line
+          .put(2, entry.event.time.slice(0, 11), 'gray', 14)
+          .put(14, entry.event.category, categoryColor(entry.event.category), 21);
+      }
+      line.put(21, entry.text, VALUE, inner);
     }
     lines.push(line);
+  }
+
+  if (bandCost > 0) {
+    const spoken = coachLines(view, inner - 3);
+    const offset = view.coachOffset ?? 0;
+    lines.push(border());
+    lines.push(
+      coachBandLabel(width, Math.min(offset, coachDepth(spoken, COACH_BAND_ROWS)))
+    );
+    const band = windowCoach(spoken, COACH_BAND_ROWS, offset);
+    for (let row = 0; row < COACH_BAND_ROWS; row++) {
+      const said = band[row];
+      lines.push(
+        said ? putCoachLine(new Line(width), 2, said, inner) : new Line(width)
+      );
+    }
   }
 
   lines.push(border());
@@ -932,6 +1642,32 @@ function buildStackedFrame(view: TerminalView, size: Size): Line[] {
   return lines;
 }
 
+/**
+ * Where the coach panel begins, or null when it is not beside the log.
+ *
+ * Only the frame knows how it laid itself out, and the screen has to know to
+ * send a wheel event to the panel the pointer is actually over. Kept next to
+ * the layout choice it mirrors so the two cannot drift apart.
+ */
+export function coachPanelColumn(size: Size): number | null {
+  if (size.width < STACK_BELOW_WIDTH) return null;
+  return coachColumn(Math.max(MIN_WIDTH, size.width));
+}
+
+/**
+ * How wide the coach's prose column is, in characters.
+ *
+ * Told to the coach so that 'no longer than five rows' means five rows of the
+ * panel it is actually going into. Only the frame knows how it laid itself out,
+ * so the number comes from here rather than being assumed at the other end.
+ */
+export function coachProseWidth(size: Size): number {
+  const width = Math.max(MIN_WIDTH, size.width);
+  const column = coachColumn(width);
+  if (column === null) return Math.max(8, width - 4);
+  return Math.max(8, width - 1 - (column + 2) - 1);
+}
+
 export function buildFrame(view: TerminalView, size: Size): Line[] {
   if (size.width < STACK_BELOW_WIDTH) return buildStackedFrame(view, size);
   return buildWideFrame(view, size);
@@ -940,23 +1676,93 @@ export function buildFrame(view: TerminalView, size: Size): Line[] {
 function buildWideFrame(view: TerminalView, size: Size): Line[] {
   const width = Math.max(MIN_WIDTH, size.width);
   const inner = width - 1;
-  const divider = Math.floor(width / 2);
   const lines: Line[] = [];
   const { header, market, position, orders, chase, activity } = view;
 
-  const border = (
-    opts: { edge?: 'top' | 'bottom'; divider?: 'down' | 'up' } = {}
+  // --- the two columns ----------------------------------------------------
+  //
+  // One divider, running from just below the shared header to the bottom
+  // border, with the trading workspace on the left and the coach on the right.
+  // Everything below is expressed against `leftEnd` rather than against the
+  // frame edge, so the trading side lays itself out inside its own column and
+  // never has to know what is beside it.
+  const coachCol = coachColumn(width);
+  const sidebar = coachCol !== null;
+  const leftEnd = sidebar ? (coachCol as number) : inner;
+  /**
+   * Where POSITION gives way to ACTIVE ORDERS, inside the left column.
+   *
+   * The position panel takes what its content requires and no more; the orders
+   * table takes the rest. It used to be an even split, which gave the panel
+   * about twenty columns of whitespace to the right of every value while the
+   * table next to it was dropping a column for want of two.
+   */
+  const splitCol = Math.max(24, Math.min(POSITION_NEED, leftEnd - 24));
+  const coachTextCol = sidebar ? (coachCol as number) + 2 : 0;
+  // One column short of the edge: text flush against a border reads as though
+  // it has been cut off, whether or not it has.
+  const coachWidth = sidebar ? Math.max(8, inner - coachTextCol - 1) : 0;
+
+  // What has been typed at the coach prompt, wrapped to its column. Computed
+  // once: the row below paints its tail and the rows above paint the rest.
+  const typedIntoCoach = (view.coachInput ?? '').length > 0;
+  const typedWrap = sidebar
+    ? coachInputRows(size, typedIntoCoach ? (view.coachInput as string) : 'Ask coach...')
+    : { rows: [''], truncated: false };
+  const coachInput = typedWrap.rows;
+
+  const teeGlyph = (kind: 'down' | 'up' | 'cross'): string =>
+    kind === 'down' ? box.teeDown : kind === 'up' ? box.teeUp : box.cross;
+
+  /** A rule across the whole application: above the columns, and below them. */
+  const fullBorder = (
+    opts: { edge?: 'top' | 'bottom'; coachTee?: 'down' | 'up' | 'cross' } = {}
   ): Line => {
     const left = opts.edge === 'top' ? box.tl : opts.edge === 'bottom' ? box.bl : box.teeRight;
     const right = opts.edge === 'top' ? box.tr : opts.edge === 'bottom' ? box.br : box.teeLeft;
 
     const line = new Line(width, false);
     line.put(0, left + box.h.repeat(width - 2) + right, undefined, width);
+    if (sidebar && opts.coachTee) {
+      line.put(coachCol as number, teeGlyph(opts.coachTee), undefined, width);
+    }
+    return line;
+  };
 
-    if (opts.divider) {
-      line.put(divider, opts.divider === 'down' ? box.teeDown : box.teeUp, undefined, width);
+  /**
+   * A rule across the trading workspace only, stopping at the divider.
+   *
+   * This is what makes the two sides read differently. The left is a stack of
+   * structured modules and its rules close against the divider; the coach
+   * column runs past them uninterrupted, so it reads as one continuous
+   * workspace rather than as a set of panels that happen to be empty.
+   */
+  const leftBorder = (opts: { divider?: 'down' | 'up' | 'cross' } = {}): Line => {
+    const line = new Line(width, false);
+
+    if (!sidebar) {
+      line.put(0, box.teeRight + box.h.repeat(width - 2) + box.teeLeft, undefined, width);
+      if (opts.divider) line.put(splitCol, teeGlyph(opts.divider), undefined, width);
+      return line;
     }
 
+    const col = coachCol as number;
+    line.put(
+      0,
+      box.teeRight + box.h.repeat(Math.max(0, col - 1)) + box.teeLeft,
+      undefined,
+      width
+    );
+    if (opts.divider) line.put(splitCol, teeGlyph(opts.divider), undefined, width);
+    // The coach side of the row is empty, but the frame still has an edge.
+    line.put(width - 1, box.v, undefined, width);
+    return line;
+  };
+
+  /** A content row, with the divider already in place. */
+  const row = (): Line => {
+    const line = new Line(width);
+    if (sidebar) line.divider(coachCol as number);
     return line;
   };
 
@@ -965,8 +1771,13 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
     chase !== null
   );
 
-  // --- header: identity on the left, connection state on the right ------
-  lines.push(border({ edge: 'top' }));
+  // --- shared application header, above both columns ----------------------
+  //
+  // Balance, equity, the connection state and the account describe the trading
+  // session rather than either column, so they stay full width and above the
+  // divider. Nothing here belongs to the coach and nothing here belongs to the
+  // workspace.
+  lines.push(fullBorder({ edge: 'top' }));
 
   const connectionText = `${header.environment} | ${header.connection}`;
   lines.push(
@@ -993,44 +1804,52 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   );
   lines.push(putFunds(fundsLine, inner - 1, funds));
 
+  lines.push(fullBorder({ coachTee: 'down' }));
+
+  // Everything from here to the input row shares its rows with the coach pane.
+  const coachTop = lines.length;
+
   // --- market: symbol and last price lead, the rest supports -------------
-  lines.push(border());
-  lines.push(new Line(width).put(2, 'MARKET', SECTION));
+  lines.push(row().put(2, 'MARKET', SECTION, leftEnd));
 
   // Four evenly spaced columns, so the primary and secondary rows line up with
-  // each other and every value keeps a fixed starting position.
-  // The leading column carries the labelled symbol, so it takes the room that
-  // symbol actually needs rather than a fixed guess -- a fixed one wide enough
-  // for a long symbol steals a column's worth of space from every short one.
+  // each other and every value keeps a fixed starting position. Measured across
+  // the left column now rather than the terminal, so the sidebar narrowing the
+  // workspace tightens the market row instead of pushing it under the divider.
   const col1 = Math.max(18, Math.min(26, 2 + 'Symbol '.length + market.symbol.length + 2));
-  const span = Math.max(14, Math.floor((inner - col1) / 4));
+  const span = Math.max(12, Math.floor((leftEnd - col1) / 4));
   const col2 = col1 + span;
   const col3 = col2 + span;
   const col4 = col3 + span;
 
   const field = (line: Line, col: number, label: string, value: string, limit: number) =>
-    labelled(line, col, label, value, limit);
+    labelled(line, col, label, value, Math.min(limit, leftEnd));
 
-  const primaryRow = new Line(width);
+  const primaryRow = row();
   labelled(primaryRow, 2, 'Symbol', market.symbol, col1, HEADLINE);
   labelled(primaryRow, col1, 'Last', market.last, col2, HEADLINE);
   field(primaryRow, col2, 'Bid', market.bid, col3);
   field(primaryRow, col3, 'Ask', market.ask, col4);
-  if (market.change && market.change !== NO_VALUE) {
-    labelled(primaryRow, col4, '24h', market.change, inner, signedColor(market.change) ?? VALUE);
+  if (market.change && market.change !== NO_VALUE && col4 < leftEnd - 6) {
+    labelled(primaryRow, col4, '24h', market.change, leftEnd, signedColor(market.change) ?? VALUE);
   }
   lines.push(primaryRow);
 
-  const secondaryRow = new Line(width);
+  const secondaryRow = row();
 
-  // Spread sits under Ask, at every width. It is the distance between bid and
-  // ask, so it reads against the prices it comes from rather than against the
-  // funding rate or the 24h change, and an alignment that moves as the terminal
-  // is resized is not an alignment.
+  // Funding takes two of the four cells; spread takes the last one.
   //
-  // Funding yields the space instead: it is the one value here carrying an
-  // aside it can afford to lose.
-  const spreadCol = col3;
+  // It used to sit in one cell with spread beneath Ask, and that was fine while
+  // the row ran the width of the terminal. Once the coach took a quarter of it
+  // a cell was about twelve columns, and '0.0100% (10.95% APR)' is twenty --
+  // so the annualised figure was quietly dropped on every redraw. The rate on
+  // its own is the half of that value that looks like nothing: a hundredth of a
+  // percent reads as negligible until it is annualised.
+  //
+  // So spread moves one cell right, to sit under 24h. It is still on the row
+  // and still beside the prices it comes from, which is what its position was
+  // there to say.
+  const spreadCol = col4;
   const fundingAt = col2 + 'Funding '.length;
 
   field(secondaryRow, 2, 'Mark', market.mark, col1);
@@ -1042,49 +1861,73 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
     fitValue(market.funding, Math.max(0, spreadCol - 1 - fundingAt)),
     spreadCol - 1
   );
-  labelled(secondaryRow, spreadCol, 'Spread', market.spread, inner);
+  labelled(secondaryRow, spreadCol, 'Spread', market.spread, leftEnd);
   lines.push(secondaryRow);
 
   // --- range: where price has been over each period ----------------------
-  if (showRanges && view.ranges.length > 0) {
-    lines.push(border());
-    lines.push(...rangeBlock(view.ranges, width, inner));
+  //
+  // Rendered whenever there is height for it, whether or not the numbers have
+  // arrived. It used to appear only once `ranges` was non-empty, which meant
+  // the first seconds of a session had no RANGE block -- and POSITION, ACTIVE
+  // ORDERS and ACTIVITY all sat five rows higher than where they were about to
+  // end up, then jumped. A region's existence is a property of the layout; only
+  // its contents are a property of the data.
+  if (showRanges) {
+    lines.push(leftBorder());
+    for (const line of rangeBlock(view.ranges, width, leftEnd)) {
+      if (sidebar) line.divider(coachCol as number);
+      lines.push(line);
+    }
   }
 
   // --- confirmation takes the place of position/orders when pending --------
   if (view.confirmation) {
-    lines.push(...confirmationBlock(view.confirmation, width, splitRows + 1));
-    lines.push(border());
-    lines.push(new Line(width).put(2, 'ACTIVITY', SECTION));
-    const pending = activity.slice(-activityRows);
-    for (let row = 0; row < activityRows; row++) {
-      const line = new Line(width);
-      const event = pending[row];
-      if (event) {
-        line
-          .put(2, event.time, 'gray', 11)
-          .put(12, event.category, categoryColor(event.category), 20)
-          .put(21, event.message, VALUE, inner);
-      }
+    // The panel wants nine rows and must not be cut short -- it is the last
+    // thing read before something irreversible is sent. So it borrows from the
+    // log rather than from the frame: the two together spend exactly what the
+    // position block and the log would have spent, which is what keeps the
+    // frame the height of the terminal.
+    const wanted = 9;
+    const budget = splitRows + activityRows;
+    const confirmRows = Math.min(Math.max(splitRows, wanted), budget - 1);
+    const logRows = Math.max(1, budget - confirmRows);
+
+    for (const line of confirmationBlock(view.confirmation, width, confirmRows, leftEnd)) {
+      if (sidebar) line.divider(coachCol as number);
       lines.push(line);
     }
-    lines.push(border());
-    lines.push(new Line(width).put(2, '>', 'cyan').put(4, view.input, HEADLINE, inner));
-    lines.push(border());
-    lines.push(footerRow(view, width, inner));
-    lines.push(border());
+
+    lines.push(leftBorder());
+    lines.push(row().put(2, 'ACTIVITY', SECTION, leftEnd));
+
+    const pending = wrapActivity(activity, leftEnd, messageColumn).slice(-logRows);
+    for (let index = 0; index < logRows; index++) {
+      const line = row();
+      const entry = pending[index];
+      if (entry) paintActivity(line, entry, leftEnd);
+      lines.push(line);
+    }
+
+    lines.push(coachInput.length === 1 ? fullBorder({ coachTee: 'cross' }) : leftBorder());
+    lines.push(inputRow());
+    lines.push(fullBorder({ edge: 'bottom', coachTee: 'up' }));
+    paintCoach(lines, coachTop, lines.length - 2 - coachInput.length);
+    paintCoachInput(lines, lines.length - 2);
     return lines;
   }
 
   // --- position | active orders -----------------------------------------
-  lines.push(border({ divider: 'down' }));
+  lines.push(leftBorder({ divider: 'down' }));
   lines.push(
-    new Line(width).divider(divider).put(2, 'POSITION', SECTION).put(divider + 2, 'ACTIVE ORDERS', SECTION)
+    row()
+      .divider(splitCol)
+      .put(2, 'POSITION', SECTION, splitCol)
+      .put(splitCol + 2, 'ACTIVE ORDERS', SECTION, leftEnd)
   );
 
   // The full form is preferred; the short one is used only when the panel can't
   // hold it, so an unprotected quantity is never silently cut off.
-  const riskRoom = divider - 21 - 1;
+  const riskRoom = splitCol - 21 - 1;
   const riskValue = position
     ? position.risk.length <= riskRoom
       ? position.risk
@@ -1109,6 +1952,17 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
         // Risk is not profit: a positive number here is exposure, so it takes
         // the warning treatment rather than the green a positive PnL earns.
         ['Position Risk', riskValue, riskColor],
+        // A cost of carrying the position, so it sits with the other one rather
+        // than among the leverage figures.
+        ...(position.funding
+          ? ([
+              [
+                `Funding(${position.fundingCurrency || 'quote'})`,
+                position.funding,
+                signedColor(position.funding),
+              ],
+            ] as Array<[string, string, Paint | undefined]>)
+          : []),
         ['Leverage', position.leverage, undefined],
         ['Effective Leverage', position.effectiveLeverage, undefined],
         ['Liquidation', position.liquidation, undefined],
@@ -1119,14 +1973,12 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   // available, and the order id gives up room first: it identifies an order but
   // you don't trade on it, whereas side, size, price, type and status are what
   // you read when deciding whether to act.
-  const panelStart = divider + 2;
-  const panelWidth = Math.max(20, inner - panelStart);
-  const fixedWithoutExpiry = 5 + 8 + 9 + 7 + 8 + 7; // side, qty, price, type, status, mode
-  const expiryWidth = 8;
+  const panelStart = splitCol + 2;
+  const panelWidth = Math.max(20, leftEnd - panelStart);
   // Width decides this, not whether a chase happens to be running: a column that
   // came and went with the chase would shift every other value sideways.
-  const showExpiry = panelWidth >= fixedWithoutExpiry + expiryWidth + 4;
-  const fixed = fixedWithoutExpiry + (showExpiry ? expiryWidth : 0);
+  const showExpiry = panelWidth >= ORDER_COLUMNS + ORDER_EXPIRY_WIDTH + 4;
+  const fixed = ORDER_COLUMNS + (showExpiry ? ORDER_EXPIRY_WIDTH : 0);
   const idWidth = Math.max(0, Math.min(10, panelWidth - fixed));
 
   const oId = panelStart;
@@ -1141,10 +1993,10 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
   const valueCol = 21;
   const bodyRows = Math.max(1, splitRows - 1); // first row of the block is a gap
 
-  for (let row = 0; row < bodyRows; row++) {
-    const line = new Line(width).divider(divider);
+  for (let index = 0; index < bodyRows; index++) {
+    const line = row().divider(splitCol);
 
-    if (row === 0) {
+    if (index === 0) {
       if (idWidth > 0) line.put(oId, 'ID', LABEL, oSide - 1);
       line
         .put(oSide, 'SIDE', LABEL, oQty)
@@ -1152,10 +2004,10 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
         .putRight(oType - 2, 'PRICE', LABEL, oPrice)
         .put(oType, 'TYPE', LABEL, oStatus)
         .put(oStatus, 'STATUS', LABEL, oManaged)
-        .put(oManaged, 'MODE', LABEL, showExpiry ? oExpires : inner);
-      if (showExpiry) line.put(oExpires, 'EXPIRES', LABEL, inner);
+        .put(oManaged, 'MODE', LABEL, showExpiry ? oExpires : leftEnd);
+      if (showExpiry) line.put(oExpires, 'EXPIRES', LABEL, leftEnd);
     } else {
-      const order = orders[row - 1];
+      const order = orders[index - 1];
       if (order) {
         // The id stays quiet -- it identifies an order but you don't trade on
         // it -- yet it is still a value, so it outranks the column header above.
@@ -1171,85 +2023,210 @@ function buildWideFrame(view: TerminalView, size: Size): Line[] {
           // An order being worked by the chase is an active state, so it takes
           // the same accent as WORKING rather than reading as metadata.
           .put(oManaged, order.managed, order.managed ? 'cyan' : undefined,
-               showExpiry ? oExpires : inner);
+               showExpiry ? oExpires : leftEnd);
         if (showExpiry) {
           // Amber near the end: a chase about to give up is worth noticing
           // before it does.
           const nearlyDone = /^00:0\d$/.test(order.expires ?? '');
-          line.put(oExpires, order.expires, nearlyDone ? 'yellow' : VALUE, inner);
+          line.put(oExpires, order.expires, nearlyDone ? 'yellow' : VALUE, leftEnd);
         }
-      } else if (row === 1 && orders.length === 0) {
-        line.put(panelStart, 'No active orders', MUTED, inner);
+      } else if (index === 1 && orders.length === 0) {
+        line.put(panelStart, 'No active orders', MUTED, leftEnd);
       }
     }
 
-    const field = positionFields[row];
-    if (field) {
-      labelledAt(line, 2, field[0], valueCol, field[1], divider, field[2] ?? VALUE);
-    } else if (row === 0 && !position) {
-      line.put(2, 'No open position', MUTED, divider);
+    const entry = positionFields[index];
+    if (entry) {
+      labelledAt(line, 2, entry[0], valueCol, entry[1], splitCol, entry[2] ?? VALUE);
+    } else if (index === 0 && !position) {
+      line.put(2, 'No open position', MUTED, splitCol);
     }
 
     lines.push(line);
   }
 
   // --- chase: only present while one is running --------------------------
-  lines.push(border({ divider: 'up' }));
+  lines.push(leftBorder({ divider: 'up' }));
   if (chase) {
-    lines.push(new Line(width).put(2, 'CHASE', SECTION));
+    lines.push(row().put(2, 'CHASE', SECTION, leftEnd));
     lines.push(
-      new Line(width).put(2, chase.side, sideColor(chase.side), 7).put(7, chase.quantity)
+      row().put(2, chase.side, sideColor(chase.side), 7).put(7, chase.quantity, VALUE, leftEnd)
     );
 
     const q1 = 2;
-    const q2 = Math.floor(inner * 0.34);
-    const q3 = Math.floor(inner * 0.58);
-    const q4 = Math.floor(inner * 0.80);
+    const q2 = Math.floor(leftEnd * 0.34);
+    const q3 = Math.floor(leftEnd * 0.58);
+    const q4 = Math.floor(leftEnd * 0.80);
     lines.push(
-      new Line(width)
-        .put(q1, 'Target', undefined, q1 + 11)
-        .put(q1 + 12, chase.target, undefined, q2)
-        .put(q2, 'Working', undefined, q2 + 8)
-        .put(q2 + 8, chase.working, undefined, q3)
-        .put(q3, 'Reprices', undefined, q3 + 9)
-        .put(q3 + 9, chase.reprices, undefined, q4)
-        .put(q4, 'Elapsed', undefined, q4 + 8)
-        .put(q4 + 8, chase.elapsed)
+      row()
+        .put(q1, 'Target', LABEL, q1 + 11)
+        .put(q1 + 12, chase.target, VALUE, q2)
+        .put(q2, 'Working', LABEL, q2 + 8)
+        .put(q2 + 8, chase.working, VALUE, q3)
+        .put(q3, 'Reprices', LABEL, q3 + 9)
+        .put(q3 + 9, chase.reprices, VALUE, q4)
+        .put(q4, 'Elapsed', LABEL, q4 + 8)
+        .put(q4 + 8, chase.elapsed, VALUE, leftEnd)
     );
     lines.push(
-      new Line(width).put(2, 'Status').put(14, chase.status, statusColor(chase.status))
+      row().put(2, 'Status', LABEL).put(14, chase.status, statusColor(chase.status), leftEnd)
     );
-    lines.push(border());
+    lines.push(leftBorder());
   }
 
-  // --- activity ----------------------------------------------------------
-  lines.push(activityLabel(view, width, activityRows));
+  // --- activity, full width of the trading workspace ----------------------
+  //
+  // The coach no longer takes its right half, so the log gets one uninterrupted
+  // rectangle from the frame edge to the divider -- plus the two rows the
+  // static command footer used to occupy.
+  const logRows = Math.max(1, activityRows);
+  const wrapped = wrapActivity(activity, leftEnd, messageColumn);
 
-  const visible = windowActivity(activity, activityRows, view.activityOffset ?? 0);
-  for (let row = 0; row < activityRows; row++) {
-    const line = new Line(width);
-    const event = visible[row];
+  lines.push(activityLabel(view, width, logRows, wrapped.length, leftEnd, sidebar ? (coachCol as number) : undefined));
 
-    if (event) {
-      lines.push(activityRow(event, width, inner));
-      continue;
-    }
+  const visible = windowActivity(wrapped, logRows, view.activityOffset ?? 0);
 
+  for (let index = 0; index < logRows; index++) {
+    const line = row();
+    const entry = visible[index];
+    if (entry) paintActivity(line, entry, leftEnd);
     lines.push(line);
   }
 
-  // --- command entry, kept fixed so activity never moves it --------------
-  lines.push(border());
-  lines.push(new Line(width).put(2, '>', 'cyan').put(4, view.input, HEADLINE, inner));
+  // --- the two prompts, forming the bottom edge of the application --------
+  // A rule over both prompts, not just the left one.
+  //
+  // The trading prompt has always had one and the coach prompt had none, so the
+  // conversation ran straight into the thing being typed and the two halves of
+  // the bottom edge did not match. When the question is one line -- which it
+  // usually is -- this is a single rule across the frame with the divider
+  // crossing it, and the two prompts sit under it level with each other.
+  lines.push(coachInput.length === 1 ? fullBorder({ coachTee: 'cross' }) : leftBorder());
+  lines.push(inputRow());
+  lines.push(fullBorder({ edge: 'bottom', coachTee: 'up' }));
 
-  // --- footer ------------------------------------------------------------
-  lines.push(border());
-
-  lines.push(footerRow(view, width, inner));
-
-  lines.push(border({ edge: 'bottom' }));
+  paintCoach(lines, coachTop, lines.length - 2 - coachInput.length);
+  paintCoachInput(lines, lines.length - 2);
 
   return lines;
+
+  /**
+   * The execution prompt and the coach prompt, side by side.
+   *
+   * Two prompts rather than one, because they do categorically different
+   * things: the left one sends orders and the right one asks questions, and a
+   * shared prompt would make the difference a matter of remembering which mode
+   * it was in. The focused one keeps the cyan caret; the other dims, so which
+   * one a keystroke will reach is visible without typing anything.
+   */
+  function inputRow(): Line {
+    const line = row();
+    const focused = (view.focus ?? 'command') === 'command';
+
+    line.put(2, '>', focused ? 'cyan' : MUTED).put(4, view.input, HEADLINE, leftEnd);
+
+    if (sidebar) {
+      // The marker leads the block, so on the usual one-line question it sits
+      // on this row level with the trading prompt, and on a wrapped one it
+      // leads from the top like any other prompt. The last row is here either
+      // way, which is what keeps the bottom edge of the two columns aligned.
+      const single = coachInput.length <= 1;
+      line.put(coachTextCol, single ? '>' : ' ', focused ? MUTED : 'cyan');
+      line.put(
+        coachTextCol + 2,
+        coachInput[coachInput.length - 1],
+        typedIntoCoach ? COACH_YOU_TEXT : MUTED,
+        inner
+      );
+    }
+
+    return line;
+  }
+
+  /**
+   * The rows a wrapped question takes above the prompt row.
+   *
+   * Painted after the frame is built, into the bottom of the coach column,
+   * because that is the only region that can afford them: the left column's
+   * rows are all spoken for and its prompt must not move. The conversation
+   * above gives up a row for each one, and gets it back the moment the question
+   * is sent.
+   */
+  function paintCoachInput(rows: Line[], promptIndex: number): void {
+    if (!sidebar) return;
+
+    // A wrapped question grows upward and its rule rises with it, so the text
+    // being typed always sits inside its own region rather than being cut off
+    // from its prompt by a line through the middle of it. At one row the rule
+    // is the frame-wide one already drawn above, and there is nothing to do.
+    if (coachInput.length > 1) {
+      const column = coachCol as number;
+      const rule = rows[promptIndex - coachInput.length];
+      if (rule) {
+        rule.put(
+          column,
+          box.teeRight + box.h.repeat(Math.max(0, width - column - 2)) + box.teeLeft,
+          undefined,
+          width
+        );
+      }
+    }
+
+    for (let index = 0; index < coachInput.length - 1; index++) {
+      const target = promptIndex - (coachInput.length - 1) + index;
+      if (target < coachTop) continue;
+
+      // A question long enough to scroll shows where it was cut, or the row it
+      // continues from reads as the row it began on.
+      const marker = index === 0 ? (typedWrap.truncated ? '…' : '>') : ' ';
+      rows[target].put(
+        coachTextCol,
+        marker,
+        index === 0 && typedWrap.truncated
+          ? MUTED
+          : (view.focus ?? 'command') === 'command'
+            ? MUTED
+            : 'cyan'
+      );
+      rows[target].put(coachTextCol + 2, coachInput[index], COACH_YOU_TEXT, inner);
+    }
+  }
+
+  /**
+   * Fills the coach column, from its heading down to the last row above the
+   * prompts.
+   *
+   * Painted last, over rows the trading side has already finished with. The
+   * alternative -- interleaving it as the left column is built -- would tie the
+   * two sides' row counts together, and the whole point of the composition is
+   * that the coach does not care how many sections the workspace has.
+   */
+  function paintCoach(rows: Line[], from: number, until: number): void {
+    if (!sidebar) return;
+
+    const height = until - from;
+    if (height <= 2) return;
+
+    rows[from].put(coachTextCol, 'COACH', SECTION, inner);
+
+    // The heading keeps its row and the conversation starts under it.
+    const bodyTop = from + 2;
+    const bodyRows = until - bodyTop;
+    if (bodyRows <= 0) return;
+
+    const spoken = coachPaneLines(view, coachWidth);
+    const offset = view.coachOffset ?? 0;
+
+    const behind = Math.min(offset, coachDepth(spoken, bodyRows));
+    if (behind > 0) {
+      rows[from].put(coachTextCol + 6, `scrolled back ${behind}`, 'yellow', inner);
+    }
+
+    const window = windowCoach(spoken, bodyRows, offset);
+    for (let index = 0; index < window.length; index++) {
+      putCoachLine(rows[bodyTop + index], coachTextCol, window[index], inner);
+    }
+  }
 }
 
 export function renderPlain(view: TerminalView, size: Size): string[] {
