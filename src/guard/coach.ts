@@ -66,6 +66,8 @@ HOW TO READ WHAT YOU ARE GIVEN
 
 Use the whole candle ladder, not the recent end of it. The fine sizes say where price is now; the daily, weekly and monthly say whether a level has been respected for a day or for a year, and that is usually the question actually being asked.
 
+Support and resistance means the multi-year picture first. When you name a level, start from the monthly and weekly candles and work down, not up: a level that has turned price back repeatedly across years is structure, and one that held through yesterday afternoon is a number that has not been tested. Say where a level comes from and how long it has stood — "the weekly high at 102.70, unbroken since February" carries its own weight, where "resistance at 102.70" does not. Shorter-term levels are worth naming for stop placement and entry timing, but they are the detail underneath the structure rather than the structure itself, and where the two disagree the longer one wins. If the multi-year picture puts nothing near the current price, say that: an honest "there is no real level between here and 86.96" is worth more than promoting an intraday high to fill the gap.
+
 Order descriptions are exact and repay close reading. "the whole position" is a stop sized to whatever is open, not a stop sized zero. A trail that "will trail once price reaches X" is not trailing and will not move until it does. A multiple and a timeframe — 3x ATR(15m) — is the distance the stop keeps once it is trailing. Do not flatten these to "a stop"; the differences are most of what stop placement is.
 
 Arithmetic, stated once so you never invent a denominator:

@@ -857,7 +857,10 @@ const coachLineText = (line: CoachLine): string =>
  */
 const COACH_TOKENS: Array<{ pattern: RegExp; paint: (match: string) => Paint | undefined }> = [
   {
-    pattern: /[+−-][\d,]+(?:\.\d+)?(?:\s*(?:USDT|USD|SOL|BTC|ETH))?/g,
+    // The sign has to be a sign. Without the lookbehind the hyphen in a date or
+    // a range is read as a minus and half of it turns red -- '08-17' became
+    // '08' plus a negative seventeen, and '102.70-105.45' likewise.
+    pattern: /(?<![\d.,])[+−-][\d,]+(?:\.\d+)?(?:\s*(?:USDT|USD|SOL|BTC|ETH))?/g,
     paint: (match) => (match.trim().startsWith('+') ? 'green' : 'red'),
   },
   {
@@ -875,12 +878,38 @@ const COACH_TOKENS: Array<{ pattern: RegExp; paint: (match: string) => Paint | u
  * Earlier patterns win where two overlap, which is why the signed amount is
  * listed first: '-26.16 USDT' is a negative amount before it is anything else.
  */
+/**
+ * Spans nothing may colour part of.
+ *
+ * A date is one token to a reader and several to a regular expression. The
+ * lookbehind on the signed-amount pattern already stops the common case, and
+ * this is the belt to that pair of braces: whatever a date or a clock time
+ * contains, no rule gets to paint a piece of it.
+ */
+const COACH_RESERVED = /\b\d{4}-\d{2}-\d{2}\b|\b\d{2}-\d{2}\b|\b\d{1,2}:\d{2}(?::\d{2})?\b/g;
+
 function coachSegments(
   text: string,
   base: Paint | undefined,
   emphasis: string[] = []
 ): CoachSegment[] {
-  const claims: Array<{ start: number; end: number; paint: Paint | undefined }> = [];
+  const claims: Array<{
+    start: number;
+    end: number;
+    paint: Paint | undefined;
+    /** Whether a value found inside it may take its own colour. */
+    splittable?: boolean;
+  }> = [];
+
+  COACH_RESERVED.lastIndex = 0;
+  let reserved: RegExpExecArray | null;
+  while ((reserved = COACH_RESERVED.exec(text)) !== null) {
+    claims.push({
+      start: reserved.index,
+      end: reserved.index + reserved[0].length,
+      paint: base,
+    });
+  }
 
   // What the coach asked to be emphasised, claimed first so a value inside a
   // bolded phrase still takes its own colour rather than the phrase's weight.
@@ -888,7 +917,12 @@ function coachSegments(
     if (phrase.length === 0) continue;
     let from = text.indexOf(phrase);
     while (from !== -1) {
-      claims.push({ start: from, end: from + phrase.length, paint: { color: 'brightWhite' } });
+      claims.push({
+        start: from,
+        end: from + phrase.length,
+        paint: { color: 'brightWhite' },
+        splittable: true,
+      });
       from = text.indexOf(phrase, from + phrase.length);
     }
   }
@@ -902,8 +936,10 @@ function coachSegments(
       // A value that falls inside an emphasised phrase takes the value's
       // colour: '+8,139 USDT' is green wherever it appears, and the emphasis
       // around it is the coach's way of pointing at it, not of recolouring it.
+      // Only an emphasised phrase yields to a value inside it. A reserved span
+      // -- a date, a clock time -- is one token and is never broken up.
       const inside = claims.findIndex(
-        (claim) => start >= claim.start && end <= claim.end
+        (claim) => claim.splittable === true && start >= claim.start && end <= claim.end
       );
       if (inside !== -1) {
         const outer = claims[inside];
