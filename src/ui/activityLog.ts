@@ -36,6 +36,8 @@ export interface ActivityEvent {
   detail?: EventDetail;
   /** Diagnostics are kept but not shown in the primary view. */
   debug: boolean;
+  /** How many times this same event has arrived in a row. Absent means once. */
+  repeats?: number;
   /**
    * The message as it arrived, when `message` is a shortened form of it.
    *
@@ -55,6 +57,9 @@ export interface ActivityEvent {
  * quarter of the terminal.
  */
 const COMPACT_WIDTH = 76;
+
+/** How long the same message keeps folding into the row above it. */
+const REPEAT_WINDOW_MS = 5 * 60_000;
 
 /**
  * A message with no payload is left alone below this length.
@@ -76,6 +81,7 @@ const KEEP_WHOLE = 150;
  * same every time.
  */
 const CAUSES: Array<[RegExp, string]> = [
+  [/throttle queue is over maxCapacity/i, 'request queue full'],
   [/timed out|ETIMEDOUT|\btimeout\b/i, 'timeout'],
   [/rate ?limit|too many requests|\b429\b/i, 'rate limited'],
   [/not supported|NotSupported/i, 'unsupported'],
@@ -100,7 +106,8 @@ export function condense(raw: string): string {
   const hasPayload = /https?:\/\/|\{"|\{\s*\w+:/.test(text);
   if (!hasPayload && text.length <= KEEP_WHOLE) return text;
 
-  const cause = CAUSES.find(([pattern]) => pattern.test(text))?.[1];
+  const matched = CAUSES.find(([pattern]) => pattern.test(text));
+  const cause = matched?.[1];
 
   // The endpoint, in case the request is all there is: a failure with no prose
   // in front of it still has a name, and 'activeList' is a better row than
@@ -113,6 +120,22 @@ export function condense(raw: string): string {
   head = head.split(/\s*[:,-]?\s*\b(?:phemex|binance|bybit)?\s*(?:GET|POST|PUT|DELETE)?\s*https?:\/\//i)[0];
   head = head.split(/\s*\{/)[0];
   head = head.replace(/[\s:,.-]+$/, '');
+
+  // Where the phrase that identified the cause is still sitting in the head,
+  // it goes: 'throttle queue is over maxCapacity (1000), see · request queue
+  // full' says the same thing twice and ends on a preposition, because the URL
+  // that followed 'see' was cut away.
+  if (matched) {
+    const at = matched[0].exec(head);
+    matched[0].lastIndex = 0;
+    if (at && at.index > 0) head = head.slice(0, at.index);
+  }
+
+  // Whatever the cut leaves dangling: a trailing conjunction or preposition
+  // reads as a sentence that lost its end, which is exactly what it is.
+  head = head
+    .replace(/[\s,:;.\-]*\b(?:see|at|for|from|via|per|with|and|on|in|to)\s*$/i, '')
+    .replace(/[\s,:;.\-]+$/, '');
 
   // The one failure common enough to deserve a phrasing of its own.
   const candles = /could not (?:read|fetch) (\S+) candles/i.exec(head);
@@ -232,6 +255,28 @@ export class ActivityLog {
     // the payload is available to whoever is diagnosing without being in front
     // of whoever is trading.
     const compact = condense(text);
+    // The same failure, again.
+    //
+    // A condition that persists reports itself on every pass -- ten identical
+    // rows in ninety seconds, which pushes ten real events off the top of a
+    // region whose value is that it can be scanned. The count carries the fact
+    // that it is still happening without spending a row on each occurrence.
+    const last = this.events[this.events.length - 1];
+    if (
+      last !== undefined &&
+      !detail &&
+      last.category === category &&
+      last.debug === debug &&
+      (last.full ?? last.message) === (compact === text ? compact : text) &&
+      when - last.at <= REPEAT_WINDOW_MS
+    ) {
+      last.repeats = (last.repeats ?? 1) + 1;
+      last.at = when;
+      last.time = time;
+      for (const listener of this.listeners) listener();
+      return;
+    }
+
     const event: ActivityEvent = {
       time,
       at: when,
@@ -264,7 +309,15 @@ export class ActivityLog {
   visible(): ActivityRowView[] {
     return this.events
       .filter((event) => !event.debug)
-      .map(({ time, category, message, detail }) => ({ time, category, message, detail }));
+      .map(({ time, category, message, detail, repeats }) => ({
+        time,
+        category,
+        // The count goes on the message rather than into a column of its own:
+        // it is rare, and a column that is empty on every other row costs more
+        // than the four characters it saves.
+        message: repeats && repeats > 1 ? `${message} (x${repeats})` : message,
+        detail,
+      }));
   }
 
   /** Everything, for the debug view. */
