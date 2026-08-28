@@ -57,6 +57,17 @@ export interface ActivityEvent {
 const COMPACT_WIDTH = 76;
 
 /**
+ * A message with no payload is left alone below this length.
+ *
+ * The condensing exists to stop a request URL and its JSON reply from taking
+ * four wrapped rows. A guardrail's own sentence is not that, and cutting one at
+ * seventy-six characters produced 'have given back 130.0...' -- a number
+ * severed mid-digit, which reads as a different number rather than as a
+ * shortened one. Two rows of the log is the budget; this is what fits in them.
+ */
+const KEEP_WHOLE = 150;
+
+/**
  * What went wrong, in two words.
  *
  * The cause is the part of a failure worth reading. 'phemex GET https://...
@@ -87,7 +98,7 @@ export function condense(raw: string): string {
   const text = String(raw).trim().replace(/^\[[^\]]+\]\s*/, '');
 
   const hasPayload = /https?:\/\/|\{"|\{\s*\w+:/.test(text);
-  if (text.length <= COMPACT_WIDTH && !hasPayload) return text;
+  if (!hasPayload && text.length <= KEEP_WHOLE) return text;
 
   const cause = CAUSES.find(([pattern]) => pattern.test(text))?.[1];
 
@@ -108,7 +119,11 @@ export function condense(raw: string): string {
   if (candles) head = `MARKET DATA ${candles[1]} candles unavailable`;
 
   if (head.length > COMPACT_WIDTH) {
-    head = `${head.slice(0, COMPACT_WIDTH - 1).trimEnd()}…`;
+    // Cut at a word, never through one. A truncated word is ugly; a truncated
+    // number is wrong, and this log carries prices.
+    const cut = head.slice(0, COMPACT_WIDTH - 1);
+    const space = cut.lastIndexOf(' ');
+    head = `${(space > COMPACT_WIDTH / 2 ? cut.slice(0, space) : cut).trimEnd()}…`;
   }
 
   if (!head) head = endpoint ? `${endpoint} request failed` : 'request failed';

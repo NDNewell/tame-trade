@@ -4580,14 +4580,17 @@ export class ExchangeClient {
         'WARNING'
       );
 
-      // The coach gets the same edge, and decides for itself whether it has
-      // anything to add -- it is rate-limited hard, so most of these are
-      // dropped. Never awaited: the sweep is on a timer and a slow model call
-      // must not delay the next one.
-      void this.guard
-        .getThread()
-        .nudge(finding)
-        .catch(() => undefined);
+      // The coach is told only if the operator has asked for it to be. An
+      // unprompted remark is a model call nobody requested and somebody pays
+      // for, and a condition that flaps around its threshold can produce
+      // several inside a quarter of an hour. What the guardrail found is
+      // already on the status line and on the row above this one.
+      if (this.guard.getPolicy().coachRemarks) {
+        void this.guard
+          .getThread()
+          .nudge(finding)
+          .catch(() => undefined);
+      }
     }
 
     for (const intervention of interventions) {
