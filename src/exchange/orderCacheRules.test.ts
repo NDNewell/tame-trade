@@ -1,5 +1,5 @@
 // The rules that decide what stays in the cached order list.
-import { classifyOrderStatus, staleOrderIds } from './orderCacheRules.js';
+import { classifyOrderStatus, staleOrderIds, mayIntroduceOrder } from './orderCacheRules.js';
 
 let failures = 0;
 const check = (name: string, ok: boolean, detail: string) => {
@@ -88,6 +88,29 @@ check(
   staleOrderIds(['a', 'b'], [], false).length === 0,
   'a filtered query returning nothing proves nothing'
 );
+
+// --- the feed may not invent an order --------------------------------------
+//
+// A buy order appeared in ACTIVE ORDERS that the operator never placed, that the
+// journal had no record of, and that five days of exchange history showed had
+// never existed. It came from the feed replaying an order that closed days
+// earlier, arriving with the status it held back then.
+
+check('the feed may update an order the cache already holds',
+  mayIntroduceOrder('working', true),
+  'a live order reporting progress is the ordinary case');
+
+check('   but may not introduce one the cache has never seen',
+  !mayIntroduceOrder('working', false),
+  'a replayed order from days ago arrives looking exactly like a new one');
+
+check('   and may not introduce a finished one either',
+  !mayIntroduceOrder('finished', false) && !mayIntroduceOrder('finished', true),
+  'nothing finished belongs in a list of working orders');
+
+check('   nor one whose status means nothing to us',
+  !mayIntroduceOrder('unknown', false) && !mayIntroduceOrder('unknown', true),
+  'an unrecognised status is not evidence of anything, least of all of a new order');
 
 console.log(`\n${failures === 0 ? 'PASS: all order-cache cases' : `FAIL: ${failures} case(s)`}\n`);
 process.exit(failures === 0 ? 0 : 1);

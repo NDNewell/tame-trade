@@ -42,6 +42,34 @@ export function classifyOrderStatus(status: unknown): OrderDisposition {
 }
 
 /**
+ * Whether a streamed update may put an order into the cache that was not there.
+ *
+ * It may not, and this is the rule that says so.
+ *
+ * The order feed replays recent history whenever it reconnects -- the same
+ * behaviour that had fills counted five times over -- and a replayed order
+ * arrives carrying whatever status it held at that moment. One that was open
+ * days ago therefore arrives looking open now. Nothing announces it, because a
+ * plain 'open' is not an event worth a log line, so it appears in ACTIVE ORDERS
+ * with no trace anywhere else: an order the operator never placed, on an
+ * account where that is the most alarming thing a screen can show.
+ *
+ * A genuinely new order reaches the cache by one of two honest routes. One this
+ * application placed is put there when the exchange accepts it. One placed
+ * anywhere else is found by the next authoritative snapshot. Neither needs the
+ * feed to introduce it, and the feed cannot tell a replay from the present.
+ *
+ * So the feed may update an order the cache already knows, and may remove one.
+ * It may not invent one.
+ */
+export function mayIntroduceOrder(
+  disposition: OrderDisposition,
+  known: boolean
+): boolean {
+  return known && disposition === 'working';
+}
+
+/**
  * Cached orders the exchange did not list, and which should therefore go.
  *
  * `authoritative` says whether the snapshot could have contained every cached
