@@ -32,7 +32,7 @@ import {
 } from '../trading/adaptiveTrail.js';
 import { buildTrailTag, readTrailTag, TrailTag } from '../trading/trailTag.js';
 import { describeExchangeError, isMissingOrderError } from '../utils/exchangeErrors.js';
-import { classifyOrderStatus, staleOrderIds } from './orderCacheRules.js';
+import { classifyOrderStatus, mayIntroduceOrder, staleOrderIds } from './orderCacheRules.js';
 import { GuardService } from '../guard/guardService.js';
 import { OrderProposal, PositionContext } from '../guard/detectors.js';
 import { GuardVerdict } from '../guard/guardrails.js';
@@ -1694,8 +1694,21 @@ export class ExchangeClient {
 
               state.orders.delete(update.id);
               state.filledSoFar.delete(update.id);
-            } else {
+            } else if (mayIntroduceOrder(disposition, state.orders.has(update.id))) {
               state.orders.set(update.id, update);
+            } else {
+              // A working update for an order this cache has never held. The
+              // feed replays history on reconnect, so this is at least as
+              // likely to be an order that closed days ago as a new one -- and
+              // showing a buy nobody placed is not a thing to get wrong. It is
+              // not taken on the feed's word; the exchange is asked instead,
+              // and a real order appears a beat later on an answer that can be
+              // trusted.
+              NotificationManager.diagnostic(
+                `[ExchangeClient] Feed reported order ${update.id} (${update.side} ` +
+                  `${update.status}) that is not in the cache; verifying against the exchange.`
+              );
+              void this.getLiveOpenOrders(market).catch(() => undefined);
             }
           }
 
