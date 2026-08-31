@@ -362,8 +362,26 @@ export class Workspace {
     });
   }
 
-  /** Whether a refresh is still running, so the next tick does not stack on it. */
-  private refreshing = false;
+  /** When the running pass began, or null when none is. */
+  private runningSince: number | null = null;
+  /** Identifies the running pass, so a late one cannot clear a newer one's flag. */
+  private pass = Symbol('idle');
+
+  /**
+   * How long a pass may run before the next tick stops waiting for it.
+   *
+   * The guard that stops passes overlapping had no way out of a pass that never
+   * finished. One request that hangs -- a socket that neither answers nor
+   * errors, a queue that never drains -- left the flag set forever, and the
+   * workspace then skipped every tick for the rest of the session: a terminal
+   * showing '--' in every field, no errors, and nothing to indicate the reason.
+   *
+   * Fifteen seconds is far longer than a healthy pass, which is under two, and
+   * far shorter than a session. Past it the pass is abandoned rather than
+   * waited on, and the abandonment is written to the log, because a pass that
+   * takes this long is itself the news.
+   */
+  private static readonly REFRESH_DEADLINE_MS = 15_000;
 
   /**
    * One pass over the exchange, on a two-second timer.
@@ -383,13 +401,30 @@ export class Workspace {
    */
   private async refresh(): Promise<void> {
     if (!this.screen || !this.market) return;
-    if (this.refreshing) return;
 
-    this.refreshing = true;
+    const now = Date.now();
+    if (this.runningSince !== null) {
+      if (now - this.runningSince < Workspace.REFRESH_DEADLINE_MS) return;
+
+      ActivityLog.getInstance().add(
+        'WARNING',
+        `A refresh has been running for ${Math.round(
+          (now - this.runningSince) / 1000
+        )}s and has been abandoned. The panel may be behind.`
+      );
+    }
+
+    // The abandoned pass keeps running -- there is no way to stop an await --
+    // but it no longer owns the flag, so when it finally settles it cannot
+    // clear the flag belonging to whichever pass is current by then.
+    const mine = Symbol('pass');
+    this.pass = mine;
+    this.runningSince = now;
+
     try {
       await this.refreshOnce();
     } finally {
-      this.refreshing = false;
+      if (this.pass === mine) this.runningSince = null;
     }
   }
 
