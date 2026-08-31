@@ -4662,7 +4662,10 @@ export class ExchangeClient {
    * sweeping everything would mean a position query per market per thirty
    * seconds, and the behaviours this catches are about the thing being traded.
    */
-  private guardSweepRunning = false;
+  private guardSweepSince: number | null = null;
+  private guardSweepPassId = Symbol('idle');
+  /** As with the workspace: long enough to be abnormal, short enough to recover. */
+  private static readonly GUARD_SWEEP_DEADLINE_MS = 60_000;
 
   private async runGuardSweep(): Promise<void> {
     const market = this.lastFollowedMarket;
@@ -4673,12 +4676,26 @@ export class ExchangeClient {
     // Every sweep reads the position, the equity and the market, and passes
     // stacking on a rate-limited queue is how a slow exchange becomes an
     // unusable one.
-    if (this.guardSweepRunning) return;
-    this.guardSweepRunning = true;
+    const now = Date.now();
+    if (
+      this.guardSweepSince !== null &&
+      now - this.guardSweepSince < ExchangeClient.GUARD_SWEEP_DEADLINE_MS
+    ) {
+      return;
+    }
+
+    // A pass that has outlived the deadline is abandoned rather than waited on
+    // forever. It keeps running -- an await cannot be cancelled -- but it no
+    // longer owns the flag, so it cannot clear one that belongs to a later
+    // pass when it eventually settles.
+    const mine = Symbol('sweep');
+    this.guardSweepPassId = mine;
+    this.guardSweepSince = now;
+
     try {
       await this.guardSweepPass(market);
     } finally {
-      this.guardSweepRunning = false;
+      if (this.guardSweepPassId === mine) this.guardSweepSince = null;
     }
   }
 
