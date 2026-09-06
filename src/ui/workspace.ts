@@ -10,6 +10,7 @@ import { ConfirmationView, NO_VALUE, TerminalView } from './frame.js';
 import { PositionRiskResult } from '../trading/positionRisk.js';
 import { RANGE_WINDOWS } from '../trading/volatility.js';
 import { describeOrders } from '../trading/orderView.js';
+import { monotonicNow } from '../utils/monotonic.js';
 
 const FOOTER = [
   'buy',
@@ -380,6 +381,11 @@ export class Workspace {
    * far shorter than a session. Past it the pass is abandoned rather than
    * waited on, and the abandonment is written to the log, because a pass that
    * takes this long is itself the news.
+   *
+   * Fifteen seconds of monotonic time, at that. Measured on the wall clock this
+   * fired on healthy passes all of 2026-09-01, because the machine's clock was
+   * being stepped nineteen seconds forwards and back every five: every pass
+   * looked wedged, none was, and the panel abandoned every refresh it started.
    */
   private static readonly REFRESH_DEADLINE_MS = 15_000;
 
@@ -402,7 +408,10 @@ export class Workspace {
   private async refresh(): Promise<void> {
     if (!this.screen || !this.market) return;
 
-    const now = Date.now();
+    // Monotonic: how long this pass has been going, not what time it is. The
+    // wall clock can move under us, and a deadline that believes it will report
+    // stalls that never happened.
+    const now = monotonicNow();
     if (this.runningSince !== null) {
       if (now - this.runningSince < Workspace.REFRESH_DEADLINE_MS) return;
 
