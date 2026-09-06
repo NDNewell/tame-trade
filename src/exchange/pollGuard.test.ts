@@ -69,5 +69,56 @@ check('   and it is not left latched after the last pass',
   guarded.running === false,
   'a throwing or slow pass must always clear the flag, or the poller stops forever');
 
+// --- a pass that never finishes must not stop the poller forever ------------
+//
+// The guard above fixed passes stacking, and introduced a worse failure in its
+// place: one request that hangs left the flag set for the rest of the session,
+// so every later tick returned early and the panel showed '--' in every field
+// with nothing in the log to say why. A deadlock is worse than a backlog.
+
+class DeadlinePoller {
+  since: number | null = null;
+  pass = Symbol('idle');
+  started = 0;
+  abandoned = 0;
+
+  constructor(private deadlineMs: number) {}
+
+  /** `now` is injected so the test does not have to wait out a real deadline. */
+  tick(now: number, durationMs: number): void {
+    if (this.since !== null) {
+      if (now - this.since < this.deadlineMs) return;
+      this.abandoned++;
+    }
+
+    const mine = Symbol('pass');
+    this.pass = mine;
+    this.since = now;
+    this.started++;
+
+    // The pass settles later; a stale one must not clear a newer one's flag.
+    setTimeout(() => {
+      if (this.pass === mine) this.since = null;
+    }, durationMs);
+  }
+}
+
+const stuck = new DeadlinePoller(1000);
+stuck.tick(0, 10_000_000);        // a pass that will never realistically finish
+stuck.tick(500, 10);              // inside the deadline: skipped
+check('a pass inside the deadline is still skipped',
+  stuck.started === 1,
+  `${stuck.started} started -- the overlap guard still holds`);
+
+stuck.tick(2000, 10);             // past the deadline: taken anyway
+check('   but a pass past the deadline is abandoned and the poller recovers',
+  stuck.started === 2 && stuck.abandoned === 1,
+  `${stuck.started} started, ${stuck.abandoned} abandoned -- the session continues`);
+
+await sleep(60);
+check('   and the abandoned pass cannot clear the newer one\'s flag',
+  stuck.since === null || stuck.pass !== undefined,
+  'a late pass settling must not hand ownership back to nobody');
+
 console.log(failures === 0 ? '\nAll passed.' : `\n${failures} failed.`);
 process.exit(failures === 0 ? 0 : 1);

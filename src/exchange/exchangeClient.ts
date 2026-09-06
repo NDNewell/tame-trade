@@ -32,11 +32,13 @@ import {
 } from '../trading/adaptiveTrail.js';
 import { buildTrailTag, readTrailTag, TrailTag } from '../trading/trailTag.js';
 import { describeExchangeError, isMissingOrderError } from '../utils/exchangeErrors.js';
-import { classifyOrderStatus, staleOrderIds } from './orderCacheRules.js';
+import { classifyOrderStatus, mayIntroduceOrder, staleOrderIds } from './orderCacheRules.js';
 import { GuardService } from '../guard/guardService.js';
 import { OrderProposal, PositionContext } from '../guard/detectors.js';
 import { GuardVerdict } from '../guard/guardrails.js';
 import { MarketContext, MarketSeries } from '../guard/marketContext.js';
+import { PassGuard } from '../utils/passGuard.js';
+import { monotonicNow } from '../utils/monotonic.js';
 import { describeOrders } from '../trading/orderView.js';
 import { resolvePolicy, GuardPolicy } from '../guard/guardPolicy.js';
 import {
@@ -1694,8 +1696,21 @@ export class ExchangeClient {
 
               state.orders.delete(update.id);
               state.filledSoFar.delete(update.id);
-            } else {
+            } else if (mayIntroduceOrder(disposition, state.orders.has(update.id))) {
               state.orders.set(update.id, update);
+            } else {
+              // A working update for an order this cache has never held. The
+              // feed replays history on reconnect, so this is at least as
+              // likely to be an order that closed days ago as a new one -- and
+              // showing a buy nobody placed is not a thing to get wrong. It is
+              // not taken on the feed's word; the exchange is asked instead,
+              // and a real order appears a beat later on an answer that can be
+              // trusted.
+              NotificationManager.diagnostic(
+                `[ExchangeClient] Feed reported order ${update.id} (${update.side} ` +
+                  `${update.status}) that is not in the cache; verifying against the exchange.`
+              );
+              void this.getLiveOpenOrders(market).catch(() => undefined);
             }
           }
 
@@ -4336,8 +4351,42 @@ export class ExchangeClient {
    * bar of that size closes -- so the weekly series is read about once a week,
    * and the cost of the whole ladder amortises to almost nothing.
    */
-  private coachWarmRunning = false;
-  private coachWarmAt = 0;
+  /**
+   * When the ladder was last walked, on the monotonic clock.
+   *
+   * `-Infinity` rather than 0 because that clock counts from around process
+   * start: a 0 here would read as 'walked a moment ago' and hold the first walk
+   * of every session off for a minute.
+   */
+  private coachWarmAt = -Infinity;
+
+  /**
+   * How long a walk may run before the next sweep stops waiting for it.
+   *
+   * Longer than anything else here, because the walk is eight reads in series
+   * and each one may spend ccxt's ten-second timeout before it gives up -- a
+   * walk that fails every step honestly takes eighty seconds, and abandoning it
+   * at fifteen would start a second walk on top of a first that was still
+   * working. Past two minutes it is not slow, it is stuck.
+   */
+  private static readonly COACH_WARM_DEADLINE_MS = 120_000;
+
+  /**
+   * The walk, guarded the way the panel refresh is.
+   *
+   * `coachWarmRunning` was a bare boolean with nothing behind it, so one candle
+   * request that hung left it set for the rest of the session and the coach's
+   * history stopped at whatever had been fetched before -- which, early enough
+   * in a session, is nothing at all.
+   */
+  private coachWarmPass = new PassGuard({
+    deadlineMs: ExchangeClient.COACH_WARM_DEADLINE_MS,
+    onAbandon: (ranForMs) =>
+      console.warn(
+        `The coach's candle history has been fetching for ${Math.round(ranForMs / 1000)}s ` +
+          `and has been abandoned. Older bars may be missing.`
+      ),
+  });
   /**
    * How often the ladder is walked at all.
    *
@@ -4354,23 +4403,28 @@ export class ExchangeClient {
     const symbol = market ?? this.lastFollowedMarket;
     if (!symbol || !this.exchange) return;
 
-    // One walk at a time, and not again straight away. Both matter: the first
-    // stops passes overlapping when the exchange is slow, the second stops the
-    // sweep asking every thirty seconds for series that change hourly.
-    if (this.coachWarmRunning) return;
-    if (Date.now() - this.coachWarmAt < ExchangeClient.COACH_WARM_MS) return;
+    // Not again straight away: each series refuses to refetch until a bar of
+    // its own size has closed, so this stops the sweep asking every thirty
+    // seconds for series that change hourly. One walk at a time is the pass
+    // guard's job, and it is the half that has a way out.
+    //
+    // Stamped when a walk finishes rather than when one starts, so a walk that
+    // is still stuck cannot also be holding the next one off: with the clock
+    // unstamped this check passes, and whether a fresh walk actually begins is
+    // then the deadline's decision rather than a timer's.
+    if (monotonicNow() - this.coachWarmAt < ExchangeClient.COACH_WARM_MS) return;
 
-    this.coachWarmRunning = true;
-    try {
-      for (const { timeframe, count } of ExchangeClient.COACH_SERIES) {
-        await this.getCandles(symbol, timeframe, ExchangeClient.coachDepth(count)).catch(
-          () => undefined
-        );
+    await this.coachWarmPass.start(async () => {
+      try {
+        for (const { timeframe, count } of ExchangeClient.COACH_SERIES) {
+          await this.getCandles(symbol, timeframe, ExchangeClient.coachDepth(count)).catch(
+            () => undefined
+          );
+        }
+      } finally {
+        this.coachWarmAt = monotonicNow();
       }
-    } finally {
-      this.coachWarmRunning = false;
-      this.coachWarmAt = Date.now();
-    }
+    });
   }
 
   /**
@@ -4649,7 +4703,10 @@ export class ExchangeClient {
    * sweeping everything would mean a position query per market per thirty
    * seconds, and the behaviours this catches are about the thing being traded.
    */
-  private guardSweepRunning = false;
+  private guardSweepSince: number | null = null;
+  private guardSweepPassId = Symbol('idle');
+  /** As with the workspace: long enough to be abnormal, short enough to recover. */
+  private static readonly GUARD_SWEEP_DEADLINE_MS = 60_000;
 
   private async runGuardSweep(): Promise<void> {
     const market = this.lastFollowedMarket;
@@ -4660,12 +4717,28 @@ export class ExchangeClient {
     // Every sweep reads the position, the equity and the market, and passes
     // stacking on a rate-limited queue is how a slow exchange becomes an
     // unusable one.
-    if (this.guardSweepRunning) return;
-    this.guardSweepRunning = true;
+    // Monotonic, like every other deadline here: a duration measured on a wall
+    // clock that can be stepped is not a duration.
+    const now = monotonicNow();
+    if (
+      this.guardSweepSince !== null &&
+      now - this.guardSweepSince < ExchangeClient.GUARD_SWEEP_DEADLINE_MS
+    ) {
+      return;
+    }
+
+    // A pass that has outlived the deadline is abandoned rather than waited on
+    // forever. It keeps running -- an await cannot be cancelled -- but it no
+    // longer owns the flag, so it cannot clear one that belongs to a later
+    // pass when it eventually settles.
+    const mine = Symbol('sweep');
+    this.guardSweepPassId = mine;
+    this.guardSweepSince = now;
+
     try {
       await this.guardSweepPass(market);
     } finally {
-      this.guardSweepRunning = false;
+      if (this.guardSweepPassId === mine) this.guardSweepSince = null;
     }
   }
 
