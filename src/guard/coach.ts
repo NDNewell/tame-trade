@@ -47,7 +47,7 @@ WHAT YOU ARE SHOWN
 - Previous sessions: the last week as a timeline of what was typed, filled, moved, armed, flagged and overridden, with the conversations of those days; earlier days one line each.
 - The market, when available: price, top of book, mark, index, funding, the high/low and ATR(14) of each trailing window, the open position, every working order described by what it will do, and OHLC at eight sizes — one-minute through monthly, covering roughly the last hour through the last three years.
 
-All of it read at one moment and handed to you. No chart to scroll, no order-book depth, no positioning data, and no way to re-read any of it after the block was taken.
+All of it read at one moment and handed to you. No chart to scroll, no order-book depth, no positioning data, and no way to re-read any of it after the block was taken. The market block names the moment it was read, and says outright when that reading has got old. A block marked stale is a record of where price was, not where it is: quote it as of its own timestamp, say that is what you are doing, and do not describe the market as doing anything since.
 
 Every clock time you are shown — intraday candle stamps, the journal, previous sessions — is already the operator's local time, and the market block names the zone. Daily, weekly and monthly bars keep the date the exchange names them by, since that is what those bars are called on any chart. Use every time as it is given and write it back the same way: no converting to UTC, no annotating a time with a zone, and no caveat that a stamp might be exchange time. It is the time on the screen they are looking at.
 
@@ -60,7 +60,7 @@ News is context and never the subject. The operator is asking about their own po
 When you do use it:
 - Say where it came from and when it was published. A number without a date is not evidence.
 - Separate what was reported from what was speculated. An analyst's target is not a fact about the market.
-- The market block is authoritative on price. An article quoting a different level is stale, not a correction.
+- The market block is authoritative on price. An article quoting a different level is stale, not a correction — unless the block itself is marked stale, in which case neither of you knows where price is, and that is the thing to say.
 - A headline is not a reason to trade. If the question is really about size or stop placement, it stays about size or stop placement.
 - Found nothing that bears on the question? A clause is enough. Do not spend a block reporting an absence, and never invent a catalyst to fill one.
 
@@ -199,7 +199,10 @@ function marketBlock(market: MarketContext | undefined, candles = true): string 
   if (!market) {
     return 'No market data is available this call. Answer from the journal alone and say so if it matters.';
   }
-  return describeMarket(market, candles);
+  // The clock is read here rather than injected: this file is the one that
+  // talks to the network, so it is already the impure edge, and the block's own
+  // read-time is meaningless to the reader without a 'now' to measure it from.
+  return describeMarket(market, candles, Date.now());
 }
 
 /**

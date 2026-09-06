@@ -154,13 +154,38 @@ function zoneLabel(at: number): string {
 }
 
 /**
+ * How old a reading has to be before it is worth saying so.
+ *
+ * The sweep re-reads the market every pass and a typed question re-reads it on
+ * the spot, so a reading is normally seconds old and its age is not news. Past
+ * a minute a read has either failed or is stuck behind a queue that has stopped
+ * draining, and that is the single most useful thing the block can say.
+ */
+const STALE_AFTER_MS = 60_000;
+
+/** An age a sentence can carry, rather than a count of milliseconds. */
+function age(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 90) return `${seconds} seconds`;
+
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 90) return `${minutes} minutes`;
+
+  return `${Math.round(minutes / 60)} hours`;
+}
+
+/**
  * The context as prose and columns rather than JSON.
  *
  * A hundred candles as JSON objects is several thousand tokens of repeated key
  * names for the same numbers. Rows cost a fraction of that and are no harder to
  * read -- and the header says what the columns are, so nothing is guessed.
  */
-export function describeMarket(context: MarketContext, includeCandles = true): string {
+export function describeMarket(
+  context: MarketContext,
+  includeCandles = true,
+  now?: number
+): string {
   const out: string[] = [];
 
   const top = [
@@ -177,6 +202,24 @@ export function describeMarket(context: MarketContext, includeCandles = true): s
     `MARKET, read at ${stamp(context.at, false)} — clock times are the ` +
       `operator's own (${zoneLabel(context.at)})`
   );
+
+  // Said outright rather than left to be worked out from the stamp, because
+  // there is nothing here to work it out against: a block headed '07:22' reads
+  // as current to someone with no idea what time it is now, and the whole
+  // reason a reading gets old is that the exchange stopped answering -- which
+  // is precisely when the coach must not talk about price as though it were
+  // watching it.
+  if (now !== undefined && now - context.at > STALE_AFTER_MS) {
+    out.push(
+      `STALE: this is the most recent reading there is and it is ${age(
+        now - context.at
+      )} old — the exchange has not answered since. Every figure below, price ` +
+        `included, is as of the time above and not as of now. Say so before ` +
+        `quoting any of it, and do not treat a level as tested or untested on ` +
+        `the strength of it.`
+    );
+  }
+
   out.push(top.join('  '));
   if (context.funding) out.push(`funding ${context.funding}`);
 

@@ -21,6 +21,8 @@ import { FindingTracker, Transition } from './findingTracker.js';
 import { OrderProposal, PositionContext, PriceMove } from './detectors.js';
 import { GuardPolicy, resolvePolicy } from './guardPolicy.js';
 import { MarketContext } from './marketContext.js';
+import { PassGuard } from '../utils/passGuard.js';
+import { monotonicNow } from '../utils/monotonic.js';
 import {
   Finding,
   GuardVerdict,
@@ -54,8 +56,18 @@ export interface GuardSweep extends SweepResult {
 export interface GuardServiceOptions {
   policy?: Partial<GuardPolicy>;
   apiKey?: string;
-  /** Injected in tests; the real one is Date.now. */
+  /** Injected in tests; the real one is Date.now. Stamps moments. */
   clock?: () => number;
+  /**
+   * Injected in tests; the real one is `monotonicNow`. Measures durations.
+   *
+   * Separate from `clock` because they answer different questions and only one
+   * of them may be moved by whatever is syncing the machine's time. Everything
+   * the guard records -- a fill, a finding, the moment a market was read -- is
+   * stamped with `clock`, because those have to mean something to the operator
+   * reading them back. The market read's deadline is measured with this.
+   */
+  elapsed?: () => number;
   journal?: SessionJournal;
   /**
    * Where the conversation is kept, and what is read back from previous days.
@@ -75,6 +87,8 @@ export class GuardService {
   private tracker = new FindingTracker();
   private policy: GuardPolicy;
   private now: () => number;
+  /** How durations are measured here; see `elapsed` on the options. */
+  private elapsed: () => number;
   private currency = '';
   /** How the market is read, when anything has offered a way to read it. */
   private marketSource: (() => Promise<MarketContext | undefined>) | undefined;
@@ -87,14 +101,65 @@ export class GuardService {
    * something else. Both take what is already here; only a question or a
    * debrief pays to refresh it.
    */
-  private market: { at: number; context: MarketContext } | undefined;
-  private marketRefreshInFlight = false;
+  private lastMarket: { at: number; context: MarketContext } | undefined;
+
+  /**
+   * How long a market read may run before the next one stops waiting for it.
+   *
+   * The same figure as the panel's own refresh deadline, because it is the same
+   * failure: both are a handful of requests through one rate-limited queue, and
+   * a queue that has stopped answering one has stopped answering the other.
+   */
+  private static readonly MARKET_DEADLINE_MS = 15_000;
+
+  /**
+   * How long a typed question waits for a market read before answering without
+   * one.
+   *
+   * This path used to claim it forced a wait and did not: it called the
+   * refresh, the refresh found a flag set by a read that had hung, returned
+   * immediately without doing anything, and the question was answered against
+   * no market at all. Joining the read in flight is the fix; this ceiling is
+   * what stops the fix being worse than the bug. Ten seconds because that is
+   * what ccxt gives a single request -- a read still outstanding past it is
+   * queued behind something rather than merely slow, and more waiting will not
+   * produce it.
+   */
+  private static readonly FORCED_MARKET_WAIT_MS = 10_000;
+
+  /**
+   * The market read, guarded so that one that hangs cannot silence the coach.
+   *
+   * A bare in-flight boolean was what this had, and it was the same one the
+   * panel refresh used to have. The sweep fires the read every pass and ignores
+   * the result, so when one hung behind a backed-up queue the flag stayed set,
+   * every later read returned without doing anything, and the coach spent the
+   * rest of the session being told there was no market data -- while the panel
+   * beside it, which had been given a deadline, carried on.
+   */
+  private marketPass = new PassGuard({
+    deadlineMs: GuardService.MARKET_DEADLINE_MS,
+    // The monotonic clock, not the one that stamps the reading: a deadline is a
+    // duration, and a wall clock that steps forward abandons reads that are
+    // milliseconds old.
+    now: () => this.elapsed(),
+    // Routed through the console because this file has no business knowing
+    // about the activity log; the log captures console.warn and files it as a
+    // warning row, next to the panel's own abandonment notice.
+    onAbandon: (ranForMs) =>
+      console.warn(
+        `The coach's market read has been running for ${Math.round(ranForMs / 1000)}s ` +
+          `and has been abandoned. The coach may be reading a stale market.`
+      ),
+  });
+
   private history: SessionHistory | undefined;
 
   constructor(options: GuardServiceOptions = {}) {
     this.policy = resolvePolicy(options.policy);
     this.guardrails = new Guardrails(this.policy);
     this.now = options.clock ?? (() => Date.now());
+    this.elapsed = options.elapsed ?? monotonicNow;
     this.journal = options.journal ?? new SessionJournal();
     this.history = options.history;
     this.coach = new Coach({
@@ -110,7 +175,7 @@ export class GuardService {
       // is currently true. Deriving it twice is how the panel and the prose
       // come to describe different sessions.
       findings: () => this.tracker.active().map((entry) => entry.finding),
-      market: (maxAgeMs) => this.marketContext(maxAgeMs),
+      market: (maxAgeMs) => this.marketAt(maxAgeMs),
       clock: this.now,
       log: options.coachLog,
     });
@@ -208,40 +273,61 @@ export class GuardService {
    * The market as the coach should see it, no older than `maxAgeMs`.
    *
    * A stale reading is refreshed in the background and the stale one returned,
-   * rather than the caller waiting: every caller here has a canned fallback and
-   * none of them is worth a stalled panel. `maxAgeMs` of zero forces the wait,
-   * which is what a typed question deserves.
+   * rather than the caller waiting -- and so is no reading at all: every caller
+   * that names a tolerance has a canned fallback, and none of them is worth a
+   * stalled panel. `maxAgeMs` of zero waits, which is
+   * what a typed question deserves -- and waits on the read already in flight
+   * if there is one, which is the part that used to be missing. Even that wait
+   * has a ceiling, so the answer is at worst built on a reading with a date on
+   * it rather than on nothing.
    */
-  private async marketContext(maxAgeMs: number): Promise<MarketContext | undefined> {
-    if (!this.marketSource) return undefined;
+  async marketAt(maxAgeMs: number): Promise<MarketContext | undefined> {
+    const source = this.marketSource;
+    if (!source) return undefined;
 
-    const cached = this.market;
+    const cached = this.lastMarket;
     const fresh = cached !== undefined && this.now() - cached.at <= maxAgeMs;
     if (fresh) return cached.context;
 
-    if (cached !== undefined && maxAgeMs > 0) {
-      void this.refreshMarket();
-      return cached.context;
+    // Anything but zero means the caller will take what is here and will not
+    // wait, so it gets what is here -- including nothing, on the first call of
+    // a session. That last case used to fall through to the waiting path
+    // instead, which put an unbounded read in front of the confirmation panel:
+    // the two callers that pass a tolerance here are a sentence raced against a
+    // keypress and a remark nobody asked for, and both time-box the coach
+    // itself while awaiting this without a limit.
+    if (maxAgeMs > 0) {
+      void this.marketPass.start(() => this.readMarket(source));
+      return cached?.context;
     }
 
-    await this.refreshMarket();
-    return this.market?.context;
+    // Forced. Join the read already in flight rather than stepping over it, and
+    // put a ceiling on the joining: an answer built on a reading with a date on
+    // it beats a panel that says 'thinking...' until the session is restarted.
+    await this.marketPass.wait(
+      () => this.readMarket(source),
+      GuardService.FORCED_MARKET_WAIT_MS
+    );
+    return this.lastMarket?.context;
+  }
+
+  /** One read, kept if it produced anything. */
+  private async readMarket(
+    source: () => Promise<MarketContext | undefined>
+  ): Promise<void> {
+    const context = await source();
+    // A failed read leaves the previous reading standing. A coach shown a
+    // market from thirty seconds ago is in a better position than one shown
+    // none, and every block it is given is stamped with when it was read.
+    if (context) this.lastMarket = { at: this.now(), context };
   }
 
   /** Reads the market and keeps it. Never throws; a failure leaves the last one. */
   async refreshMarket(): Promise<void> {
-    if (!this.marketSource || this.marketRefreshInFlight) return;
+    const source = this.marketSource;
+    if (!source) return;
 
-    this.marketRefreshInFlight = true;
-    try {
-      const context = await this.marketSource();
-      if (context) this.market = { at: this.now(), context };
-    } catch {
-      // The previous reading stands. A coach shown a market from thirty seconds
-      // ago is in a better position than one shown none.
-    } finally {
-      this.marketRefreshInFlight = false;
-    }
+    await this.marketPass.start(() => this.readMarket(source));
   }
 
   snapshot(): SessionSnapshot {
@@ -523,7 +609,7 @@ export class GuardService {
     // Whatever market reading is already to hand, up to a minute old. The panel
     // cannot wait for a fresh one and the numbers that matter here -- ATR, the
     // day's range, where the stop sits -- do not turn over in a minute.
-    const market = await this.marketContext(60_000);
+    const market = await this.marketAt(60_000);
 
     const written = await Promise.race([
       this.coach.speakTo(finding, this.snapshot(), market),
@@ -534,7 +620,7 @@ export class GuardService {
   }
 
   async debrief(findings: Finding[] = []): Promise<string | undefined> {
-    return this.coach.debrief(this.snapshot(), findings, await this.marketContext(0));
+    return this.coach.debrief(this.snapshot(), findings, await this.marketAt(0));
   }
 
   /** The catalogue entry behind a flag, for `guard explain`. */
