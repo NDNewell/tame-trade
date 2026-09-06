@@ -1,184 +1,76 @@
 # Tame
 
-Tame is a Node.js and TypeScript trading app that communicates with Deribit's API. It provides a terminal-based client interface for users to input basic string commands, such as `limit buy .01`. The app also supports alias functionality, which allows users to create custom shortcuts for core commands.
+Tame is a terminal client for trading crypto perpetuals. You type short commands (`limit buy 1 101.20`, `stop 99.90`, `trail 3atr 15m`), and a fixed workspace shows the market, your position, your working orders, and an activity log, all repainted in place.
 
-## Installation
+Two things set it apart from a plain order-entry tool:
 
-Clone this repository.
-Run `yarn install` to install the required dependencies.
-Run `yarn build` to compile the TypeScript code.
-Usage
-Run `yarn start` to start the application. Follow the prompts to enter your API keys with trading, futures, and read permissions enabled. The API keys and configuration data will be stored locally in the `.tame/config.json` file located in your home directory.
+- **Behavioural guardrails.** Tame watches your own session for the patterns that end accounts (revenge entries, size escalation, a position left without a stop) and holds an order in front of you when it sees one. Nothing ever obstructs an exit or a protective order, and nothing blocks unless you set the limit yourself.
+- **A trading coach.** With an Anthropic API key, a coach reads your journal, the market, and your previous week of sessions, and answers questions in a side panel. It writes about what was measured; it never decides what happens.
 
-### Development Mode
+Tame runs from source with `tsx`. It is built and tested against **Phemex**, with Hyperliquid and Deribit wired in.
 
-For development with hot-reload capability, use:
+## Quickstart
 
-`yarn dev`
-
-This starts the application in development mode with file watching. The app will automatically restart whenever you make changes to any `.ts`, `.js`, or `.json` files in the source directory. The watcher includes a 1-second debounce to prevent multiple rapid restarts when saving multiple files.
-
-For faster development without password authentication:
-
-`yarn dev:np`
-
-This runs the app in development mode while skipping the password verification step.
-
-Development mode features:
-- Automatic restart when files change, with debounce to prevent rapid restarts
-- State preservation between restarts (preserves current exchange and market)
-- Password authentication can be skipped with the `-np` flag
-- Clear indication when running in development mode
-
-### Fatfinger
-
-The fatfinger limit caps how much a single order may be **worth**, so one number
-means the same thing on every market. Set it by typing `fatfinger` followed by an
-amount:
-
-`fatfinger 5000`
-
-No single order may exceed 5000 in the market's quote currency. On `BTC/USD:BTC`
-that is 5000 USD; on `BTC/USDT:USDT` it is 5000 USDT, or about 0.065 BTC at a
-price of 77,000.
-
-An order's value is its size multiplied by its price. Limit and stop orders are
-valued at the price you gave; market orders are valued at the last traded price.
-On inverse contracts, where each contract is already worth one unit of the quote
-currency, the size is the value.
-
-- `fatfinger` — show the current limit
-- `fatfinger 5000` — set the limit
-- `fatfinger off` — remove the limit
-
-The limit is saved to your profile and applies across sessions. It is **not** set
-by default; when no limit is set, Tame says so on startup.
-
-Orders are rejected before being sent to the exchange, and the rejection tells you
-what the order was worth. Sizes that Tame works out from your own position —
-closing a position, or a stop sized to cover one — are not subject to the limit,
-so a protective order can always be placed.
-
-### Aliases
-
-Aliases are custom shortcuts that can be created for one or multiple core commands. To create an alias, edit the initrun.txt file located in the application's root directory or create it if it doesn't exist.
-
-Alias example:
-
-```
-{
-"b": "limit buy 0.01",
-"s": "limit sell 0.01"
-}`
+```bash
+git clone <this repository>
+cd tame-trade
+yarn install
+yarn start
 ```
 
-With this alias configuration, typing b in the terminal will execute the limit buy 0.01 command, and typing s will execute the limit sell 0.01 command.
+On first run Tame asks you to create a password, choose an exchange, and paste an API key and secret. Keys need **read, trading, and futures** permissions. Everything is stored in `~/.tame/config.json`, readable only by you.
 
-### General Commands
-
-`market [symbol]`: Switch to another market (e.g., market btc-perp or market eth-perp).
-
-`buy [size] @ [price]`: Place a limit buy order (e.g., buy 0.001 @ 9000).
-
-`sell [size] @ [price]`: Place a limit sell order (e.g., sell 0.001 @ 9000).
-
-`stop [price] [size]`: Place a stop loss order. **The price always comes first.**
-`stop 15000` places a stop at 15000 sized to cover your position; `stop 15000 0.5`
-places one at 15000 for a size of 0.5.
-
-A stop price far from the current market is rejected rather than placed, because
-it almost always means the price and size were entered the wrong way round.
-
-Stops are sent reduce-only and trigger on the last traded price, matching what the
-exchange UI creates. Being reduce-only, a stop can only close what you hold — it
-can never open a position in the opposite direction.
-
-`trigger buy [size] [price] or trigger sell [size] [price]`: Place a non-reduce-only stop order.
-
-`trail [distance]` / `trail [percent]%`: Place a trailing stop covering the whole
-position. `trail 1.5` trails 1.50 behind the best price; `trail 2%` trails 2%.
-The stop starts one trail-width away from the current price.
-
-The exchange maintains the trail, not Tame, so it keeps working whether or not
-this application is running. That is deliberate: a trail maintained locally would
-freeze wherever it happened to be if the process stopped, while still looking
-like it was following the price.
-
-Trails follow the **mark price** rather than the last traded price. Last price is
-what a wick moves: a spike on this venue ratchets the trail up behind it, and
-when price returns the stop is left near the market and closes the position on a
-move that never really happened. Mark price comes from the index, so a wick that
-does not move the wider market barely moves the trail. Fixed stops still trigger
-on last price, matching the exchange UI.
-
-`bump + [value] or bump - [value]`: Bump all orders by the specified value.
-
-`cancel all`: Cancel all resting orders, including stops.
-
-`cancel limits`: Cancel all resting orders, excluding stops.
-
-`cancel stops`: Cancel stop loss, take profit, and trailing stop orders.
-
-`cancel buys`: Cancel buy orders.
-
-`cancel sells`: Cancel sell orders.
-
-`logout`: Delete stored API credentials from the tame-config-db.json file.
-
-`q`: Quit the application.
-
-## Cancel Specific Orders by Range
-
-You can cancel a range of orders based on their position in the order
-book:
+Then, in the trading screen:
 
 ```
-cancel orders top 5
+market SOL/USDT:USDT      follow a market (exact exchange symbol)
+fatfinger 5000            cap any single order at 5,000 USDT
+limit buy 10 101.20       rest a bid
+stop 99.90                protect the whole position
+guard                     where the session stands
 ```
-Cancels the top 5 orders from the order book.
 
-```
-cancel orders bottom 5
-```
-Cancels the bottom 5 orders from the order book.
+Press `Tab` to move to the coach prompt and ask it something. `Ctrl+C` quits.
 
-## Cancel Orders by Specific Range
+## Documentation
 
-To cancel orders within a specific price range:
+**Guides**
 
-```
-cancel orders top 3:5
-```
-Cancels orders from top positions 3 to 5 in the order book.
+| Page | What it covers |
+|---|---|
+| [Getting started](docs/getting-started.md) | Install, first run, your first market and order, development mode |
+| [The workspace](docs/workspace.md) | Every region of the screen, the two prompts, keys, the confirmation panel |
+| [Placing and managing orders](docs/orders.md) | Market, limit, stop, trailing stops, chase, bump, cancel, the fatfinger limit |
+| [Guardrails](docs/guardrails.md) | The seventeen behaviours, severities, holds and overrides, lockouts, assisted exits |
+| [The coach](docs/coach.md) | Setup, asking questions, what the coach can see, debriefs, tuning the brief |
 
-```
-cancel orders bottom 2:4
-```
-Cancels orders from bottom positions 2 to 4 in the order book.
+**Reference**
 
-## Cancel Orders by Specific Index
+| Page | What it covers |
+|---|---|
+| [Command reference](docs/reference/commands.md) | Every command, its syntax, examples, and error messages |
+| [Configuration](docs/reference/configuration.md) | `~/.tame/config.json`, every guard policy setting, environment variables |
+| [Records on disk](docs/reference/records.md) | The journal, coach transcript, and activity log formats |
+| [Exchanges](docs/reference/exchanges.md) | Supported venues, credentials, and per-exchange behaviour |
 
-To cancel a specific order by its index in the order book, you can use
-the same command without the colon:
+**For contributors**
 
-```
-cancel orders top 3
-```
-Cancels the third order from the top of the order book.
+| Page | What it covers |
+|---|---|
+| [Development](docs/development.md) | Architecture, running from source, tests, scripts, known gaps |
+| [Troubleshooting](docs/troubleshooting.md) | Symptoms, causes, and fixes |
 
-```
-cancel orders bottom 1
-```
-Cancels the very first order from the bottom of the order book.
+## Principles
 
-Remember that these commands are context-sensitive and apply to the
-orders of the market that is currently selected within the client
-session.
+These are enforced in code, not just intended:
 
-Please ensure that you have selected the appropriate market when using
-these commands to cancel limit orders.
-```
+1. **Nothing obstructs an exit or a protective order.** Closing a position and placing a stop are never held, refused, delayed, or size-limited.
+2. **Only limits you set can refuse an order.** Shipped defaults warn or hold; they never block.
+3. **Nothing closes a position unless you authorised it.** Tame recommends a worked exit by default and executes one only for behaviours you named with `guard autoexit`.
+4. **Trails live on the exchange.** A fixed trailing stop keeps working when Tame is not running.
+5. **The record outlives the process.** The session journal is written to disk per day, so a daily loss limit survives a restart.
+6. **The coach describes; it never decides.** Guardrail findings are fixed before the model sees them, and no order waits on a network call.
 
 ## License
 
-Tame is released under the MIT License.
+MIT.
