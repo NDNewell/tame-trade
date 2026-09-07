@@ -85,7 +85,9 @@ Side, size, entry, mark, unrealized PnL, realized PnL, position risk, funding pe
 | `0.00 USDT` | Covered, and the stop is at or beyond breakeven |
 | `312.40 USDT` | Covered; this is the planned downside to the stop |
 
-Partial coverage appends `+ 400 SOL unprotected`, or `[PARTIAL]` when the panel is narrow. Stops that cannot be resolved to a single reading show `-- [AMBIGUOUS STOPS]`.
+Partial coverage appends `+ 400 SOL unprotected`, or `[PARTIAL]` when the panel is narrow.
+
+Stops are read in the order price would trigger them, nearest first. A sized stop takes what it asked for out of whatever is still open when price reaches it; a whole-position stop takes all of it; anything further out never fires. So a 500 stop above entry with a whole-position stop at entry beneath it reads as `0.00 USDT`, fully covered: half out with a profit, the rest at breakeven. Stops in a one-cancels-the-other group resolve the same way, since the first to fire cancels its partner.
 
 **Funding** on this panel is the cost of holding this position at this size, shown per 24 hours, for example `-26.78/24h`. The rate on MARKET is a property of the instrument; this is a property of your position.
 

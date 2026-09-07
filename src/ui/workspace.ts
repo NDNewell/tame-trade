@@ -160,11 +160,7 @@ const formatRisk = (
   base?: string,
   short = false
 ): string => {
-  if (!risk || risk.totalRisk === undefined) {
-    // Ambiguous coverage is flagged rather than resolved into a number that
-    // would look precise and be wrong.
-    return risk?.isAmbiguous ? `${NO_VALUE} [AMBIGUOUS STOPS]` : NO_VALUE;
-  }
+  if (!risk || risk.totalRisk === undefined) return NO_VALUE;
 
   const amount = risk.totalRisk.toLocaleString('en-US', {
     minimumFractionDigits: 2,
