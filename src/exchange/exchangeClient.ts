@@ -4510,6 +4510,7 @@ export class ExchangeClient {
             effectiveLeverage: position.effectiveLeverage,
             liquidation: position.liquidation,
             plannedRisk: risk?.totalRisk,
+            plannedOutcome: risk?.plannedOutcome,
             coverage: risk?.coveragePercentage,
             ...(() => {
               const cost = this.fundingCost(

@@ -79,8 +79,9 @@ check('H  short stop beyond breakeven contributes nothing', near(r.totalRisk, 0)
 
 // I - mixed
 r = calculatePositionRisk(position('long', 1000, 96, [stop(94, 500), stop(98, 500)]));
-check('I  a profitable tranche does not offset a losing one',
-  near(r.totalRisk, 1000), `risk=${r.totalRisk} (not 0 and not negative)`);
+check('I  a stop above entry books the profit a stop below it spends',
+  near(r.totalRisk, 0) && near(r.plannedOutcome, 0),
+  `risk=${r.totalRisk} outcome=${r.plannedOutcome} (98 fires first for +1000, then 94 for -1000; not 1000)`);
 
 // J - over-covered
 r = calculatePositionRisk(position('long', 1000, 96, [stop(94, 700), stop(92, 700)]));
@@ -178,6 +179,23 @@ r = calculatePositionRisk(position('long', 600, 96, [stop(94, 1000)]));
 check('W  a stop sized past the position closes the position, not more',
   near(r.totalRisk, 1200) && r.protectedQuantity === 600 && r.isFullyProtected,
   `risk=${r.totalRisk} protected=${r.protectedQuantity}`);
+
+// X - the operator's position after scaling in at 103.43: 1500 at an average
+// of 100.17, 500 stopped at 102.91, the rest at the original entry of 98.54.
+// The plan loses about 260 -- the 500 bought at 103.43 against their stop --
+// and read as 1,630 while each tranche was floored on its own.
+r = calculatePositionRisk(position('long', 1500, 100.170408, [
+  stop(102.91, 500), stop(98.54, 0, { coversAll: true }),
+]));
+check('X  the plan is valued as a whole: profit booked above entry offsets loss below it',
+  near(r.totalRisk, 260.61) && near(r.plannedOutcome, -260.61) && r.isFullyProtected,
+  `risk=${r.totalRisk?.toFixed(2)} outcome=${r.plannedOutcome?.toFixed(2)} (500 x +2.74 then 1000 x -1.63; not 1630.41)`);
+
+// Y - a plan that books a profit overall risks nothing, and says what it books
+r = calculatePositionRisk(position('long', 1000, 96, [stop(98, 500), stop(95, 0, { coversAll: true })]));
+check('Y  a plan in profit overall risks nothing and the outcome says how much',
+  near(r.totalRisk, 0) && near(r.plannedOutcome, 500),
+  `risk=${r.totalRisk} outcome=${r.plannedOutcome} (+1000 at 98, -500 at 95)`);
 
 // Inverse contract
 r = calculatePositionRisk(position('long', 1000, 100, [stop(90, 0, { coversAll: true })],

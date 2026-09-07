@@ -87,7 +87,9 @@ Side, size, entry, mark, unrealized PnL, realized PnL, position risk, funding pe
 
 Partial coverage appends `+ 400 SOL unprotected`, or `[PARTIAL]` when the panel is narrow.
 
-Stops are read in the order price would trigger them, nearest first. A sized stop takes what it asked for out of whatever is still open when price reaches it; a whole-position stop takes all of it; anything further out never fires. So a 500 stop above entry with a whole-position stop at entry beneath it reads as `0.00 USDT`, fully covered: half out with a profit, the rest at breakeven. Stops in a one-cancels-the-other group resolve the same way, since the first to fire cancels its partner.
+Stops are read in the order price would trigger them, nearest first. A sized stop takes what it asked for out of whatever is still open when price reaches it; a whole-position stop takes all of it; anything further out never fires. Stops in a one-cancels-the-other group resolve the same way, since the first to fire cancels its partner.
+
+The plan is then valued as a whole: what the position closes for if every stop fires, each tranche against the average entry. Risk is that figure when it is a loss and `0.00` when it is not. A stop above the average entry books a profit before any stop below it can fire, and that profit offsets the loss taken further down. So after scaling in at 103.43 to 1,500 at an average of 100.17, with 500 stopped at 102.91 and the rest stopped at the original 98.54 entry, the risk reads about `260 USDT`: the 500 bought at 103.43 against their stop, and nothing else. The figure is the same whichever lots you imagine behind which stop.
 
 **Funding** on this panel is the cost of holding this position at this size, shown per 24 hours, for example `-26.78/24h`. The rate on MARKET is a property of the instrument; this is a property of your position.
 

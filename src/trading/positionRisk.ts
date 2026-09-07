@@ -15,6 +15,18 @@
 // stop at entry underneath it is not an ambiguous pair, it is a plan -- half
 // out with a profit, the rest at breakeven -- and this reads it as one.
 //
+// The plan is then valued as a whole. If every stop fires, the position closes
+// for one number: each tranche's proceeds against the average entry, signed,
+// summed. Risk is that number when it is a loss and zero when it is not. It is
+// not the sum of each tranche's loss floored on its own: a stop above the
+// average entry books a profit before any stop below it can fire, because
+// price has to pass through it on the way down, and a figure that discards
+// that profit reports a loss the plan cannot produce. An operator who scaled
+// in at 103 with 500 stopped at 102.91 and the first thousand stopped at their
+// own entry has planned to lose about 260, not 1,630, and the arithmetic is
+// the same whichever lots are imagined behind which stop -- proceeds against
+// cost do not depend on the pairing.
+//
 // An earlier version refused to add stops it could not tell apart and showed
 // '[AMBIGUOUS STOPS]' instead, on the reasoning that a wrong number looks more
 // precise than no number. The reasoning was sound and the premise was not:
@@ -71,12 +83,25 @@ export interface RiskTranche {
   triggerPrice: number;
   effectiveQuantity: number;
   riskPerUnit: number;
+  /** What this tranche books when it fires: positive is profit. */
+  outcome: number;
+  /** The loss this tranche takes on its own, floored at zero. For reporting. */
   trancheRisk: number;
 }
 
 export interface PositionRiskResult {
-  /** Undefined when nothing protects the position at all. */
+  /**
+   * The net loss if every stop fires, floored at zero. Undefined when nothing
+   * protects the position at all.
+   */
   totalRisk: number | undefined;
+  /**
+   * What the position closes for if every stop fires: the sum of the tranche
+   * outcomes, signed. Undefined with no stops. This is the number the risk is
+   * derived from, kept so a reader can say 'the plan books +260' rather than
+   * only 'the plan risks nothing'.
+   */
+  plannedOutcome: number | undefined;
   currency: string;
   positionQuantity: number;
   protectedQuantity: number;
@@ -88,14 +113,12 @@ export interface PositionRiskResult {
 }
 
 /**
- * Loss for a quantity exiting at `exitPrice`, floored at zero.
+ * What a quantity books by exiting at `exitPrice`, signed: positive is profit.
  *
- * The floor matters: a stop moved past breakeven protects rather than risks, and
- * must contribute nothing rather than a negative that offsets a real risk
- * elsewhere. Inverse contracts settle in the base asset, so their loss is not a
- * simple price difference.
+ * Inverse contracts settle in the base asset, so their result is not a simple
+ * price difference.
  */
-function lossFor(
+function outcomeFor(
   side: 'long' | 'short',
   entryPrice: number,
   exitPrice: number,
@@ -107,16 +130,13 @@ function lossFor(
   if (entryPrice <= 0 || exitPrice <= 0 || quantity <= 0) return 0;
 
   if (inverse) {
-    const value =
-      side === 'long'
-        ? quantity * contractSize * (1 / exitPrice - 1 / entryPrice)
-        : quantity * contractSize * (1 / entryPrice - 1 / exitPrice);
-    return Math.max(value, 0);
+    return side === 'long'
+      ? quantity * contractSize * (1 / entryPrice - 1 / exitPrice)
+      : quantity * contractSize * (1 / exitPrice - 1 / entryPrice);
   }
 
-  const perUnit = side === 'long' ? entryPrice - exitPrice : exitPrice - entryPrice;
-
-  return Math.max(perUnit, 0) * quantity * contractSize;
+  const perUnit = side === 'long' ? exitPrice - entryPrice : entryPrice - exitPrice;
+  return perUnit * quantity * contractSize;
 }
 
 /** Risk per single unit, for reporting rather than for the total. */
@@ -131,6 +151,7 @@ const EPSILON = 1e-9;
 /** No coverage at all: not zero risk, but risk that cannot be stated. */
 const unprotected = (input: PositionRiskInput): PositionRiskResult => ({
   totalRisk: undefined,
+  plannedOutcome: undefined,
   currency: input.currency,
   positionQuantity: input.quantity,
   protectedQuantity: 0,
@@ -187,28 +208,35 @@ export function calculatePositionRisk(input: PositionRiskInput): PositionRiskRes
       if (stop.orderGroup !== undefined) firedGroups.add(stop.orderGroup);
     }
 
+    const outcome = outcomeFor(
+      input.side,
+      input.entryPrice,
+      stop.triggerPrice,
+      quantity,
+      contractSize,
+      inverse
+    );
+
     tranches.push({
       orderId: stop.orderId,
       triggerPrice: stop.triggerPrice,
       effectiveQuantity: quantity > EPSILON ? quantity : 0,
       riskPerUnit: riskPerUnit(input.side, input.entryPrice, stop.triggerPrice),
-      trancheRisk: lossFor(
-        input.side,
-        input.entryPrice,
-        stop.triggerPrice,
-        quantity,
-        contractSize,
-        inverse
-      ),
+      outcome,
+      trancheRisk: Math.max(0, -outcome),
     });
   }
 
   const protectedQuantity = tranches.reduce((total, t) => total + t.effectiveQuantity, 0);
-  const totalRisk = tranches.reduce((total, t) => total + t.trancheRisk, 0);
+  // Valued as one plan, not tranche by tranche: a profit booked by a nearer
+  // stop is real money by the time a farther one fires.
+  const plannedOutcome = tranches.reduce((total, t) => total + t.outcome, 0);
+  const totalRisk = Math.max(0, -plannedOutcome);
   const unprotectedQuantity = Math.max(0, input.quantity - protectedQuantity);
 
   return {
     totalRisk,
+    plannedOutcome,
     currency: input.currency,
     positionQuantity: input.quantity,
     protectedQuantity,
