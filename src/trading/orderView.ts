@@ -94,18 +94,50 @@ const truthy = (value: unknown): boolean =>
  * on the endpoint and the settlement scale -- but never inventive: a field it
  * cannot find is absent, not guessed.
  */
+/** The trigger price of a conditional order, or undefined for a plain one. */
+const triggerOf = (raw: any): number | undefined => {
+  const info = raw?.info ?? {};
+  const trigger = number(raw?.triggerPrice ?? info.stopPxRp ?? info.stopPxEp);
+  return trigger !== undefined && trigger > 0 ? trigger : undefined;
+};
+
+/**
+ * How much an order will still do, and whether that is 'everything'.
+ *
+ * For an order resting in the book, `remaining` is the answer. For a
+ * conditional order that has not triggered it is not: Phemex reports leavesQty
+ * as zero because nothing is in the book until the trigger fires, ccxt passes
+ * that through as `remaining: 0`, and reading it as the size turned a 500 stop
+ * into a whole-position stop -- on the panel, in the coach's order sentence,
+ * and in the risk arithmetic, all at once. So a trigger order is read as what
+ * it asked for less what it has already done, and only a trigger order that
+ * asked for nothing is the whole position: that is how the exchange itself
+ * spells 'close whatever is open when this fires'. A limit order sized zero is
+ * a different matter and is left to read as zero.
+ *
+ * One reader for every consumer, so the panel, the coach and the risk figure
+ * cannot disagree about how big an order is.
+ */
+export function orderSize(raw: any): { size: number; wholePosition: boolean } {
+  const info = raw?.info ?? {};
+  const filled = number(raw?.filled) ?? 0;
+
+  if (triggerOf(raw) !== undefined) {
+    const requested = number(raw?.amount ?? info.orderQtyRq ?? info.orderQty) ?? 0;
+    return { size: Math.max(0, requested - filled), wholePosition: requested <= 0 };
+  }
+
+  return { size: number(raw?.remaining ?? raw?.amount) ?? 0, wholePosition: false };
+}
+
 export function describeOrder(raw: any, context: OrderContext = {}): OrderView {
   const info = raw?.info ?? {};
   const id = String(raw?.id ?? '');
 
-  const trigger = number(raw?.triggerPrice ?? info.stopPxRp ?? info.stopPxEp);
-  const isTrigger = trigger !== undefined && trigger > 0;
+  const trigger = triggerOf(raw);
+  const isTrigger = trigger !== undefined;
 
-  const size = number(raw?.remaining ?? raw?.amount) ?? 0;
-  // A trigger order sized zero closes whatever is open when it fires. A limit
-  // order sized zero is a different matter and is left to read as zero.
-  const wholePosition = isTrigger && size <= 0;
-
+  const { size, wholePosition } = orderSize(raw);
   const filled = number(raw?.filled) ?? 0;
 
   const type: OrderView['type'] = isTrigger

@@ -7,19 +7,54 @@
 // gap, slip, or fail to fill. It is deliberately not notional exposure, margin,
 // liquidation distance, or current unrealized loss.
 //
-// The module is pure — no exchange, no market lookups — so every rule below can
-// be tested directly.
+// The stops are read in the order price would trigger them. That is the whole
+// method, and it is what makes any combination of stops resolvable: a sized
+// stop takes what it asked for out of whatever is still open when price reaches
+// it, a whole-position stop takes all of it, and once nothing is open the
+// stops further out never fire. A 500 stop above entry with a whole-position
+// stop at entry underneath it is not an ambiguous pair, it is a plan -- half
+// out with a profit, the rest at breakeven -- and this reads it as one.
+//
+// The plan is then valued as a whole. If every stop fires, the position closes
+// for one number: each tranche's proceeds against the average entry, signed,
+// summed. Risk is that number when it is a loss and zero when it is not. It is
+// not the sum of each tranche's loss floored on its own: a stop above the
+// average entry books a profit before any stop below it can fire, because
+// price has to pass through it on the way down, and a figure that discards
+// that profit reports a loss the plan cannot produce. An operator who scaled
+// in at 103 with 500 stopped at 102.91 and the first thousand stopped at their
+// own entry has planned to lose about 260, not 1,630, and the arithmetic is
+// the same whichever lots are imagined behind which stop -- proceeds against
+// cost do not depend on the pairing.
+//
+// An earlier version refused to add stops it could not tell apart and showed
+// '[AMBIGUOUS STOPS]' instead, on the reasoning that a wrong number looks more
+// precise than no number. The reasoning was sound and the premise was not:
+// the caller only ever passes stops the exchange has typed as Stops, which puts
+// every trigger on the losing side of the current price, and on that side the
+// firing order is the price order. Nothing is left to guess.
+//
+// The module is pure -- no exchange, no market lookups -- so every rule below
+// can be tested directly.
 
 /** A protective stop, normalised from whatever the exchange reported. */
 export interface ProtectiveStopTranche {
   orderId: string;
+  /**
+   * Where it fires. The caller guarantees this is on the losing side of the
+   * current price: a trigger on the winning side is a take profit, which the
+   * exchange types differently and the caller leaves out.
+   */
   triggerPrice: number;
   /** What the order asked for. Ignored when `coversAll` is set. */
   requestedQuantity: number;
   /** The order closes the whole position, whatever it happens to be. */
   coversAll: boolean;
   reduceOnly: boolean;
-  /** Orders sharing a group are alternatives, not additive coverage. */
+  /**
+   * Orders sharing a group are one-cancels-the-other: the first to fire
+   * cancels the rest, so at most one of them ever closes anything.
+   */
   orderGroup?: string;
 }
 
@@ -35,38 +70,55 @@ export interface PositionRiskInput {
   stops: ProtectiveStopTranche[];
 }
 
+/**
+ * One stop's share of the position, in firing order.
+ *
+ * `effectiveQuantity` is what the stop would actually close when price reaches
+ * it -- which is zero for a stop behind one that has already closed everything,
+ * or behind a group-mate that fired first. Those are kept in the list rather
+ * than dropped, so a reader can say which order is doing nothing and why.
+ */
 export interface RiskTranche {
   orderId: string;
   triggerPrice: number;
   effectiveQuantity: number;
   riskPerUnit: number;
+  /** What this tranche books when it fires: positive is profit. */
+  outcome: number;
+  /** The loss this tranche takes on its own, floored at zero. For reporting. */
   trancheRisk: number;
 }
 
 export interface PositionRiskResult {
-  /** Undefined when no protective coverage can be established. */
+  /**
+   * The net loss if every stop fires, floored at zero. Undefined when nothing
+   * protects the position at all.
+   */
   totalRisk: number | undefined;
+  /**
+   * What the position closes for if every stop fires: the sum of the tranche
+   * outcomes, signed. Undefined with no stops. This is the number the risk is
+   * derived from, kept so a reader can say 'the plan books +260' rather than
+   * only 'the plan risks nothing'.
+   */
+  plannedOutcome: number | undefined;
   currency: string;
   positionQuantity: number;
   protectedQuantity: number;
   unprotectedQuantity: number;
   coveragePercentage: number;
   isFullyProtected: boolean;
-  /** Coverage exists but its shape can't be resolved; no number is offered. */
-  isAmbiguous: boolean;
-  ambiguityReason?: string;
+  /** Every stop passed in, in the order price would reach them. */
   tranches: RiskTranche[];
 }
 
 /**
- * Loss for a quantity exiting at `exitPrice`, floored at zero.
+ * What a quantity books by exiting at `exitPrice`, signed: positive is profit.
  *
- * The floor matters: a stop moved past breakeven protects rather than risks, and
- * must contribute nothing rather than a negative that offsets a real risk
- * elsewhere. Inverse contracts settle in the base asset, so their loss is not a
- * simple price difference.
+ * Inverse contracts settle in the base asset, so their result is not a simple
+ * price difference.
  */
-function lossFor(
+function outcomeFor(
   side: 'long' | 'short',
   entryPrice: number,
   exitPrice: number,
@@ -78,152 +130,119 @@ function lossFor(
   if (entryPrice <= 0 || exitPrice <= 0 || quantity <= 0) return 0;
 
   if (inverse) {
-    const value =
-      side === 'long'
-        ? quantity * contractSize * (1 / exitPrice - 1 / entryPrice)
-        : quantity * contractSize * (1 / entryPrice - 1 / exitPrice);
-    return Math.max(value, 0);
+    return side === 'long'
+      ? quantity * contractSize * (1 / entryPrice - 1 / exitPrice)
+      : quantity * contractSize * (1 / exitPrice - 1 / entryPrice);
   }
 
-  const perUnit =
-    side === 'long' ? entryPrice - exitPrice : exitPrice - entryPrice;
-
-  return Math.max(perUnit, 0) * quantity * contractSize;
+  const perUnit = side === 'long' ? exitPrice - entryPrice : entryPrice - exitPrice;
+  return perUnit * quantity * contractSize;
 }
 
 /** Risk per single unit, for reporting rather than for the total. */
-function riskPerUnit(
-  side: 'long' | 'short',
-  entryPrice: number,
-  exitPrice: number
-): number {
-  const perUnit =
-    side === 'long' ? entryPrice - exitPrice : exitPrice - entryPrice;
+function riskPerUnit(side: 'long' | 'short', entryPrice: number, exitPrice: number): number {
+  const perUnit = side === 'long' ? entryPrice - exitPrice : exitPrice - entryPrice;
   return Math.max(perUnit, 0);
 }
 
-const unresolved = (
-  input: PositionRiskInput,
-  reason?: string
-): PositionRiskResult => ({
+/** Quantities this close to zero are zero; the exchange's own precision is coarser. */
+const EPSILON = 1e-9;
+
+/** No coverage at all: not zero risk, but risk that cannot be stated. */
+const unprotected = (input: PositionRiskInput): PositionRiskResult => ({
   totalRisk: undefined,
+  plannedOutcome: undefined,
   currency: input.currency,
   positionQuantity: input.quantity,
   protectedQuantity: 0,
   unprotectedQuantity: input.quantity,
   coveragePercentage: 0,
   isFullyProtected: false,
-  isAmbiguous: reason !== undefined,
-  ambiguityReason: reason,
   tranches: [],
 });
 
-export function calculatePositionRisk(
-  input: PositionRiskInput
-): PositionRiskResult {
+/**
+ * The stops in the order price reaches them on the way against the position.
+ *
+ * For a long, price falls into the highest trigger first; for a short, it
+ * rises into the lowest. Ties keep their given order, which is the order the
+ * exchange listed them in.
+ */
+function inFiringOrder(
+  side: 'long' | 'short',
+  stops: ProtectiveStopTranche[]
+): ProtectiveStopTranche[] {
+  return [...stops].sort((a, b) =>
+    side === 'long' ? b.triggerPrice - a.triggerPrice : a.triggerPrice - b.triggerPrice
+  );
+}
+
+export function calculatePositionRisk(input: PositionRiskInput): PositionRiskResult {
   const contractSize = input.contractSize ?? 1;
   const inverse = input.inverse ?? false;
 
   if (!(input.quantity > 0) || !(input.entryPrice > 0)) {
-    return unresolved(input);
+    return unprotected(input);
   }
 
   const stops = input.stops.filter((stop) => stop.triggerPrice > 0);
+  if (stops.length === 0) return unprotected(input);
 
-  // No coverage at all is not zero risk — it is risk that cannot be stated.
-  if (stops.length === 0) return unresolved(input);
+  // Walk the stops as price would, handing each one what is still open when
+  // it fires. A group-mate of a stop that fired is cancelled by it, and a stop
+  // behind the point where nothing is open has nothing to close.
+  let remaining = input.quantity;
+  const firedGroups = new Set<string>();
+  const tranches: RiskTranche[] = [];
 
-  // Stops sharing a group are alternative outcomes. Which one is effective
-  // depends on order semantics we don't have, so no total is offered rather
-  // than one that assumes both can fire.
-  const groups = new Map<string, number>();
-  for (const stop of stops) {
-    if (!stop.orderGroup) continue;
-    groups.set(stop.orderGroup, (groups.get(stop.orderGroup) ?? 0) + 1);
-  }
-  for (const [group, count] of groups) {
-    if (count > 1) {
-      return unresolved(input, `stops in group ${group} are mutually exclusive`);
-    }
-  }
+  for (const stop of inFiringOrder(input.side, stops)) {
+    const cancelled = stop.orderGroup !== undefined && firedGroups.has(stop.orderGroup);
+    const quantity = cancelled
+      ? 0
+      : stop.coversAll
+        ? remaining
+        : Math.min(Math.max(0, stop.requestedQuantity), remaining);
 
-  const wholePositionStops = stops.filter((stop) => stop.coversAll);
-  const sizedStops = stops.filter((stop) => !stop.coversAll);
-
-  // Two orders each claiming the whole position can't both be independent
-  // coverage, and nothing tells us which is effective.
-  if (wholePositionStops.length > 1) {
-    return unresolved(input, 'more than one whole-position stop');
-  }
-
-  // A whole-position stop alongside sized ones may be nested, staged or
-  // alternative protection. Adding them would overstate coverage.
-  if (wholePositionStops.length === 1 && sizedStops.length > 0) {
-    return unresolved(input, 'whole-position stop combined with sized stops');
-  }
-
-  let allocations: Array<{ stop: ProtectiveStopTranche; quantity: number }>;
-
-  if (wholePositionStops.length === 1) {
-    // 'All' means the position as it stands now, not as it was when the order
-    // was created.
-    allocations = [{ stop: wholePositionStops[0], quantity: input.quantity }];
-  } else {
-    const requested = sizedStops.reduce(
-      (total, stop) => total + Math.max(0, stop.requestedQuantity),
-      0
-    );
-
-    // More stop quantity than position, with nothing to say how the orders
-    // overlap. Capping arbitrarily would invent an allocation.
-    if (requested > input.quantity + 1e-9) {
-      return unresolved(
-        input,
-        `stops cover ${requested} against a position of ${input.quantity}`
-      );
+    if (quantity > EPSILON) {
+      remaining -= quantity;
+      if (stop.orderGroup !== undefined) firedGroups.add(stop.orderGroup);
     }
 
-    allocations = sizedStops.map((stop) => ({
-      stop,
-      quantity: Math.max(0, stop.requestedQuantity),
-    }));
-  }
-
-  const tranches: RiskTranche[] = allocations.map(({ stop, quantity }) => ({
-    orderId: stop.orderId,
-    triggerPrice: stop.triggerPrice,
-    effectiveQuantity: quantity,
-    riskPerUnit: riskPerUnit(input.side, input.entryPrice, stop.triggerPrice),
-    trancheRisk: lossFor(
+    const outcome = outcomeFor(
       input.side,
       input.entryPrice,
       stop.triggerPrice,
       quantity,
       contractSize,
       inverse
-    ),
-  }));
+    );
 
-  const protectedQuantity = tranches.reduce(
-    (total, tranche) => total + tranche.effectiveQuantity,
-    0
-  );
-  const totalRisk = tranches.reduce(
-    (total, tranche) => total + tranche.trancheRisk,
-    0
-  );
+    tranches.push({
+      orderId: stop.orderId,
+      triggerPrice: stop.triggerPrice,
+      effectiveQuantity: quantity > EPSILON ? quantity : 0,
+      riskPerUnit: riskPerUnit(input.side, input.entryPrice, stop.triggerPrice),
+      outcome,
+      trancheRisk: Math.max(0, -outcome),
+    });
+  }
+
+  const protectedQuantity = tranches.reduce((total, t) => total + t.effectiveQuantity, 0);
+  // Valued as one plan, not tranche by tranche: a profit booked by a nearer
+  // stop is real money by the time a farther one fires.
+  const plannedOutcome = tranches.reduce((total, t) => total + t.outcome, 0);
+  const totalRisk = Math.max(0, -plannedOutcome);
   const unprotectedQuantity = Math.max(0, input.quantity - protectedQuantity);
 
   return {
     totalRisk,
+    plannedOutcome,
     currency: input.currency,
     positionQuantity: input.quantity,
     protectedQuantity,
     unprotectedQuantity,
-    coveragePercentage:
-      input.quantity > 0 ? (protectedQuantity / input.quantity) * 100 : 0,
-    isFullyProtected: unprotectedQuantity <= 1e-9,
-    isAmbiguous: false,
+    coveragePercentage: (protectedQuantity / input.quantity) * 100,
+    isFullyProtected: unprotectedQuantity <= EPSILON,
     tranches,
   };
 }

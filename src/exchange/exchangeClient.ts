@@ -39,7 +39,7 @@ import { GuardVerdict } from '../guard/guardrails.js';
 import { MarketContext, MarketSeries } from '../guard/marketContext.js';
 import { PassGuard } from '../utils/passGuard.js';
 import { monotonicNow } from '../utils/monotonic.js';
-import { describeOrders } from '../trading/orderView.js';
+import { describeOrders, orderSize } from '../trading/orderView.js';
 import { resolvePolicy, GuardPolicy } from '../guard/guardPolicy.js';
 import {
   describeExitPlan,
@@ -664,16 +664,16 @@ export class ExchangeClient {
       .map((order) => {
         const info = (order as any).info ?? {};
         const trigger = Number((order as any).triggerPrice ?? info.stopPxRp ?? info.stopPxEp ?? 0);
-        const requested = Number(order.remaining ?? order.amount ?? 0);
+        // The same reading the panel and the coach use, so a stop cannot be
+        // 500 on screen and the whole position in the arithmetic.
+        const { size, wholePosition } = orderSize(order);
         const execInst = String(info.execInst ?? '');
 
         return {
           orderId: String(order.id ?? ''),
           triggerPrice: trigger,
-          requestedQuantity: requested,
-          // A quantity of zero on a trigger order means the whole position,
-          // which follows the position rather than the size at creation.
-          coversAll: !(requested > 0),
+          requestedQuantity: size,
+          coversAll: wholePosition,
           reduceOnly:
             (order as any).reduceOnly === true || /closeontrigger|reduceonly/i.test(execInst),
           orderGroup: info.orderGroup ?? info.clOrdIDGroup ?? undefined,
@@ -4510,6 +4510,7 @@ export class ExchangeClient {
             effectiveLeverage: position.effectiveLeverage,
             liquidation: position.liquidation,
             plannedRisk: risk?.totalRisk,
+            plannedOutcome: risk?.plannedOutcome,
             coverage: risk?.coveragePercentage,
             ...(() => {
               const cost = this.fundingCost(

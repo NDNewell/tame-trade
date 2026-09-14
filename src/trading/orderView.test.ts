@@ -114,5 +114,21 @@ check('L  a partially filled order says how much is done',
   view.status === 'PARTIAL' && orderSentence(view).includes('6'),
   orderSentence(view));
 
+// An untriggered stop for 500, exactly as Phemex returned one on 2026-09-07:
+// orderQtyRq 500, leavesQtyRq 0 because nothing is in the book until it fires.
+// ccxt passes leavesQty through as `remaining`, and this read as ALL.
+view = describeOrder({
+  id: '9',
+  side: 'sell',
+  amount: 500,
+  remaining: 0,
+  filled: 0,
+  triggerPrice: 102.91,
+  info: { orderType: 'Stop', orderQtyRq: '500', leavesQtyRq: '0', execInst: 'CloseOnTrigger' },
+});
+check('M  an untriggered stop sized 500 is 500, not the whole position',
+  view.wholePosition === false && view.quantity === 500,
+  orderSentence(view));
+
 console.log(failures === 0 ? '\nAll passed.' : `\n${failures} failed.`);
 process.exit(failures === 0 ? 0 : 1);

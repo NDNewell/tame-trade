@@ -54,6 +54,8 @@ export interface MarketContext {
     liquidation?: number;
     /** What the stops in place actually leave at risk, from the risk model. */
     plannedRisk?: number;
+    /** What the position closes for if every stop fires, signed. */
+    plannedOutcome?: number;
     /** How much of the position protective orders cover, as a percentage. */
     coverage?: number;
     /** The next funding payment on this position, negative when it is paid out. */
@@ -257,6 +259,10 @@ export function describeMarket(
       num(position.liquidation) && `liquidation ${num(position.liquidation)}`,
       position.plannedRisk !== undefined &&
         `planned risk ${position.plannedRisk.toFixed(2)} ${position.currency ?? ''}`.trim(),
+      // The risk is the loss side of this; the outcome says what the stops
+      // actually book, which is the number a scale-out plan is judged by.
+      signed(position.plannedOutcome) &&
+        `if every stop fires the position closes for ${signed(position.plannedOutcome)}`,
       position.coverage !== undefined &&
         `stops cover ${Math.round(position.coverage)}% of the size`,
       // Spelled out as paid or earned rather than left as a sign: the rate is

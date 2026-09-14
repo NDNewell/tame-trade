@@ -11,6 +11,7 @@ import { PositionRiskResult } from '../trading/positionRisk.js';
 import { RANGE_WINDOWS } from '../trading/volatility.js';
 import { describeOrders } from '../trading/orderView.js';
 import { monotonicNow } from '../utils/monotonic.js';
+import { ClockWatch } from '../utils/clockWatch.js';
 
 const FOOTER = [
   'buy',
@@ -160,11 +161,7 @@ const formatRisk = (
   base?: string,
   short = false
 ): string => {
-  if (!risk || risk.totalRisk === undefined) {
-    // Ambiguous coverage is flagged rather than resolved into a number that
-    // would look precise and be wrong.
-    return risk?.isAmbiguous ? `${NO_VALUE} [AMBIGUOUS STOPS]` : NO_VALUE;
-  }
+  if (!risk || risk.totalRisk === undefined) return NO_VALUE;
 
   const amount = risk.totalRisk.toLocaleString('en-US', {
     minimumFractionDigits: 2,
@@ -189,6 +186,16 @@ export class Workspace {
   };
   private refreshTimer: NodeJS.Timeout | null = null;
   private tickTimer: NodeJS.Timeout | null = null;
+  private clockTimer: NodeJS.Timeout | null = null;
+  /**
+   * Watches for the host clock being stepped, which is the one fault that has
+   * made this workspace look slow twice while nothing in it was. It reports
+   * into the activity log, where the abandoned-refresh warnings it explains
+   * already appear.
+   */
+  private clock = new ClockWatch({
+    report: (severity, message) => ActivityLog.getInstance().add(severity, message),
+  });
   private lastOrders: TerminalView['orders'] = [];
 
   constructor(
@@ -240,6 +247,7 @@ export class Workspace {
 
     this.refreshTimer = setInterval(() => void this.refresh(), 2000);
     this.tickTimer = setInterval(() => this.tickCountdown(), 1000);
+    this.clockTimer = setInterval(() => this.clock.tick(), 1000);
     void this.refresh();
   }
 
@@ -334,8 +342,10 @@ export class Workspace {
   stop(): void {
     if (this.refreshTimer) clearInterval(this.refreshTimer);
     if (this.tickTimer) clearInterval(this.tickTimer);
+    if (this.clockTimer) clearInterval(this.clockTimer);
     this.refreshTimer = null;
     this.tickTimer = null;
+    this.clockTimer = null;
     this.client.stopTrailMonitor();
     this.client.stopGuardSweep();
     this.screen?.stop();
@@ -415,11 +425,16 @@ export class Workspace {
     if (this.runningSince !== null) {
       if (now - this.runningSince < Workspace.REFRESH_DEADLINE_MS) return;
 
+      // Named as the cause when the clock watch has seen it, because the
+      // abandonment is the symptom the operator notices and the step is the
+      // line they scrolled past.
       ActivityLog.getInstance().add(
         'WARNING',
         `A refresh has been running for ${Math.round(
           (now - this.runningSince) / 1000
-        )}s and has been abandoned. The panel may be behind.`
+        )}s and has been abandoned. The panel may be behind.${
+          this.clock.isStepping() ? ' The system clock is being stepped; that is the likely cause.' : ''
+        }`
       );
     }
 

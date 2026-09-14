@@ -1,4 +1,7 @@
-// Cases A-S from the Position Risk specification.
+// Cases A-S from the Position Risk specification; T onwards from the stops an
+// operator actually had on: a sized stop above entry with a whole-position stop
+// at entry underneath it, which read as '[AMBIGUOUS STOPS]' when it was the
+// clearest possible plan.
 import {
   calculatePositionRisk,
   PositionRiskInput,
@@ -76,14 +79,15 @@ check('H  short stop beyond breakeven contributes nothing', near(r.totalRisk, 0)
 
 // I - mixed
 r = calculatePositionRisk(position('long', 1000, 96, [stop(94, 500), stop(98, 500)]));
-check('I  a profitable tranche does not offset a losing one',
-  near(r.totalRisk, 1000), `risk=${r.totalRisk} (not 0 and not negative)`);
+check('I  a stop above entry books the profit a stop below it spends',
+  near(r.totalRisk, 0) && near(r.plannedOutcome, 0),
+  `risk=${r.totalRisk} outcome=${r.plannedOutcome} (98 fires first for +1000, then 94 for -1000; not 1000)`);
 
 // J - over-covered
 r = calculatePositionRisk(position('long', 1000, 96, [stop(94, 700), stop(92, 700)]));
-check('J  over-covered position is not double-counted',
-  r.totalRisk === undefined && r.isAmbiguous && r.protectedQuantity <= 1000,
-  `risk=${r.totalRisk} ambiguous=${r.isAmbiguous} reason="${r.ambiguityReason}"`);
+check('J  over-covered position is allocated in firing order, not double-counted',
+  near(r.totalRisk, 2600) && r.protectedQuantity === 1000 && r.isFullyProtected,
+  `risk=${r.totalRisk} (700 at 94 fires first, then 300 of the 700 at 92) protected=${r.protectedQuantity}`);
 
 // K - ALL after scale-out
 r = calculatePositionRisk(position('long', 600, 96, [stop(94, 0, { coversAll: true })]));
@@ -120,8 +124,9 @@ r = calculatePositionRisk(position('long', 1000, 96, [
   stop(94, 500, { orderGroup: 'oco-1' }),
   stop(92, 500, { orderGroup: 'oco-1' }),
 ]));
-check('Q  mutually exclusive stops are not summed',
-  r.totalRisk === undefined && r.isAmbiguous, `risk=${r.totalRisk} reason="${r.ambiguityReason}"`);
+check('Q  mutually exclusive stops are not summed: the first to fire cancels the other',
+  near(r.totalRisk, 1000) && r.protectedQuantity === 500 && r.tranches[1].effectiveQuantity === 0,
+  `risk=${r.totalRisk} protected=${r.protectedQuantity} second tranche=${r.tranches[1].effectiveQuantity}`);
 
 // R/S - filtering by instrument and side happens before this function; verify a
 // single correct stop is unaffected by that filtering.
@@ -133,15 +138,64 @@ check('R/S  only the position\'s own stops reach the calculation',
 r = calculatePositionRisk(position('long', 1000, 96, [
   stop(94, 0, { coversAll: true }), stop(92, 0, { coversAll: true }),
 ]));
-check('   two whole-position stops are ambiguous',
-  r.totalRisk === undefined && r.isAmbiguous, `reason="${r.ambiguityReason}"`);
+check('   two whole-position stops: the nearer closes everything, the farther never fires',
+  near(r.totalRisk, 2000) && r.tranches[0].effectiveQuantity === 1000 && r.tranches[1].effectiveQuantity === 0,
+  `risk=${r.totalRisk} tranches=${r.tranches.map((t) => `${t.effectiveQuantity}@${t.triggerPrice}`).join(' ')}`);
 
-// ALL plus a sized stop
+// ALL plus a sized stop, sized one nearer
 r = calculatePositionRisk(position('long', 1000, 96, [
   stop(92, 0, { coversAll: true }), stop(94, 500),
 ]));
-check('   ALL alongside a sized stop is ambiguous',
-  r.totalRisk === undefined && r.isAmbiguous, `reason="${r.ambiguityReason}"`);
+check('   a sized stop nearer than ALL takes its share first, ALL takes the rest',
+  near(r.totalRisk, 3000) && r.isFullyProtected,
+  `risk=${r.totalRisk} (500 x 2 at 94, then 500 x 4 at 92)`);
+
+// T - the operator's own case: half out above entry, the rest at breakeven
+r = calculatePositionRisk(position('long', 1000, 98.54, [
+  stop(102.91, 500), stop(98.54, 0, { coversAll: true }),
+]));
+check('T  500 above entry plus ALL at entry is zero planned risk, fully covered',
+  near(r.totalRisk, 0) && r.isFullyProtected && r.protectedQuantity === 1000,
+  `risk=${r.totalRisk} protected=${r.protectedQuantity} full=${r.isFullyProtected}`);
+
+// U - ALL nearer than a sized stop: the sized one never fires
+r = calculatePositionRisk(position('long', 1000, 96, [
+  stop(94, 0, { coversAll: true }), stop(92, 500),
+]));
+check('U  a sized stop behind ALL never fires',
+  near(r.totalRisk, 2000) && r.tranches[1].effectiveQuantity === 0,
+  `risk=${r.totalRisk} second tranche=${r.tranches[1].effectiveQuantity} (not 2000 + 2000)`);
+
+// V - firing order runs the other way for a short
+r = calculatePositionRisk(position('short', 1000, 96, [
+  stop(100, 0, { coversAll: true }), stop(98, 500),
+]));
+check('V  for a short the lowest trigger fires first',
+  near(r.totalRisk, 3000) && r.tranches[0].triggerPrice === 98,
+  `risk=${r.totalRisk} (500 x 2 at 98, then 500 x 4 at 100) first=${r.tranches[0].triggerPrice}`);
+
+// W - a sized stop larger than the position closes only the position
+r = calculatePositionRisk(position('long', 600, 96, [stop(94, 1000)]));
+check('W  a stop sized past the position closes the position, not more',
+  near(r.totalRisk, 1200) && r.protectedQuantity === 600 && r.isFullyProtected,
+  `risk=${r.totalRisk} protected=${r.protectedQuantity}`);
+
+// X - the operator's position after scaling in at 103.43: 1500 at an average
+// of 100.17, 500 stopped at 102.91, the rest at the original entry of 98.54.
+// The plan loses about 260 -- the 500 bought at 103.43 against their stop --
+// and read as 1,630 while each tranche was floored on its own.
+r = calculatePositionRisk(position('long', 1500, 100.170408, [
+  stop(102.91, 500), stop(98.54, 0, { coversAll: true }),
+]));
+check('X  the plan is valued as a whole: profit booked above entry offsets loss below it',
+  near(r.totalRisk, 260.61) && near(r.plannedOutcome, -260.61) && r.isFullyProtected,
+  `risk=${r.totalRisk?.toFixed(2)} outcome=${r.plannedOutcome?.toFixed(2)} (500 x +2.74 then 1000 x -1.63; not 1630.41)`);
+
+// Y - a plan that books a profit overall risks nothing, and says what it books
+r = calculatePositionRisk(position('long', 1000, 96, [stop(98, 500), stop(95, 0, { coversAll: true })]));
+check('Y  a plan in profit overall risks nothing and the outcome says how much',
+  near(r.totalRisk, 0) && near(r.plannedOutcome, 500),
+  `risk=${r.totalRisk} outcome=${r.plannedOutcome} (+1000 at 98, -500 at 95)`);
 
 // Inverse contract
 r = calculatePositionRisk(position('long', 1000, 100, [stop(90, 0, { coversAll: true })],
