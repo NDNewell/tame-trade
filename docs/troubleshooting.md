@@ -39,7 +39,9 @@ The exchange is answering slowly and requests were queued faster than they drain
 
 The two-second refresh has a fifteen-second deadline on the **monotonic** clock. If it is being abandoned repeatedly, either the exchange is very slow or, on WSL, the host clock is being stepped.
 
-Check the clock first. On 2026-09-01 a WSL host clock was being corrected by around nineteen seconds every five seconds, which made every wall-clock duration meaningless and poisoned ccxt's rate limiter. Compare `date` against a reliable source a few times over a minute; if it jumps, fix the clock (on WSL, `sudo hwclock -s` or a restart of the WSL VM) and restart Tame.
+Check the clock first. Tame watches for this: when the wall clock jumps by a second or more against the monotonic clock, the activity log gets a WARNING naming the size of the jump and the fix, repeated with a count every five minutes while it continues, and a SYSTEM line once the clock has held steady for a minute. Abandoned-refresh warnings written while it is happening say so.
+
+The fault has been the Windows host each time (2026-09-01 and 2026-09-13): its time service had stopped, the host clock ran ahead, WSL copied it into the guest every five seconds and NTP pulled it straight back. Each backwards step puts ccxt's rate limiter into debt, so every exchange request queues, and an order hold can take ten seconds to appear while the send itself is still instant. The fix is on the host: **Settings > Time & language > Date & time > Sync now**. Restarting the time service from an elevated prompt (`net start w32time`, `w32tm /resync /force`) was tried both times and did not sync on its own. Nothing needs restarting after; the queue drains within seconds of the last step.
 
 ### RANGE shows `--` for a long time
 

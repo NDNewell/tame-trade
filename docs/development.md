@@ -94,7 +94,7 @@ These are enforced by the structure and by tests. A change that breaks one needs
 6. **State goes on a status line; events go in a log.** A condition that is still true is not news.
 7. **Records outlive the process.** The journal is on disk per day. A trail's terms are in its client order id, so the exchange itself is the register.
 8. **What leaves the machine is assembled explicitly.** Adding a field to the journal cannot silently start sending it to the model.
-9. **Stamps use `Date.now()`; durations use `performance.now()`.** A host clock that is stepped makes every wall-clock duration meaningless. See `src/utils/monotonic.ts` for the incident that produced this rule.
+9. **Stamps use `Date.now()`; durations use `performance.now()`.** A host clock that is stepped makes every wall-clock duration meaningless. See `src/utils/monotonic.ts` for the incident that produced this rule, and `src/utils/clockWatch.ts` for the watchdog that names the incident in the activity log when it recurs.
 10. **Colour is spans over a grid, never bytes in a string.** And never the only carrier of meaning.
 
 ## Tests
