@@ -10,6 +10,7 @@ export enum OrderType {
   LIMIT_BUY,
   LIMIT_SELL,
   STOP,
+  TAKE_PROFIT,
   NULL,
 }
 
@@ -89,6 +90,15 @@ export class ExchangeCommand implements Command {
           );
         }
         break;
+      case OrderType.TAKE_PROFIT:
+        if (price) {
+          await this.exchangeClient.createTakeProfitOrder(
+            currentMarket,
+            price,
+            quantity
+          );
+        }
+        break;
       default:
         console.log('Invalid command. Please enter a valid command.');
         break;
@@ -116,6 +126,8 @@ export namespace OrderType {
       type = OrderType.MARKET_SELL;
     } else if (orderTypeString === 'stop') {
       type = OrderType.STOP;
+    } else if (orderTypeString === 'tp') {
+      type = OrderType.TAKE_PROFIT;
     } else if (orderTypeString === 'limit' && args.length === 4) {
       const sideString = args[1];
       if (sideString === 'buy') {
@@ -134,8 +146,8 @@ export namespace OrderType {
       let priceString;
       let quantityString;
 
-      if (type === OrderType.STOP) {
-        // stop <price> [size]
+      if (type === OrderType.STOP || type === OrderType.TAKE_PROFIT) {
+        // stop <price> [size], and tp <price> [size] the same way round.
         //
         // The first argument is always the price, whether or not a size follows.
         // It previously meant price on its own but size when a second argument
@@ -149,7 +161,9 @@ export namespace OrderType {
           } else {
             throw new AppError(
               ErrorType.INVALID_QUANTITY,
-              'Usage: stop <price> [size]'
+              type === OrderType.TAKE_PROFIT
+                ? 'Usage: tp <price> [size]'
+                : 'Usage: stop <price> [size]'
             );
           }
         }
@@ -166,6 +180,7 @@ export namespace OrderType {
 
       if (
         type === OrderType.STOP ||
+        type === OrderType.TAKE_PROFIT ||
         type === OrderType.LIMIT_BUY ||
         type === OrderType.LIMIT_SELL
       ) {
@@ -213,6 +228,10 @@ export namespace OrderType {
     } else if (type === OrderType.STOP) {
       if (args.length < 2 || args.length > 3) {
         throw new AppError(ErrorType.INVALID_STOP_ORDER);
+      }
+    } else if (type === OrderType.TAKE_PROFIT) {
+      if (args.length < 2 || args.length > 3) {
+        throw new AppError(ErrorType.INVALID_TAKE_PROFIT_ORDER);
       }
     }
   }

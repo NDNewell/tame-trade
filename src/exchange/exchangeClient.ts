@@ -39,7 +39,9 @@ import { GuardVerdict } from '../guard/guardrails.js';
 import { MarketContext, MarketSeries } from '../guard/marketContext.js';
 import { PassGuard } from '../utils/passGuard.js';
 import { monotonicNow } from '../utils/monotonic.js';
-import { describeOrders, orderSize } from '../trading/orderView.js';
+import { describeOrders, isTakeProfitOrder, orderSize, triggerOf } from '../trading/orderView.js';
+import { chooseTakeProfits, takeProfitProblem } from '../trading/takeProfit.js';
+import { STOP_LIMIT_USAGE } from '../trading/stopLimit.js';
 import { resolvePolicy, GuardPolicy } from '../guard/guardPolicy.js';
 import {
   describeExitPlan,
@@ -89,6 +91,17 @@ interface StopOrder extends Order {
   pegOffsetValueRp: number;
   pegOffsetProportionRr: number;
 }
+
+/**
+ * An order this process declined to send, as opposed to one the exchange
+ * turned down.
+ *
+ * The difference matters on screen. An exchange failure is summarised, because
+ * its payload would run across the activity row; a refusal made here has a
+ * sentence written for the operator, and summarising that as 'Exchange rejected
+ * request' both hides the reason and blames the wrong party.
+ */
+class OrderRefused extends Error {}
 
 export class ExchangeClient {
   private static instance: ExchangeClient | null = null;
@@ -656,8 +669,8 @@ export class ExchangeClient {
 
         const orderType = String(info.ordType ?? info.orderType ?? order.type ?? '').toLowerCase();
 
-        // Touch orders are take profits: they trigger on the winning side.
-        if (orderType.includes('iftouched')) return false;
+        // Take profits trigger on the winning side and protect nothing.
+        if (isTakeProfitOrder(order)) return false;
 
         return orderType.includes('stop') || orderType === 'trigger';
       })
@@ -2739,6 +2752,52 @@ export class ExchangeClient {
     }
   }
 
+  /**
+   * Cancels the take profits and leaves the stops where they are.
+   *
+   * 'cancel stops' takes both, which is the wrong tool for changing a target:
+   * it strips the protection to move the exit.
+   */
+  async cancelAllTakeProfitOrders(symbol: string): Promise<CancelResult> {
+    try {
+      const walletAddress = this.exchange?.id === 'hyperliquid' ?
+        (this.exchange as any).publicAddress || (this.exchange as any).walletAddress : undefined;
+      const params = walletAddress ? { 'user': walletAddress } : undefined;
+
+      const openOrders = await this.exchange!.fetchOpenOrders(symbol, undefined, undefined, params);
+      const takeProfits = openOrders.filter((order) => isTakeProfitOrder(order));
+
+      if (takeProfits.length === 0) return { cancelled: 0, failed: 0 };
+
+      const results = await Promise.allSettled(
+        takeProfits.map((order) => this.exchange!.cancelOrder(order.id, symbol, params))
+      );
+
+      this.forgetCancelledOrders(
+        symbol,
+        takeProfits
+          .filter((_, index) => results[index].status === 'fulfilled')
+          .map((order) => order.id)
+      );
+
+      const failed = results.filter((r) => r.status === 'rejected').length;
+      for (const result of results) {
+        if (result.status === 'rejected') {
+          NotificationManager.diagnostic(
+            `[cancelAllTakeProfitOrders] ${describeExchangeError(result.reason).raw}`
+          );
+        }
+      }
+
+      return { cancelled: results.length - failed, failed };
+    } catch (error) {
+      const failure = describeExchangeError(error);
+      NotificationManager.diagnostic(`[cancelAllTakeProfitOrders] ${failure.raw}`);
+      NotificationManager.notify(`Take profits NOT cancelled: ${failure.summary}`, NType.ERROR, 'ERROR');
+      return { cancelled: 0, failed: 0 };
+    }
+  }
+
   async cancelAllStopOrders(symbol: string): Promise<CancelResult> {
     try {
       // Get public wallet address from exchange config for Hyperliquid
@@ -2773,9 +2832,11 @@ export class ExchangeClient {
       // Only the ones that actually went. A refused cancel left the stop in
       // place, and recording it as pulled would have the guard reporting
       // protection that was never removed.
+      // Take profits go with the rest, but are not protection, so cancelling
+      // one is not reported to the guard as a stop being pulled.
       void this.noteStopsCancelled(
         symbol,
-        cancelled.map((order) =>
+        cancelled.filter((order) => !isTakeProfitOrder(order)).map((order) =>
           Number((order as any).triggerPrice ?? (order as any).info?.stopPxRp ?? order.stopPrice ?? 0)
         )
       );
@@ -3493,6 +3554,11 @@ export class ExchangeClient {
           const orderType = order.type?.toLowerCase() ?? '';
           let newPrice: number | undefined;
 
+          // A target stays where it was put. On Hyperliquid the branch below
+          // would also have re-placed it as a stop, since it moves trigger
+          // orders through updateStopOrder.
+          if (isTakeProfitOrder(order)) continue;
+
           if (isHyperliquid) {
             // Hyperliquid-specific logic
             if (orderType.includes('stop') || order.info?.isTrigger === true || order.info?.orderType?.toLowerCase().includes('stop')) {
@@ -3894,9 +3960,8 @@ export class ExchangeClient {
       const trigger = Number((order as any).triggerPrice ?? info.stopPxRp ?? info.stopPxEp ?? 0);
       if (!(trigger > 0)) return false;
 
-      const orderType = String(info.ordType ?? info.orderType ?? order.type ?? '').toLowerCase();
-      // A touch order is a take profit, not a stop.
-      return !orderType.includes('iftouched');
+      // A take profit is not the stop, and moving it would be a surprise.
+      return !isTakeProfitOrder(order);
     });
 
     if (!stopOrder) {
@@ -3973,8 +4038,17 @@ export class ExchangeClient {
     /** Absolute price distance the exchange should trail the stop by. */
     trailOffset?: number,
     clientOrderId?: string,
-    triggerOnMark = false
+    triggerOnMark = false,
+    /**
+     * A take profit is the same order with the trigger on the winning side, so
+     * it is built here rather than beside it: sizing, reduce-only and the
+     * whole-position marker must not be able to drift apart between the two.
+     */
+    kind: 'stop' | 'takeProfit' = 'stop'
   ): Promise<Order | undefined> {
+    const isTakeProfit = kind === 'takeProfit';
+    const label = isTakeProfit ? 'Take profit' : 'Stop';
+    const usage = isTakeProfit ? 'tp <price> [size]' : 'stop <price> [size]';
     // A size we work out from the position isn't something the user typed, so it
     // isn't subject to the fatfinger limit — a stop must always be placeable.
     const sizeCameFromUser = quantity !== undefined;
@@ -4001,9 +4075,9 @@ export class ExchangeClient {
         const ratio = price / marketPrice;
 
         if (ratio > 10 || ratio < 0.1) {
-          throw new Error(
-            `Stop price ${price} is far from the market price of ${marketPrice} for ${market}. ` +
-              `No order was placed. The stop price comes first: 'stop <price> [size]'.`
+          throw new OrderRefused(
+            `${label} price ${price} is far from the market price of ${marketPrice} for ${market}. ` +
+              `No order was placed. The ${label.toLowerCase()} price comes first: '${usage}'.`
           );
         }
       }
@@ -4057,6 +4131,13 @@ export class ExchangeClient {
           side = position?.side === 'long' ? 'sell' : 'buy';
         } else if (limitOrders.length > 0) {
           side = limitOrders[0].side === 'buy' ? 'sell' : 'buy';
+        } else if (isTakeProfit) {
+          // A stop with nothing to go on takes its side from where it sits.
+          // A take profit cannot: the same price reads as the opposite side,
+          // and guessing would rest an order that opens a position.
+          throw new OrderRefused(
+            `No position or resting orders on ${market} to take profit on. No order was placed.`
+          );
         } else {
           // Reuse the price already fetched for the sanity check above.
           const currentPrice = marketPrice ?? 0;
@@ -4066,12 +4147,21 @@ export class ExchangeClient {
           side = price < currentPrice ? 'sell' : 'buy';
         }
 
+        if (isTakeProfit) {
+          // On the wrong side of the market this is a stop, or fires on
+          // arrival and closes the position at market.
+          const problem = takeProfitProblem(side as 'buy' | 'sell', price, marketPrice);
+          if (problem) throw new OrderRefused(problem);
+        }
+
         // Get the appropriate exchange parameters based on the current exchange
         const exchangeName = this.exchange!.id;
-        const orderType =
-          exchangeParams[exchangeName].orders.stopLoss.ORDER_TYPE;
-        const stopLossProp =
-          exchangeParams[exchangeName].orders.stopLoss.STOP_LOSS_PROP;
+        const orderType = isTakeProfit
+          ? exchangeParams[exchangeName].orders.takeProfit.ORDER_TYPE
+          : exchangeParams[exchangeName].orders.stopLoss.ORDER_TYPE;
+        const stopLossProp = isTakeProfit
+          ? exchangeParams[exchangeName].orders.takeProfit.TAKE_PROFIT_PROP
+          : exchangeParams[exchangeName].orders.stopLoss.STOP_LOSS_PROP;
         const reduceOnlySupported =
           exchangeParams[exchangeName].orders.stopLoss.REDUCE_ONLY.SUPPORTED;
         const reduceOnlyProp =
@@ -4178,11 +4268,14 @@ export class ExchangeClient {
         if (this.exchange.id === 'hyperliquid') {
             finalOrderType = 'market'; // Use market type for stop-market
             finalPriceArg = price; // Pass the trigger price as the main price argument for slippage calculation
-            if (!finalParams.triggerPrice) finalParams.triggerPrice = price;
+            // Not for a take profit: ccxt reads a bare triggerPrice as a
+            // stop-loss, and the price is already there as takeProfitPrice.
+            if (!isTakeProfit && !finalParams.triggerPrice) finalParams.triggerPrice = price;
             finalParams.reduceOnly = true;
         } else if (
             finalOrderType.toLowerCase() === 'stop' ||
-            finalOrderType.toLowerCase() === 'market'
+            finalOrderType.toLowerCase() === 'market' ||
+            finalOrderType.toLowerCase() === 'take_market'
         ) {
             // A stop-market has no limit price of its own, so the main price
             // argument stays undefined. The trigger price is already carried in
@@ -4209,7 +4302,7 @@ export class ExchangeClient {
                 side: side.toUpperCase(),
                 quantity: closeWholePosition ? 'ALL' : this.formatQuantity(quantity),
                 price: this.formatPriceForDisplay(market, price),
-                status: 'STOP WORKING',
+                status: isTakeProfit ? 'TP WORKING' : 'STOP WORKING',
               });
           }
           return createdOrder;
@@ -4220,11 +4313,17 @@ export class ExchangeClient {
       } else {
         // If there's no position found, log an error message and return undefined
         console.error(
-          `[ExchangeClient] No positions or open orders found to determine quantity/side for market ${market}. Cannot create stop order.`
+          `[ExchangeClient] No positions or open orders found to determine quantity/side for market ${market}. Cannot create ${label.toLowerCase()} order.`
         );
         return undefined; // Return undefined if order not created
       }
     } catch (error) {
+      if (error instanceof OrderRefused) {
+        // Ours, and already a sentence. Shown whole, as a guard refusal is.
+        NotificationManager.notify(error.message, NType.ERROR, 'ERROR');
+        return undefined;
+      }
+
       // If any errors occur during the process, log the error message
       const failure = describeExchangeError(error);
       // The full response stays available, marked as diagnostic so it doesn't
@@ -4232,11 +4331,253 @@ export class ExchangeClient {
       NotificationManager.diagnostic(`[createStopOrder] ${failure.raw}`);
 
       NotificationManager.notify(failure.summary, NType.ERROR, 'ERROR', undefined, {
-        side: 'STOP',
+        side: isTakeProfit ? 'TP' : 'STOP',
         status: 'REJECTED',
       });
       return undefined; // Return undefined on error
     }
+  }
+
+  /**
+   * A stop-limit: when the last price reaches the trigger, the exchange places
+   * a limit order at the limit price. Held entirely by the exchange.
+   *
+   * Reduce-only when it would close the position held, and an ordinary order
+   * otherwise -- a stop-limit is as often a breakout entry as an exit, and a
+   * reduce-only entry would be rejected or silently do nothing.
+   */
+  async createStopLimitOrder(
+    market: string,
+    side: 'buy' | 'sell',
+    triggerPrice: number,
+    limitPrice: number,
+    size: number
+  ): Promise<Order | undefined> {
+    if (!this.exchange) throw new Error('Exchange not initialized.');
+
+    try {
+      const marketInfo = this.availableMarkets?.[market];
+      const tick = marketInfo?.precision?.price;
+      if (tick === undefined || !(tick > 0)) {
+        throw new Error(`Market ${market} precision info not found`);
+      }
+      const decimals = Math.abs(Math.log10(tick));
+      triggerPrice = Number(triggerPrice.toFixed(decimals));
+      limitPrice = Number(limitPrice.toFixed(decimals));
+
+      // The same transposition check a stop gets. Three numbers in a row is
+      // three chances to put one in the wrong place.
+      const marketPrice = await this.getReferencePrice(market);
+      if (marketPrice !== undefined) {
+        for (const [what, price] of [['Trigger', triggerPrice], ['Limit', limitPrice]] as const) {
+          const ratio = price / marketPrice;
+          if (ratio > 10 || ratio < 0.1) {
+            throw new OrderRefused(
+              `${what} price ${price} is far from the market price of ${marketPrice} for ${market}. ` +
+                `No order was placed. ${STOP_LIMIT_USAGE}`
+            );
+          }
+        }
+      }
+
+      const position = await this.getPositionStructure(market);
+      const positionSide = position?.contracts && position.contracts > 0 ? position.side : undefined;
+      const closing =
+        (positionSide === 'long' && side === 'sell') || (positionSide === 'short' && side === 'buy');
+
+      // Which key the trigger travels under decides the order type on the
+      // venues that do not take a direction: a trigger the market has to move
+      // against the order to reach is a stop, the other kind is a touch.
+      const onStopSide =
+        marketPrice === undefined ? true : side === 'buy' ? triggerPrice > marketPrice : triggerPrice < marketPrice;
+      const venue = exchangeParams[this.exchange.id];
+      const triggerKey = onStopSide
+        ? venue.orders.stopLoss.STOP_LOSS_PROP
+        : venue.orders.takeProfit.TAKE_PROFIT_PROP;
+
+      const params: Record<string, any> = { [triggerKey]: triggerPrice };
+
+      if (this.exchange.id === 'phemex') {
+        params.triggerDirection =
+          marketPrice !== undefined
+            ? triggerPrice > marketPrice ? 'up' : 'down'
+            : side === 'buy' ? 'up' : 'down';
+        params.triggerType = 'ByLastPrice';
+        if (closing) params.closeOnTrigger = true;
+      } else if (this.exchange.id === 'hyperliquid') {
+        const walletAddress = (this.exchange as any).publicAddress || (this.exchange as any).walletAddress;
+        if (walletAddress) params.user = walletAddress;
+        if (closing) params.reduceOnly = true;
+      } else if (closing && venue.orders.stopLoss.REDUCE_ONLY.SUPPORTED) {
+        params[venue.orders.stopLoss.REDUCE_ONLY.REDUCE_ONLY_PROP ?? 'reduceOnly'] = true;
+      }
+
+      // Typed by the operator, so the fatfinger limit applies.
+      const quantity = await this.getQuantityPrecision(market, size, { price: limitPrice });
+
+      const order = await this.executeOrder(
+        'createOrder', market, 'limit', side, quantity, limitPrice, params
+      );
+      if (!order) return undefined;
+
+      NotificationManager.notify(
+        `limit ${this.formatPriceForDisplay(market, limitPrice)}` + (closing ? ', reduce-only' : ''),
+        NType.INFO,
+        'ORDER',
+        undefined,
+        {
+          side: side.toUpperCase(),
+          quantity: this.formatQuantity(quantity),
+          price: this.formatPriceForDisplay(market, triggerPrice),
+          status: 'STOP LIMIT WORKING',
+        }
+      );
+      return order;
+    } catch (error) {
+      if (error instanceof OrderRefused) {
+        NotificationManager.notify(error.message, NType.ERROR, 'ERROR');
+        return undefined;
+      }
+      const failure = describeExchangeError(error);
+      NotificationManager.diagnostic(`[createStopLimitOrder] ${failure.raw}`);
+      NotificationManager.notify(failure.summary, NType.ERROR, 'ERROR', undefined, {
+        side: side.toUpperCase(),
+        status: 'REJECTED',
+      });
+      return undefined;
+    }
+  }
+
+  /**
+   * Moves the take profit resting at `oldPrice` to `newPrice`, keeping its size.
+   *
+   * Throws with a sentence for the operator when nothing was changed. Returns
+   * what moved, so the caller reports the orders that actually went rather
+   * than the ones it hoped would.
+   */
+  async moveTakeProfitOrder(
+    market: string,
+    oldPrice: number | undefined,
+    newPrice: number
+  ): Promise<{ moved: number; failed: number; side?: string; from: number; to: number; quantity: string }> {
+    if (!this.exchange) throw new Error('Exchange not initialized.');
+
+    const tick = this.availableMarkets?.[market]?.precision?.price;
+    if (tick !== undefined && tick > 0) {
+      newPrice = Number(newPrice.toFixed(Math.abs(Math.log10(tick))));
+    }
+
+    const isHyperliquid = this.exchange.id === 'hyperliquid';
+    const walletAddress = isHyperliquid
+      ? (this.exchange as any).publicAddress || (this.exchange as any).walletAddress
+      : undefined;
+    const params = walletAddress ? { user: walletAddress } : undefined;
+
+    // Fresh from the exchange: an edit aimed at an order from a stale list
+    // fails, or worse, lands on something that has since changed.
+    const openOrders = await this.exchange.fetchOpenOrders(market, undefined, undefined, params);
+    const takeProfits = openOrders.filter((order) => isTakeProfitOrder(order));
+
+    const choice = chooseTakeProfits(
+      takeProfits.map((order) => ({ id: String(order.id), trigger: triggerOf(order) ?? 0 })),
+      oldPrice,
+      tick
+    );
+    if (choice.problem !== undefined) throw new OrderRefused(choice.problem);
+
+    const chosen = takeProfits.filter((order) =>
+      choice.matches.some((match) => match.id === String(order.id))
+    );
+
+    // The same rule as placing one. Moved across the market it would fire at
+    // once, and an edit gives no second chance to notice.
+    const marketPrice = await this.getReferencePrice(market);
+    for (const order of chosen) {
+      const side = String(order.side ?? '').toLowerCase();
+      if (side !== 'buy' && side !== 'sell') continue;
+      const problem = takeProfitProblem(side, newPrice, marketPrice);
+      if (problem) throw new OrderRefused(problem.replace('No order was placed.', 'Nothing was changed.'));
+    }
+
+    let moved = 0;
+    let failed = 0;
+    for (const order of chosen) {
+      try {
+        if (isHyperliquid) {
+          // No in-place edit for a trigger here; the same cancel and replace
+          // the stop uses. The size is carried over explicitly.
+          const { size } = orderSize(order);
+          await this.exchange.cancelOrder(order.id, market, params);
+          this.forgetCancelledOrders(market, [order.id]);
+          const replacement = await this.createStopOrder(
+            market, newPrice, size > 0 ? size : undefined, true, false,
+            undefined, undefined, false, 'takeProfit'
+          );
+          if (!replacement) throw new Error('cancelled, but the replacement was not placed');
+        } else {
+          await this.exchange.editOrder(
+            order.id,
+            market,
+            String(order.type ?? 'market'),
+            String(order.side ?? ''),
+            // Zero means the whole position. Sending it is rejected as below
+            // the minimum; sending nothing leaves the size alone.
+            Number(order.amount) > 0 ? order.amount : undefined,
+            // A market-if-touched has no limit price. The trigger goes in params.
+            undefined,
+            { stopPrice: newPrice }
+          );
+        }
+        moved++;
+      } catch (error) {
+        failed++;
+        NotificationManager.diagnostic(
+          `[moveTakeProfitOrder] ${describeExchangeError(error).raw}`
+        );
+      }
+    }
+
+    const first = chosen[0];
+    const sizes = chosen.map((order) => orderSize(order));
+    return {
+      moved,
+      failed,
+      side: first?.side ? String(first.side).toUpperCase() : undefined,
+      from: triggerOf(first) ?? oldPrice ?? 0,
+      to: newPrice,
+      quantity: sizes.some((s) => s.wholePosition)
+        ? 'ALL'
+        : this.formatQuantity(sizes.reduce((sum, s) => sum + s.size, 0)),
+    };
+  }
+
+  /** Whether an error is a refusal made here, with a sentence worth showing whole. */
+  isOrderRefusal(error: unknown): boolean {
+    return error instanceof OrderRefused;
+  }
+
+  /**
+   * A reduce-only order that closes the position when price reaches a target.
+   *
+   * With no size it covers the whole position, as a stop does. It sits on the
+   * winning side of the market or it is refused; see takeProfitProblem.
+   */
+  async createTakeProfitOrder(
+    market: string,
+    price: number,
+    quantity?: number
+  ): Promise<Order | undefined> {
+    return this.createStopOrder(
+      market,
+      price,
+      quantity,
+      false,
+      true,
+      undefined,
+      undefined,
+      false,
+      'takeProfit'
+    );
   }
 
   /**

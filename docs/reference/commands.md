@@ -128,6 +128,54 @@ stop entry
 | `Invalid quantity. Usage: stop <price> [size]` | Size is not a number |
 | `Stop price <p> is far from the market price of <m> for <market>. No order was placed. The stop price comes first: 'stop <price> [size]'.` | Price is more than 10x or less than 0.1x the market |
 
+### stop limit
+
+```
+stop limit buy|sell <trigger price> <limit price> <size>
+```
+
+Exchange-held: when last price reaches the trigger, a limit order at the limit price is placed. Reduce-only when it closes the position held; an ordinary order otherwise. Reviewed by the guardrails as the limit order it becomes. Panel shows `STOP` at the trigger, or `TP` for a trigger on the near side of the market.
+
+```
+stop limit sell 95 94.50 10
+stop limit buy 105 105.50 10
+```
+
+| Message | Cause |
+|---|---|
+| `Usage: stop limit buy|sell <trigger price> <limit price> <size>` | Wrong shape |
+| `Invalid price. '<x>' is not a usable price. ...` | Bad trigger or limit |
+| `Invalid quantity. '<x>' is not a usable size. ...` | Bad size |
+| `Trigger price <p> is far from the market price ...` / `Limit price <p> is far ...` | More than 10x or less than 0.1x the market |
+
+Warning (order still placed): `Limit <l> is above the trigger <t>. Once triggered on the way down, it fills only if price comes back up to it.`
+
+Success: an activity row with status `STOP LIMIT WORKING`, showing the trigger, with the limit price in the message.
+
+### tp
+
+```
+tp <price> [size]
+```
+
+A reduce-only take profit: a market order triggered on the last traded price, resting on the winning side of the market. **The price always comes first.** With no size, closes the whole position; the panel shows `ALL` and type `TP`. Not counted as protection in position risk.
+
+```
+tp 110
+tp 110 500
+```
+
+| Message | Cause |
+|---|---|
+| `Invalid take profit order. Usage: tp <price> [size]` | Wrong number of arguments |
+| `Invalid quantity. Usage: tp <price> [size]` | Size is not a number |
+| `Take profit <p> is not above the market price of <m>. Closing a long, it has to be above. No order was placed. For a trigger below the market use 'stop <price> [size]'.` | Long position, price at or below the market |
+| `Take profit <p> is not below the market price of <m>. Closing a short, it has to be below. No order was placed. For a trigger above the market use 'stop <price> [size]'.` | Short position, price at or above the market |
+| `No position or resting orders on <market> to take profit on. No order was placed.` | Nothing to close |
+| `Take profit price <p> is far from the market price of <m> for <market>. No order was placed. The take profit price comes first: 'tp <price> [size]'.` | Price is more than 10x or less than 0.1x the market |
+
+Success: an activity row with status `TP WORKING`.
+
 ### trail
 
 ```
@@ -241,6 +289,26 @@ move stop 100.40
 | `Invalid price format.` | Not a number |
 | `No stop order found to move` | No resting stop |
 
+### move tp
+
+```
+move tp <old price> <new price>
+move tp <new price>
+```
+
+Edits the take profit resting at the old price in place, keeping its size. The old price may be omitted when exactly one take profit is resting. Matches within half a tick; take profits sharing a price move together. Stops are never matched.
+
+| Message | Cause |
+|---|---|
+| `Usage: move tp <old price> <new price>` | Wrong number of arguments, or a price that is not a positive number |
+| `No take profit found to move. Nothing was changed.` | None resting |
+| `No take profit at <p>. Resting at: <levels>. Nothing was changed.` | Old price matches nothing |
+| `There are <n> take profits (<levels>). Say which: 'move tp <old price> <new price>'. Nothing was changed.` | Old price omitted with several resting |
+| `Take profit <p> is not above the market price of <m>. ... Nothing was changed. ...` | New price on the wrong side of the market |
+| `<n> take profit(s) could NOT be moved — check the exchange.` | The exchange refused the edit |
+
+Success: an activity row with status `TP UPDATED`.
+
 ### update stop
 
 ```
@@ -268,7 +336,7 @@ bump - <value>
 bump <value>
 ```
 
-Shifts every open order's price (or trigger) on the market by the value.
+Shifts every open order's price (or trigger) on the market by the value. Take profits are skipped.
 
 ```
 bump +10
@@ -289,6 +357,7 @@ Success: `All orders have been bumped by 10.`
 cancel all            every resting order, stops included
 cancel limits         limit orders only
 cancel stops          stop-loss, take-profit, and trailing orders
+cancel tp             take-profit orders only
 cancel orders         every limit order
 cancel orders [top | bottom] <n>
 cancel orders [top | bottom] <n>:<m>

@@ -34,6 +34,8 @@ export class AppError extends Error {
         return errorMessages.exchangeCommand.INVALID_LIMIT_ORDER;
       case ErrorType.INVALID_STOP_ORDER:
         return errorMessages.exchangeCommand.INVALID_STOP_ORDER;
+      case ErrorType.INVALID_TAKE_PROFIT_ORDER:
+        return errorMessages.exchangeCommand.INVALID_TAKE_PROFIT_ORDER;
       default:
         return 'An unknown error occurred';
     }

@@ -7,6 +7,8 @@ This guide covers every way to get an order onto the exchange and to change or r
 - [Before you trade](#before-you-trade)
 - [Market and limit orders](#market-and-limit-orders)
 - [Stops](#stops)
+- [Take profits](#take-profits)
+- [Stop-limits](#stop-limits)
 - [Trailing stops](#trailing-stops)
 - [Chase orders](#chase-orders)
 - [Adjusting working orders](#adjusting-working-orders)
@@ -81,6 +83,72 @@ Stop price 500 is far from the market price of 101.62 for SOL/USDT:USDT. No orde
 ```
 
 A stop is a protective order. The guardrails never hold or refuse one, and the fatfinger limit does not apply to a stop sized from your position.
+
+## Take profits
+
+```
+tp <price> [size]
+```
+
+A take profit is a stop's mirror image: the same reduce-only trigger order, resting on the winning side of the market. **The price comes first**, as it does for a stop. With no size it closes the whole position.
+
+```
+tp 110             close the whole position at 110
+tp 110 500         take 500 units off at 110
+```
+
+What a take profit is:
+
+- **Reduce-only.** It can only close what you hold. If the stop closes the position first, the take profit cannot open a new one the other way, which a plain `limit sell` at your target could.
+- **A market order on trigger**, fired by the last traded price. It fills at the market when price touches the target, not at a guaranteed price. On Phemex it is a `MarketIfTouched` order.
+- **Sized `ALL`** when no size was given, exactly as a stop is.
+- **Shown as `TP`** in the orders panel, and announced as `TP WORKING`. The coach is told it is a take profit and that it is not protection.
+- **Not counted as protection.** Position risk is worked out from your stops alone. A take profit does nothing for the downside.
+
+It has to sit on the winning side: above the market closing a long, below it closing a short. On the other side it would either be a stop or fire the moment it arrived, so it is refused:
+
+```
+Take profit 95 is not above the market price of 100. Closing a long, it has to be above. No order was placed. For a trigger below the market use 'stop <price> [size]'.
+```
+
+With no position and no resting limit orders there is nothing to take profit on, and nothing is placed. With resting limit orders but no position yet, the take profit is sized to those orders, as a stop would be.
+
+Several take profits can rest at once, so you can scale out: `tp 105 200`, `tp 110 200`, `tp 120`. Remove them with `cancel tp`, which leaves your stop alone. `move stop` and `bump` never touch a take profit; change a target with [`move tp`](#move-a-take-profit).
+
+The guardrails never hold or refuse a take profit, because it can only reduce the position. A size you type is still subject to the fatfinger limit.
+
+## Stop-limits
+
+```
+stop limit buy <trigger price> <limit price> <size>
+stop limit sell <trigger price> <limit price> <size>
+```
+
+A conditional order the exchange holds: when the last traded price reaches the trigger, a limit order at the limit price is placed. Nothing needs to be running for it to work. All three numbers are required, and the side is spelled out because a stop-limit is as often an entry as an exit.
+
+```
+stop limit sell 95 94.50 10       exit: if price falls to 95, offer 10 at 94.50
+stop limit buy 105 105.50 10      breakout entry: if price rises to 105, bid 10 at 105.50
+stop limit buy 95 95.20 10        dip entry: if price falls to 95, bid 10 at 95.20
+```
+
+What it is:
+
+- **Reduce-only when it closes what you hold**, and an ordinary order otherwise. A sell with a long open is sent close-on-trigger; the same sell with no position is a plain entry.
+- **Reviewed as the limit order it becomes.** An entry can be held or refused by the guardrails; an exit goes straight through. The fatfinger limit applies to the size.
+- **Shown as `STOP`** in the panel, at the trigger price. The coach's sentence names it a stop-limit and gives the limit price. A trigger on the near side of the market (the dip entry above) is a limit-if-touched, which the panel shows as `TP`; the coach's sentence says what it is.
+- **Cancelled by `cancel stops`**, like every trigger order. `move stop` will pick a stop-limit up if it is the only stop resting, and edits only its trigger.
+
+**A stop-limit can fail to fill.** Once triggered it is a limit order and rests like one. If price runs through the limit, the position stays open with the stop gone. Choose the gap between trigger and limit for the market you are in, and for protection you cannot afford to miss, use a plain `stop`, which goes to market.
+
+A limit on the far side of the trigger is accepted with a warning in the activity log: a sell that triggers at 95 and asks for 96 fills only if price comes back up to it.
+
+| Message | Cause |
+|---|---|
+| `Usage: stop limit buy|sell <trigger price> <limit price> <size>` | Wrong shape, or no side |
+| `Invalid price. '<x>' is not a usable price. ...` | A price that is not a positive number |
+| `Invalid quantity. '<x>' is not a usable size. ...` | A size that is not a positive number |
+| `Trigger price <p> is far from the market price of <m> for <market>. No order was placed. ...` | Trigger or limit is more than 10x or less than 0.1x the market |
 
 ## Trailing stops
 
@@ -171,6 +239,29 @@ move stop <price>
 
 Finds your resting stop by its trigger price and edits it in place, leaving the size alone. Take-profit orders are not touched. If there is no stop: `No stop order found to move`.
 
+### Move a take profit
+
+```
+move tp <old price> <new price>
+move tp <new price>
+```
+
+Names the take profit by the price it rests at, then gives the new one: from, to. The order is edited in place and keeps its size. With only one take profit resting, the old price can be left out.
+
+```
+move tp 110 112      the target at 110 goes to 112
+move tp 112          the only target goes to 112
+```
+
+- The old price matches within half a tick, so it does not matter that the exchange rounded what you typed.
+- Two take profits resting at the same price move together.
+- The new price has to be on the winning side of the market, the same rule as placing one.
+- Stops are never matched, whatever price you give.
+
+When nothing matches, the message lists what is resting: `No take profit at 111. Resting at: 105, 110, 120. Nothing was changed.`
+
+To change a take profit's size, `cancel tp` and place it again.
+
 ### Re-size the stop
 
 ```
@@ -187,7 +278,7 @@ bump - <value>
 bump <value>
 ```
 
-Shifts the price of every open order on the market by the value: limit orders by editing the price, stops by moving the trigger. `bump +10`, `bump + 10`, and `bump 10` are all accepted. With no orders: `No open orders to bump`.
+Shifts the price of every open order on the market by the value: limit orders by editing the price, stops by moving the trigger. Take profits are left where they are. `bump +10`, `bump + 10`, and `bump 10` are all accepted. With no orders: `No open orders to bump`.
 
 ## Cancelling
 
@@ -196,6 +287,7 @@ Shifts the price of every open order on the market by the value: limit orders by
 | `cancel all` | Every resting order, stops included |
 | `cancel limits` | Limit orders only |
 | `cancel stops` | Stop-loss, take-profit, and trailing orders |
+| `cancel tp` | Take-profit orders only; stops stay where they are |
 | `cancel chase` | The running chase |
 | `cancel orders` | Every limit order |
 | `cancel orders top 3` | The third limit order from the top of the book |

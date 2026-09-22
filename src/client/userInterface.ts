@@ -7,6 +7,7 @@ import clear from 'console-clear';
 import { formatOutput as fo } from '../utils/formatOutput.js';
 import { ExchangeProfile } from '../config/configManager.js';
 import { ExchangeCommand, OrderType } from '../commands/exchangeCommand.js';
+import { parseStopLimit, stopLimitCaution } from '../trading/stopLimit.js';
 import { StateManager } from '../config/stateManager.js';
 import {
   parseTrailSpec,
@@ -631,6 +632,16 @@ export class UserInterface {
           size: quantity,
           price,
         };
+      case OrderType.TAKE_PROFIT:
+        // Reduce-only and on the winning side: it can only take the position
+        // off. The guard must never stand between the operator and an exit.
+        return {
+          market: this.currentMarket,
+          side: 'sell',
+          intent: 'exit',
+          size: quantity,
+          price,
+        };
       default:
         return undefined;
     }
@@ -1076,6 +1087,33 @@ export class UserInterface {
     }
     if (command === 'list methods') {
       this.displayAvailableMethods();
+    } else if (parseStopLimit(command) !== undefined) {
+      // stop limit buy|sell <trigger> <limit> <size>. Before the plain stop,
+      // which would otherwise read 'limit' as a price and refuse it.
+      const parsed = parseStopLimit(command)!;
+      if ('error' in parsed) {
+        NotificationManager.notify(parsed.error, NType.ERROR, 'ERROR');
+      } else if (!this.currentMarket) {
+        console.log('No market selected. Please select a market first.');
+      } else {
+        // Reviewed as the limit order it becomes: an entry is held or refused
+        // like any other, an exit goes straight through.
+        const type = parsed.side === 'buy' ? OrderType.LIMIT_BUY : OrderType.LIMIT_SELL;
+        const cleared = await this.guardReview(command, type, parsed.size, parsed.limitPrice);
+        if (cleared) {
+          const caution = stopLimitCaution(parsed);
+          if (caution) ActivityLog.getInstance().add('WARNING', caution);
+          try {
+            await this.exchangeCommand
+              .getExchangeClient()
+              .createStopLimitOrder(
+                this.currentMarket, parsed.side, parsed.triggerPrice, parsed.limitPrice, parsed.size
+              );
+          } catch (error: unknown) {
+            this.reportFailure(error);
+          }
+        }
+      }
     } else if (command.startsWith('stop ') && / trail\b/.test(command)) {
       await this.handleDelayedTrailCommand(command);
     } else if (command === 'trail' || command.startsWith('trail ')) {
@@ -1172,6 +1210,19 @@ export class UserInterface {
             .getExchangeClient()
             .closePosition(this.currentMarket);
           console.log('Position closed');
+        } catch (error: unknown) {
+          this.reportFailure(error);
+        }
+      } else {
+        console.log('No market selected. Please select a market first.');
+      }
+    } else if (command === 'cancel tp') {
+      if (this.currentMarket) {
+        try {
+          await this.exchangeCommand
+            .getExchangeClient()
+            .cancelAllTakeProfitOrders(this.currentMarket)
+            .then((result) => this.reportCancelled('take profit', result));
         } catch (error: unknown) {
           this.reportFailure(error);
         }
@@ -1433,6 +1484,53 @@ export class UserInterface {
       } else {
         console.log('Invalid bracket command format. Please try again.');
       }
+    } else if (command === 'move tp' || command.startsWith('move tp ')) {
+      // move tp <old price> <new price>, or move tp <new price> when only one
+      // is resting. Old first, new second: 'from, to', as it would be said.
+      const parts = command.trim().split(/\s+/).slice(2);
+      const prices = parts.map(Number);
+      const usable = prices.every((price) => Number.isFinite(price) && price > 0);
+
+      if (!this.currentMarket) {
+        console.log('No market selected. Please select a market first.');
+      } else if (parts.length < 1 || parts.length > 2 || !usable) {
+        console.log('Usage: move tp <old price> <new price>');
+      } else {
+        const client = this.exchangeCommand.getExchangeClient();
+        const [oldPrice, newPrice] =
+          prices.length === 2 ? [prices[0], prices[1]] : [undefined, prices[0]];
+
+        try {
+          const result = await client.moveTakeProfitOrder(this.currentMarket, oldPrice, newPrice);
+
+          if (result.moved > 0) {
+            NotificationManager.notify('', NType.SUCCESS, 'ORDER', undefined, {
+              side: result.side,
+              quantity: result.quantity,
+              price: client.formatPriceForDisplay(this.currentMarket, result.to),
+              status: 'TP UPDATED',
+            });
+          }
+          if (result.failed > 0) {
+            NotificationManager.notify(
+              `${result.failed} take profit${result.failed === 1 ? '' : 's'} could NOT be moved — check the exchange.`,
+              NType.ERROR,
+              'ERROR'
+            );
+          }
+        } catch (error) {
+          if (client.isOrderRefusal(error)) {
+            NotificationManager.notify((error as Error).message, NType.ERROR, 'ERROR');
+          } else {
+            const failure = describeExchangeError(error);
+            NotificationManager.diagnostic(`[userInterface/move tp] ${failure.raw}`);
+            NotificationManager.notify(failure.summary, NType.ERROR, 'ERROR', undefined, {
+              side: 'TP',
+              status: 'REJECTED',
+            });
+          }
+        }
+      }
     } else if (command.startsWith('move stop')) {
       const parts = command.split(' ');
       if (parts.length === 3 && this.currentMarket) {
@@ -1546,6 +1644,7 @@ export class UserInterface {
             });
           } else if (
             type === OrderType.STOP ||
+            type === OrderType.TAKE_PROFIT ||
             type === OrderType.LIMIT_BUY ||
             type === OrderType.LIMIT_SELL
           ) {

@@ -1,5 +1,5 @@
 // Reading a working order the way the panel and the coach both have to read it.
-import { describeOrder, orderSentence } from './orderView.js';
+import { describeOrder, isTakeProfitOrder, orderSentence } from './orderView.js';
 import { buildTrailTag } from './trailTag.js';
 
 let failures = 0;
@@ -128,6 +128,64 @@ view = describeOrder({
 });
 check('M  an untriggered stop sized 500 is 500, not the whole position',
   view.wholePosition === false && view.quantity === 500,
+  orderSentence(view));
+
+// A take profit as Phemex names one: a trigger on the winning side.
+view = describeOrder({
+  id: '10',
+  side: 'sell',
+  amount: 0,
+  remaining: 0,
+  type: 'market',
+  triggerPrice: 110,
+  info: { ordType: 'MarketIfTouched', execInst: 'CloseOnTrigger', closeOnTrigger: true },
+});
+check('N  a touch order is a take profit, not a stop',
+  view.type === 'TP' && view.wholePosition === true && view.trigger === 110,
+  orderSentence(view));
+
+check('O  and the sentence does not call it protection',
+  orderSentence(view).includes('take profit') && orderSentence(view).includes('not protection'),
+  orderSentence(view));
+
+check('P  a stop past breakeven is still a stop',
+  !isTakeProfitOrder({ triggerPrice: 105, info: { ordType: 'Stop' } }),
+  'ordType Stop');
+
+check('Q  an entry limit with an attached take profit is not itself a take profit',
+  !isTakeProfitOrder({ type: 'limit', price: 100, takeProfitPrice: 110, info: { ordType: 'Limit' } }),
+  'ordType Limit, takeProfitPrice 110');
+
+check('R  the other venues\' names for it are recognised',
+  isTakeProfitOrder({ triggerPrice: 110, info: { order_type: 'take_market' } }) &&
+    isTakeProfitOrder({ triggerPrice: 110, info: { orderType: 'Take Profit Market' } }),
+  'take_market, Take Profit Market');
+
+// A stop-limit as Phemex returns one: a trigger, and the limit it will rest.
+view = describeOrder({
+  id: '12', side: 'sell', amount: 10, remaining: 0, filled: 0, type: 'limit', price: 94.5,
+  triggerPrice: 95, info: { ordType: 'StopLimit', closeOnTrigger: true },
+});
+check('T  a stop-limit is a stop that names the limit it will rest',
+  view.type === 'STOP' && view.trigger === 95 && view.limitPrice === 94.5 &&
+    /stop-limit, triggers at 95, then rests a limit at 94.5/.test(orderSentence(view)),
+  orderSentence(view));
+
+view = describeOrder({
+  id: '13', side: 'sell', amount: 10, remaining: 0, type: 'market', price: 95,
+  triggerPrice: 95, info: { ordType: 'Stop' },
+});
+check('U  a stop-market that echoes its trigger as a price is still a plain stop',
+  view.limitPrice === undefined && /^SELL 10, stop, triggers at 95/.test(orderSentence(view)),
+  orderSentence(view));
+
+view = describeOrder({
+  id: '14', side: 'buy', amount: 10, remaining: 0, type: 'limit', price: 95.2,
+  triggerPrice: 95, info: { ordType: 'LimitIfTouched' },
+});
+check('V  a limit-if-touched says so, and does not call itself a take profit',
+  view.type === 'TP' && view.limitPrice === 95.2 && /limit-if-touched/.test(orderSentence(view)) &&
+    !/take profit/.test(orderSentence(view)),
   orderSentence(view));
 
 console.log(failures === 0 ? '\nAll passed.' : `\n${failures} failed.`);
