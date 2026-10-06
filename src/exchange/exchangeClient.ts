@@ -1447,6 +1447,45 @@ export class ExchangeClient {
     return { balance, equity, currency };
   }
 
+  /**
+   * Best bid and ask, from the streamed ticker where it has them and from the
+   * book otherwise. Either side may be missing; callers decide whether that
+   * is fatal.
+   *
+   * The display reads this every redraw, and takes whatever the stream last
+   * said: this was fetchL2OrderBook every two seconds for two numbers arriving
+   * on a socket already held open. An order placed 'at bid' asks for a fresh
+   * quote, since a price the feed reported before going quiet is one the
+   * market may have left. The fetch covers the first tick, a quiet feed, and
+   * a venue without a ticker stream.
+   */
+  async getTopOfBook(
+    market: string,
+    maxAgeMs?: number
+  ): Promise<{ bid?: number; ask?: number }> {
+    const streamed = this.tickerStreams.get(market);
+    const fresh =
+      streamed !== undefined &&
+      (maxAgeMs === undefined || Date.now() - streamed.at <= maxAgeMs);
+
+    if (fresh && streamed.bid !== undefined && streamed.ask !== undefined) {
+      return { bid: streamed.bid, ask: streamed.ask };
+    }
+
+    try {
+      const book = await this.exchange!.fetchL2OrderBook(market, 1);
+      return { bid: book.bids?.[0]?.[0], ask: book.asks?.[0]?.[0] };
+    } catch {
+      // Book unavailable this tick. The stream's last word is better than
+      // nothing for a display, and a caller that asked for a fresh quote has
+      // its age limit to say so.
+      return fresh ? { bid: streamed.bid, ask: streamed.ask } : {};
+    }
+  }
+
+  /** How old a streamed quote may be before an order typed against it refetches. */
+  static readonly QUOTE_MAX_AGE_MS = 5000;
+
   /** The market values the workspace shows, taken from the feeds where possible. */
   async getDisplayPrice(market: string): Promise<{
     last?: number;
@@ -1459,25 +1498,7 @@ export class ExchangeClient {
     change?: string;
   }> {
     const last = await this.getReferencePrice(market);
-
-    // Top of book from the streamed ticker, which already carries it. This was
-    // fetchL2OrderBook on every redraw -- a rate-limited request every two
-    // seconds for two numbers arriving on a socket we were already holding
-    // open. The fetch remains as a fallback for the first tick and for a feed
-    // that has gone quiet.
-    const streamed = this.tickerStreams.get(market);
-    let bid = streamed?.bid;
-    let ask = streamed?.ask;
-
-    if (bid === undefined || ask === undefined) {
-      try {
-        const book = await this.exchange!.fetchL2OrderBook(market, 1);
-        bid = book.bids?.[0]?.[0];
-        ask = book.asks?.[0]?.[0];
-      } catch {
-        // Book unavailable this tick; the rest of the view is still worth showing.
-      }
-    }
+    const { bid, ask } = await this.getTopOfBook(market);
 
     const spread =
       bid !== undefined && ask !== undefined ? (ask - bid).toFixed(4).replace(/0+$/, '').replace(/\.$/, '') : undefined;

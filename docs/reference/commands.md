@@ -403,17 +403,25 @@ Substituted in any command before it runs.
 | `possize` | Current position size |
 | `<n>%possize` | That whole-number percentage of it |
 | `entry` | Average entry price, rounded to market precision |
+| `bid` | Best bid when the command runs; priced commands only |
+| `ask` | Best ask when the command runs; priced commands only |
 
 ```
 limit sell 50%possize 104.50
 stop entry
+limit buy 10 bid
+tp ask
+stop limit buy ask bid 10
 print possize
 ```
+
+`bid` and `ask` are read as prices in `limit`, `stop`, `tp`, `stop limit`, `move`, `bump`, and `bracket`, and nowhere else. The price is fixed when the command runs; it does not follow the book.
 
 | Message | Cause |
 |---|---|
 | `Error: Cannot execute an order with a position size of zero.` | `possize` with no position |
 | `Error: Cannot execute an order with an entry price of zero.` | `entry` with no position |
+| `No bid price is available for <market> right now. No order was placed. Type the price instead.` | `bid` or `ask` with no quote from the feed or the book |
 
 ### print
 
@@ -421,6 +429,8 @@ print possize
 print possize
 print entry
 print precision
+print bid
+print ask
 ```
 
 Shows the value without trading. `print precision` shows the market's price precision.

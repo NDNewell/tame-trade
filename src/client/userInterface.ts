@@ -7,7 +7,9 @@ import clear from 'console-clear';
 import { formatOutput as fo } from '../utils/formatOutput.js';
 import { ExchangeProfile } from '../config/configManager.js';
 import { ExchangeCommand, OrderType } from '../commands/exchangeCommand.js';
+import { ExchangeClient } from '../exchange/exchangeClient.js';
 import { parseStopLimit, stopLimitCaution } from '../trading/stopLimit.js';
+import { substituteTopOfBook, topOfBookWords } from '../commands/priceShorthand.js';
 import { StateManager } from '../config/stateManager.js';
 import {
   parseTrailSpec,
@@ -1043,6 +1045,11 @@ export class UserInterface {
           .getExchangeClient()
           .getMarketPrecision(this.currentMarket);
         console.log(precision);
+      } else if (command === 'print bid' || command === 'print ask') {
+        const book = await this.exchangeCommand
+          .getExchangeClient()
+          .getTopOfBook(this.currentMarket, ExchangeClient.QUOTE_MAX_AGE_MS);
+        console.log(command === 'print bid' ? book.bid : book.ask);
       }
 
       return;
@@ -1085,6 +1092,23 @@ export class UserInterface {
         command = this.replaceCommandVariable(command, this.entryPrice, 'entry');
       }
     }
+
+    // 'bid' and 'ask' as prices, read from the book as the order is typed.
+    // The journal already has the command as typed; what runs is the
+    // substituted one, echoed as 'entry' and 'possize' are.
+    if (topOfBookWords(command)) {
+      const book = await this.exchangeCommand
+        .getExchangeClient()
+        .getTopOfBook(this.currentMarket, ExchangeClient.QUOTE_MAX_AGE_MS);
+      const substituted = substituteTopOfBook(command, book, this.currentMarket);
+      if ('error' in substituted) {
+        NotificationManager.notify(substituted.error, NType.ERROR, 'ERROR');
+        return;
+      }
+      command = substituted.command;
+      console.log(command);
+    }
+
     if (command === 'list methods') {
       this.displayAvailableMethods();
     } else if (parseStopLimit(command) !== undefined) {

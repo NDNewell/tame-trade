@@ -310,17 +310,23 @@ For a large position, `guard exit` builds a worked exit in slices rather than on
 
 ## Size and price shorthand
 
-Two tokens are substituted in any command before it runs:
+These tokens are substituted in a command before it runs:
 
 | Token | Replaced with | Example |
 |---|---|---|
 | `possize` | Your current position size | `stop 99.90 possize` |
 | `50%possize` | That percentage of it (whole percentages only) | `limit sell 50%possize 104.50` |
 | `entry` | Your average entry price, rounded to the market's precision | `stop entry` |
+| `bid` | The best bid at the moment the command runs | `limit buy 10 bid` |
+| `ask` | The best ask at the moment the command runs | `tp ask` |
 
 With no position, a command using `possize` is dropped with `Error: Cannot execute an order with a position size of zero.`
 
-Three `print` commands show the values without trading: `print possize`, `print entry`, `print precision`.
+`bid` and `ask` work wherever a price goes in `limit`, `stop`, `tp`, `stop limit`, `move`, `bump`, and `bracket`, and both can appear in one command: `stop limit buy ask bid 10`. The price is read from the ticker feed, or from the book when the feed is older than five seconds, and is fixed at that moment: the order does not follow the book afterwards. For an order that does, use [`chase`](#chase-orders). Nowhere else are the words rewritten, so a coach question that mentions the ask reaches the coach as typed. If no quote is available the command is refused: `No bid price is available for SOL/USDT:USDT right now. No order was placed. Type the price instead.`
+
+The journal records the command as you typed it; the activity log and the exchange see the substituted one.
+
+`print` shows a value without trading: `print possize`, `print entry`, `print precision`, `print bid`, `print ask`.
 
 ## The fatfinger limit
 
