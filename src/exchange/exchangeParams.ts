@@ -7,10 +7,20 @@ interface ExchangeStopLossOrderParams {
   };
 }
 
+/**
+ * How a take profit differs from a stop on this exchange. Everything not named
+ * here -- reduce-only, sizing, the trigger source -- is shared with stopLoss.
+ */
+interface ExchangeTakeProfitOrderParams {
+  ORDER_TYPE: string;
+  TAKE_PROFIT_PROP: string;
+}
+
 interface ExchangeParams {
   [key: string]: {
     orders: {
       stopLoss: ExchangeStopLossOrderParams;
+      takeProfit: ExchangeTakeProfitOrderParams;
     };
   };
 }
@@ -19,10 +29,16 @@ enum OrderType {
   MARKET = 'market',
   STOP = 'stop',
   STOP_MARKET = 'stop_market',
+  TAKE_MARKET = 'take_market',
 }
 
 enum StopLossProp {
   STOP_LOSS_PRICE = 'stopLossPrice',
+  STOP_PRICE = 'stopPrice',
+}
+
+enum TakeProfitProp {
+  TAKE_PROFIT_PRICE = 'takeProfitPrice',
   STOP_PRICE = 'stopPrice',
 }
 
@@ -46,6 +62,10 @@ export const exchangeParams: ExchangeParams = {
           REDUCE_ONLY_PROP: ReduceOnlyProp.REDUCE_ONLY,
         },
       },
+      takeProfit: {
+        ORDER_TYPE: OrderType.TAKE_MARKET,
+        TAKE_PROFIT_PROP: TakeProfitProp.TAKE_PROFIT_PRICE,
+      },
     },
   },
   phemex: {
@@ -67,6 +87,13 @@ export const exchangeParams: ExchangeParams = {
           REDUCE_ONLY_PROP: ReduceOnlyProp.CLOSE_ON_TRIGGER,
         },
       },
+      // The same request as a stop. Phemex has no separate take-profit
+      // parameter: a market order with a trigger on the winning side is what
+      // ccxt turns into MarketIfTouched, chosen by triggerDirection.
+      takeProfit: {
+        ORDER_TYPE: OrderType.MARKET,
+        TAKE_PROFIT_PROP: TakeProfitProp.STOP_PRICE,
+      },
     },
   },
   hyperliquid: {
@@ -77,6 +104,12 @@ export const exchangeParams: ExchangeParams = {
         REDUCE_ONLY: {
           SUPPORTED: false,
         },
+      },
+      // ccxt marks the trigger 'tp' rather than 'sl' only when the price
+      // arrives as takeProfitPrice; any other key makes it a stop-loss.
+      takeProfit: {
+        ORDER_TYPE: OrderType.MARKET,
+        TAKE_PROFIT_PROP: TakeProfitProp.TAKE_PROFIT_PRICE,
       },
     },
   },

@@ -59,7 +59,17 @@ export interface OrderView {
   filled: number;
   price?: number;
   trigger?: number;
-  type: 'LIMIT' | 'MARKET' | 'STOP';
+  /**
+   * For a stop-limit or limit-if-touched: the limit the exchange places once
+   * the trigger is reached. Absent for a trigger that goes to market.
+   */
+  limitPrice?: number;
+  /**
+   * 'TP' is a trigger order on the winning side of the market. It is kept
+   * apart from 'STOP' because it closes the position without protecting it, and
+   * a reader shown two 'STOP' rows would count protection that is not there.
+   */
+  type: 'LIMIT' | 'MARKET' | 'STOP' | 'TP';
   status: string;
   reduceOnly: boolean;
   closeOnTrigger: boolean;
@@ -95,11 +105,34 @@ const truthy = (value: unknown): boolean =>
  * cannot find is absent, not guessed.
  */
 /** The trigger price of a conditional order, or undefined for a plain one. */
-const triggerOf = (raw: any): number | undefined => {
+export const triggerOf = (raw: any): number | undefined => {
   const info = raw?.info ?? {};
   const trigger = number(raw?.triggerPrice ?? info.stopPxRp ?? info.stopPxEp);
   return trigger !== undefined && trigger > 0 ? trigger : undefined;
 };
+
+/**
+ * Whether a trigger order is a take profit rather than a stop.
+ *
+ * Read from what the exchange calls the order, not from where the trigger sits
+ * relative to the entry: a stop moved past breakeven is still a stop. Phemex
+ * names a trigger on the winning side MarketIfTouched or LimitIfTouched;
+ * Deribit says take_market; Hyperliquid says 'Take Profit Market'.
+ *
+ * One reader, for the same reason as orderSize below: the panel, the coach,
+ * the risk figure and 'move stop' must not disagree about which order is
+ * protecting the position.
+ */
+export function isTakeProfitOrder(raw: any): boolean {
+  // Only an order that waits on a trigger. An entry limit can carry an attached
+  // takeProfitPrice of its own, and that does not make the entry a take profit.
+  if (triggerOf(raw) === undefined) return false;
+
+  const info = raw?.info ?? {};
+  return [info.ordType, info.orderType, info.order_type, raw?.type]
+    .map((value) => String(value ?? '').toLowerCase())
+    .some((type) => type.includes('iftouched') || type.includes('take'));
+}
 
 /**
  * How much an order will still do, and whether that is 'everything'.
@@ -140,7 +173,16 @@ export function describeOrder(raw: any, context: OrderContext = {}): OrderView {
   const { size, wholePosition } = orderSize(raw);
   const filled = number(raw?.filled) ?? 0;
 
-  const type: OrderView['type'] = isTrigger
+  // A trigger order that names a limit price rests a limit when it fires. The
+  // exchange's own name for it is the reliable tell; the price field alone is
+  // not, since some venues echo the trigger there for a stop-market.
+  const rawType = String(info.ordType ?? info.orderType ?? raw?.type ?? '').toLowerCase();
+  const limitPrice =
+    isTrigger && rawType.includes('limit') ? number(raw?.price ?? info.priceRp ?? info.priceEp) : undefined;
+
+  const type: OrderView['type'] = isTakeProfitOrder(raw)
+    ? 'TP'
+    : isTrigger
     ? 'STOP'
     : String(raw?.type ?? 'limit').toLowerCase() === 'market'
       ? 'MARKET'
@@ -194,6 +236,7 @@ export function describeOrder(raw: any, context: OrderContext = {}): OrderView {
     filled,
     price: isTrigger ? undefined : number(raw?.price),
     trigger: isTrigger ? trigger : undefined,
+    limitPrice,
     type,
     status,
     reduceOnly: truthy(raw?.reduceOnly ?? info.reduceOnly),
@@ -250,8 +293,26 @@ export function orderSentence(view: OrderView): string {
 
   const parts: string[] = [`${view.side} ${size}`];
 
+  const then =
+    view.limitPrice !== undefined ? `, then rests a limit at ${trim(view.limitPrice)}` : '';
+
   if (view.type === 'STOP') {
-    parts.push(`stop, triggers at ${view.trigger !== undefined ? trim(view.trigger) : '?'}`);
+    parts.push(
+      `${view.limitPrice !== undefined ? 'stop-limit' : 'stop'}, triggers at ` +
+        `${view.trigger !== undefined ? trim(view.trigger) : '?'}${then}`
+    );
+  } else if (view.type === 'TP' && view.limitPrice !== undefined) {
+    parts.push(
+      `limit-if-touched, triggers at ${view.trigger !== undefined ? trim(view.trigger) : '?'}${then} ` +
+        `(a trigger on the winning side; it is not protection)`
+    );
+  } else if (view.type === 'TP') {
+    // Spelled out, and said not to be protection: the coach reads these
+    // sentences to decide what is guarding the position.
+    parts.push(
+      `take profit, triggers at ${view.trigger !== undefined ? trim(view.trigger) : '?'} ` +
+        `(closes on the winning side; it is not protection)`
+    );
   } else if (view.price !== undefined) {
     parts.push(`${view.type.toLowerCase()} at ${trim(view.price)}`);
   } else {

@@ -15,5 +15,6 @@ export const errorMessages = {
     INVALID_MARKET_ORDER: 'Invalid market order',
     INVALID_LIMIT_ORDER: 'Invalid limit order',
     INVALID_STOP_ORDER: 'Invalid stop order',
+    INVALID_TAKE_PROFIT_ORDER: 'Invalid take profit order. Usage: tp <price> [size]',
   },
 };
